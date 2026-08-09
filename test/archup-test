@@ -120,6 +120,7 @@ pacman() {
 
 # Let the fallback test hide the yay function without changing PATH or the
 # command lookup behavior used by the rest of the suite.
+# shellcheck disable=SC2329 # Exercised indirectly by the sourced backend.
 command() {
   if [[ "${1:-}" == "-v" && "${2:-}" == yay ]]; then
     ((ARCHUP_HAS_YAY != 0)) || return 1
@@ -186,6 +187,7 @@ ldd() {
   printf '%s\n' "${ARCHUP_LDD_OUTPUT[$1]:-}"
 }
 
+# shellcheck disable=SC2329 # Exercised indirectly by the shared driver.
 sudo() {
   if [[ "${1:-}" == "-v" ]]; then
     return 0
@@ -194,6 +196,7 @@ sudo() {
   "$@"
 }
 
+# shellcheck disable=SC2329 # Exercised indirectly by the shared systemd helpers.
 systemctl() {
   case "$1" in
     list-units)
@@ -231,6 +234,7 @@ systemctl() {
   esac
 }
 
+# shellcheck disable=SC2329 # Exercised indirectly by sysup_main.
 sysup_require_family() {
   return 0
 }
