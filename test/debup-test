@@ -1,0 +1,873 @@
+#!/usr/bin/env bash
+# debup-test - unit tests for the Debian upgrade helper.
+#
+# debup reaches apt through `sudo env VAR=VAL apt-get`, so the package manager
+# mocks have to be real executables on PATH rather than shell functions: `env`
+# resolves a binary and would never see a function.
+
+set -o pipefail
+export NO_COLOR=1
+
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
+# shellcheck source=lib/test.sh
+. "$TEST_DIR/lib/test.sh"
+
+DEBUP_MOCK_BIN=$(_mock_bin)
+export PATH="$DEBUP_MOCK_BIN:$PATH"
+
+# Written by the mocks, asserted by the tests.
+DEBUP_APT_LOG="$(_tmpdir)/apt.log"
+DEBUP_SYSTEMCTL_LOG="$(_tmpdir)/systemctl.log"
+DEBUP_NEEDRESTART_LOG="$(_tmpdir)/needrestart.log"
+DEBUP_APT_OPTIONS_LOG="$(_tmpdir)/apt-options.log"
+DEBUP_APT_ENV_LOG="$(_tmpdir)/apt-env.log"
+DEBUP_DPKG_QUERY_ARGS_LOG="$(_tmpdir)/dpkg-query-args.log"
+export DEBUP_APT_LOG DEBUP_SYSTEMCTL_LOG DEBUP_NEEDRESTART_LOG
+export DEBUP_APT_OPTIONS_LOG DEBUP_APT_ENV_LOG
+export DEBUP_DPKG_QUERY_ARGS_LOG
+
+# Fixture state the mocks read.
+export DEBUP_MOCK_INSTALLED=""     # dpkg-query rows: "<abbrev> <pkg> <version>"
+export DEBUP_MOCK_UPGRADED=""      # rows applied to DEBUP_MOCK_INSTALLED on upgrade
+export DEBUP_MOCK_PACKAGE_FILES="" # dpkg -L rows: "<pkg> <file>"
+export DEBUP_MOCK_HOLDS=""
+export DEBUP_MOCK_ACTIVE_UNITS=""
+export DEBUP_MOCK_FAILED_UNITS=""
+export DEBUP_MOCK_AUDIT=""
+export DEBUP_MOCK_AUTOREMOVE=""
+export DEBUP_MOCK_APT_CHECK_STATUS=0
+export DEBUP_MOCK_UPGRADE_STATUS=0
+export DEBUP_MOCK_UPDATE_FAILURES=0
+export DEBUP_MOCK_UPDATE_STATUS=100
+export DEBUP_MOCK_AUTOCLEAN_STATUS=0
+export DEBUP_MOCK_AUTOREMOVE_STATUS=0
+export DEBUP_MOCK_APPLY_BEFORE_FAILURE=0
+export DEBUP_MOCK_APT_MARK_STATUS=0
+export DEBUP_MOCK_DPKG_AUDIT_STATUS=0
+export DEBUP_MOCK_DPKG_QUERY_FAIL_ON=0
+export DEBUP_MOCK_DPKG_QUERY_STATUS=8
+export DEBUP_MOCK_NEEDRESTART_OUTPUT=""
+export DEBUP_MOCK_NEEDRESTART_STATUS=0
+DEBUP_UPDATE_COUNT_FILE="$(_tmpdir)/update-count"
+DEBUP_SNAPSHOT_COUNT_FILE="$(_tmpdir)/snapshot-count"
+export DEBUP_UPDATE_COUNT_FILE DEBUP_SNAPSHOT_COUNT_FILE
+: >"$DEBUP_UPDATE_COUNT_FILE"
+: >"$DEBUP_SNAPSHOT_COUNT_FILE"
+DEBUP_MOCK_STATE="$(_tmpdir)/installed"
+export DEBUP_MOCK_STATE
+: >"$DEBUP_MOCK_STATE"
+
+_debup_write_mock() {
+  local name="$1"
+  cat >"$DEBUP_MOCK_BIN/$name"
+  chmod +x "$DEBUP_MOCK_BIN/$name"
+}
+
+_debup_write_mock sudo <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "-v" ]] && exit 0
+exec "$@"
+EOF
+
+_debup_write_mock apt-get <<'EOF'
+#!/usr/bin/env bash
+# Log the -o options and the env prefix separately from the command, so
+# assertions can read the command plainly and still cover the options.
+args=()
+while (($#)); do
+  if [[ "$1" == "-o" ]]; then
+    printf '%s\n' "$2" >>"$DEBUP_APT_OPTIONS_LOG"
+    shift 2
+    continue
+  fi
+  args+=("$1")
+  shift
+done
+printf '%s\n' "${args[*]}" >>"$DEBUP_APT_LOG"
+printf 'DEBIAN_FRONTEND=%s NEEDRESTART_MODE=%s\n' \
+  "${DEBIAN_FRONTEND:-unset}" "${NEEDRESTART_MODE:-unset}" >>"$DEBUP_APT_ENV_LOG"
+
+case "${args[0]:-}" in
+  check) exit "$DEBUP_MOCK_APT_CHECK_STATUS" ;;
+  update)
+    count=$(cat "$DEBUP_UPDATE_COUNT_FILE" 2>/dev/null || printf '0')
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$DEBUP_UPDATE_COUNT_FILE"
+    ((count <= DEBUP_MOCK_UPDATE_FAILURES)) && exit "$DEBUP_MOCK_UPDATE_STATUS"
+    exit 0
+    ;;
+  autoclean) exit "$DEBUP_MOCK_AUTOCLEAN_STATUS" ;;
+esac
+
+for arg in "${args[@]}"; do
+  case "$arg" in
+    upgrade | full-upgrade)
+      if ((DEBUP_MOCK_APPLY_BEFORE_FAILURE != 0)) && [[ -n "$DEBUP_MOCK_UPGRADED" ]]; then
+        printf '%s\n' "$DEBUP_MOCK_UPGRADED" >"$DEBUP_MOCK_STATE"
+      fi
+      ((DEBUP_MOCK_UPGRADE_STATUS == 0)) || exit "$DEBUP_MOCK_UPGRADE_STATUS"
+      [[ -z "$DEBUP_MOCK_UPGRADED" ]] || printf '%s\n' "$DEBUP_MOCK_UPGRADED" >"$DEBUP_MOCK_STATE"
+      exit 0
+      ;;
+    autoremove)
+      # Only the --simulate report prints Remv lines.
+      [[ " ${args[*]} " == *" --simulate "* ]] || exit "$DEBUP_MOCK_AUTOREMOVE_STATUS"
+      [[ -z "$DEBUP_MOCK_AUTOREMOVE" ]] && exit 0
+      while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && printf 'Remv %s [1.0]\n' "$pkg"
+      done <<<"$DEBUP_MOCK_AUTOREMOVE"
+      exit 0
+      ;;
+  esac
+done
+exit 0
+EOF
+
+_debup_write_mock dpkg-query <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$DEBUP_DPKG_QUERY_ARGS_LOG"
+count=$(cat "$DEBUP_SNAPSHOT_COUNT_FILE" 2>/dev/null || printf '0')
+count=$((count + 1))
+printf '%s\n' "$count" >"$DEBUP_SNAPSHOT_COUNT_FILE"
+if ((DEBUP_MOCK_DPKG_QUERY_FAIL_ON == count)); then
+  printf 'mock dpkg-query failure\n' >&2
+  exit "$DEBUP_MOCK_DPKG_QUERY_STATUS"
+fi
+rows=$(cat "$DEBUP_MOCK_STATE")
+[[ -n "$rows" ]] || rows="$DEBUP_MOCK_INSTALLED"
+while read -r abbrev pkg version; do
+  [[ -n "${pkg:-}" ]] || continue
+  # Real dpkg emits db:Status-Abbrev as exactly three characters, e.g. 'ii ',
+  # so pad it here or the code's glob match is never really exercised.
+  printf '%-3s\t%s\t%s\n' "$abbrev" "$pkg" "$version"
+done <<<"$rows"
+EOF
+
+_debup_write_mock dpkg <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --audit)
+    printf '%s' "$DEBUP_MOCK_AUDIT"
+    exit "$DEBUP_MOCK_DPKG_AUDIT_STATUS"
+    ;;
+  -L)
+    while read -r pkg file; do
+      [[ "${pkg:-}" == "$2" ]] || continue
+      printf '%s\n' "$file"
+    done <<<"$DEBUP_MOCK_PACKAGE_FILES"
+    ;;
+esac
+exit 0
+EOF
+
+_debup_write_mock apt-mark <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "showhold" ]] && printf '%s' "$DEBUP_MOCK_HOLDS"
+exit "$DEBUP_MOCK_APT_MARK_STATUS"
+EOF
+
+_debup_write_mock systemctl <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-units)
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] && printf '%s loaded active running mock unit\n' "$unit"
+    done <<<"$DEBUP_MOCK_ACTIVE_UNITS"
+    ;;
+  --failed) printf '%s' "$DEBUP_MOCK_FAILED_UNITS" ;;
+  is-enabled) printf 'enabled\n' ;;
+  *) printf '%s\n' "$*" >>"$DEBUP_SYSTEMCTL_LOG" ;;
+esac
+exit 0
+EOF
+
+export SYSUP_SOURCE_ONLY=1
+# shellcheck source=../lib/sysup/debup
+. "$REPO_ROOT/lib/sysup/debup"
+
+# Point the advisory checks at a fixture tree instead of the live system.
+DEBUP_FIXTURE_ETC=$(_tmpdir)
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_CONFFILE_ROOT="$DEBUP_FIXTURE_ETC"
+DEBUP_REBOOT_REQUIRED_FILE="$(_tmpdir)/reboot-required"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART="$DEBUP_MOCK_BIN/needrestart"
+
+# The suite runs on Arch, so the family guard has to be neutralized the same way
+# archup-test does. One case later restores the real guard to prove it runs.
+# shellcheck disable=SC2329 # invoked indirectly by the sourced debup.
+sysup_require_family() {
+  return 0
+}
+
+_debup_reset() {
+  : >"$DEBUP_APT_LOG"
+  : >"$DEBUP_SYSTEMCTL_LOG"
+  : >"$DEBUP_NEEDRESTART_LOG"
+  : >"$DEBUP_APT_OPTIONS_LOG"
+  : >"$DEBUP_APT_ENV_LOG"
+  : >"$DEBUP_DPKG_QUERY_ARGS_LOG"
+  : >"$DEBUP_UPDATE_COUNT_FILE"
+  : >"$DEBUP_SNAPSHOT_COUNT_FILE"
+  : >"$DEBUP_MOCK_STATE"
+  DEBUP_MOCK_INSTALLED=""
+  DEBUP_MOCK_UPGRADED=""
+  DEBUP_MOCK_PACKAGE_FILES=""
+  DEBUP_MOCK_HOLDS=""
+  DEBUP_MOCK_ACTIVE_UNITS=""
+  DEBUP_MOCK_FAILED_UNITS=""
+  DEBUP_MOCK_AUDIT=""
+  DEBUP_MOCK_AUTOREMOVE=""
+  DEBUP_MOCK_APT_CHECK_STATUS=0
+  DEBUP_MOCK_UPGRADE_STATUS=0
+  DEBUP_MOCK_UPDATE_FAILURES=0
+  DEBUP_MOCK_UPDATE_STATUS=100
+  DEBUP_MOCK_AUTOCLEAN_STATUS=0
+  DEBUP_MOCK_AUTOREMOVE_STATUS=0
+  DEBUP_MOCK_APPLY_BEFORE_FAILURE=0
+  DEBUP_MOCK_APT_MARK_STATUS=0
+  DEBUP_MOCK_DPKG_AUDIT_STATUS=0
+  DEBUP_MOCK_DPKG_QUERY_FAIL_ON=0
+  DEBUP_MOCK_DPKG_QUERY_STATUS=8
+  # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+  DEBUP_UPDATE_ATTEMPTS=5
+  # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+  DEBUP_UPDATE_RETRY_DELAY=0
+  DEBUP_MOCK_NEEDRESTART_OUTPUT=""
+  DEBUP_MOCK_NEEDRESTART_STATUS=0
+  # shellcheck disable=SC2034 # backend state read by the sourced debup under test.
+  DEBUP_UPGRADE_VERB=upgrade
+  # shellcheck disable=SC2034 # backend state read by the sourced debup under test.
+  DEBUP_AUTOREMOVE=0
+  rm -f "$DEBUP_REBOOT_REQUIRED_FILE" "$DEBUP_REBOOT_REQUIRED_FILE.pkgs"
+  rm -rf "${DEBUP_FIXTURE_ETC:?}"/*
+  # needrestart is absent unless a test installs the mock. Clear bash's command
+  # hash too: a prior direct invocation (which is what happens when the suite
+  # runs as root and sysup_run_as_root skips sudo) leaves the deleted path
+  # cached, and `command -v` would keep reporting it as installed.
+  rm -f "$DEBUP_MOCK_BIN/needrestart"
+  hash -r
+}
+
+_debup_install_needrestart() {
+  _debup_write_mock needrestart <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$DEBUP_NEEDRESTART_LOG"
+printf '%s' "$DEBUP_MOCK_NEEDRESTART_OUTPUT"
+exit "$DEBUP_MOCK_NEEDRESTART_STATUS"
+EOF
+}
+
+echo "=== debup: upgrade verb ==="
+
+usage=$(sysup_backend_usage)
+_assert_contains "debup usage: documents unattended package installation" \
+  "upgrade packages noninteractively" "$usage"
+_assert_contains "debup usage: documents checks before service restarts" \
+  "run dpkg/apt, pending-config, and reboot-required checks" "$usage"
+_assert_contains "debup usage: documents failed-unit reporting last" \
+  "report failed systemd units" "$usage"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+sysup_backend_upgrade >/dev/null 2>&1
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup upgrade: refreshes package lists first" \
+  "update" "$apt_log"
+_assert_contains "debup upgrade: default upgrade allows new dependencies" \
+  "--with-new-pkgs upgrade -y" "$apt_log"
+_assert_not_contains "debup upgrade: default upgrade never removes packages" \
+  "full-upgrade" "$apt_log"
+_assert_contains "debup upgrade: reclaims the package cache" \
+  "autoclean -y" "$apt_log"
+
+_debup_reset
+sysup_backend_parse_arg --full-upgrade
+sysup_backend_upgrade >/dev/null 2>&1
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup upgrade: --full-upgrade opts into dependency removals" \
+  "full-upgrade -y" "$apt_log"
+_assert_not_contains "debup upgrade: --full-upgrade replaces the default verb" \
+  "--with-new-pkgs" "$apt_log"
+
+_debup_reset
+sysup_backend_upgrade extra-arg >/dev/null 2>&1
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup upgrade: forwards extra arguments to apt-get" \
+  "upgrade -y extra-arg" "$apt_log"
+
+_debup_reset
+DEBUP_MOCK_UPGRADE_STATUS=42
+set +e
+sysup_backend_upgrade >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "debup upgrade: propagates an apt-get failure" \
+  "42" "$status"
+
+_debup_reset
+DEBUP_MOCK_UPDATE_FAILURES=2
+# shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+DEBUP_UPDATE_ATTEMPTS=3
+debup_apt_update >/dev/null 2>&1
+_assert_eq "debup update: retries transient repository failures" \
+  "3" "$(cat "$DEBUP_UPDATE_COUNT_FILE")"
+
+_debup_reset
+DEBUP_MOCK_UPDATE_FAILURES=5
+# shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+DEBUP_UPDATE_ATTEMPTS=3
+set +e
+sysup_backend_upgrade >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "debup update: exhausted retries fail the upgrade" "1" "$status"
+_assert_eq "debup update: stops after the configured attempt limit" \
+  "3" "$(cat "$DEBUP_UPDATE_COUNT_FILE")"
+_assert_not_contains "debup update: never upgrades from stale indexes after retry exhaustion" \
+  "upgrade -y" "$(cat "$DEBUP_APT_LOG")"
+
+_debup_reset
+debup_apt_update >/dev/null 2>&1
+_assert_contains "debup update: repository fetch warnings are fatal and retryable" \
+  "APT::Update::Error-Mode=any" "$(cat "$DEBUP_APT_OPTIONS_LOG")"
+
+_debup_reset
+DEBUP_MOCK_AUTOCLEAN_STATUS=5
+set +e
+result=$(sysup_backend_upgrade 2>&1)
+status=$?
+set -e
+_assert_eq "debup upgrade: package-cache cleanup failure is advisory" "0" "$status"
+_assert_contains "debup upgrade: package-cache cleanup failure is visible" \
+  "package cache was not reclaimed" "$result"
+
+echo ""
+echo "=== debup: autoremove is opt-in ==="
+
+_debup_reset
+DEBUP_MOCK_AUTOREMOVE=$'stale-lib\nold-kernel'
+result=$(sysup_backend_upgrade 2>&1)
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup autoremove: reports removable packages by default" \
+  "stale-lib" "$result"
+_assert_contains "debup autoremove: points at the opt-in flag" \
+  "debup --autoremove" "$result"
+_assert_not_contains "debup autoremove: does not purge without the flag" \
+  "--purge autoremove" "$apt_log"
+
+_debup_reset
+DEBUP_MOCK_AUTOREMOVE="stale-lib"
+sysup_backend_parse_arg --autoremove
+sysup_backend_upgrade >/dev/null 2>&1
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup autoremove: --autoremove purges removable packages" \
+  "--purge autoremove -y" "$apt_log"
+_assert_not_contains "debup autoremove: --autoremove skips the simulated report" \
+  "--simulate" "$apt_log"
+
+_debup_reset
+DEBUP_MOCK_AUTOREMOVE_STATUS=6
+sysup_backend_parse_arg --autoremove
+set +e
+sysup_backend_upgrade >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "debup autoremove: an opted-in purge failure remains fatal" "6" "$status"
+
+echo ""
+echo "=== debup: post-upgrade checks ==="
+
+_debup_reset
+result=$(check_package_integrity 2>&1)
+status=$?
+_assert_eq "debup integrity: clean dpkg and apt state passes" "0" "$status"
+_assert_contains "debup integrity: reports a consistent package state" \
+  "consistent package state" "$result"
+
+_debup_reset
+DEBUP_MOCK_AUDIT="The following packages are only half configured: broken-pkg"
+set +e
+result=$(check_package_integrity 2>&1)
+status=$?
+set -e
+_assert_eq "debup integrity: dpkg audit findings fail the run" "1" "$status"
+_assert_contains "debup integrity: shows the audited package" \
+  "broken-pkg" "$result"
+
+_debup_reset
+DEBUP_MOCK_APT_CHECK_STATUS=100
+set +e
+result=$(check_package_integrity 2>&1)
+status=$?
+set -e
+_assert_eq "debup integrity: unmet dependencies fail the run" "1" "$status"
+_assert_contains "debup integrity: does not assert a cause it cannot establish" \
+  "apt-get check failed" "$result"
+
+_debup_reset
+DEBUP_MOCK_DPKG_AUDIT_STATUS=2
+set +e
+result=$(check_package_integrity 2>&1)
+status=$?
+set -e
+_assert_eq "debup integrity: dpkg audit execution failure fails the check" "1" "$status"
+_assert_contains "debup integrity: dpkg audit execution failure is actionable" \
+  "dpkg --audit failed" "$result"
+_assert_not_contains "debup integrity: failed dpkg audit never claims consistency" \
+  "consistent package state" "$result"
+
+_debup_reset
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: reports an unverified reboot state without a detector" \
+  "could not determine whether a reboot is required" "$result"
+_assert_not_contains "debup pending: missing detector never claims no reboot" \
+  "ok: no reboot required" "$result"
+_assert_contains "debup pending: reports no unmerged config files" \
+  "ok: no config files awaiting a manual merge" "$result"
+
+_debup_reset
+: >"$DEBUP_REBOOT_REQUIRED_FILE"
+printf 'linux-image-amd64\n' >"$DEBUP_REBOOT_REQUIRED_FILE.pkgs"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: reports a required reboot" \
+  "reboot required" "$result"
+_assert_contains "debup pending: names the packages needing the reboot" \
+  "linux-image-amd64" "$result"
+
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_OUTPUT="NEEDRESTART-KSTA: 1"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: needrestart confirms no reboot is required" \
+  "ok: no reboot required" "$result"
+
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_OUTPUT="NEEDRESTART-KSTA: 3"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: needrestart reports a required reboot" \
+  "reboot required" "$result"
+
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_OUTPUT="NEEDRESTART-KSTA: 2"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: needrestart reports an ABI-compatible reboot" \
+  "reboot required" "$result"
+
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_OUTPUT="NEEDRESTART-KSTA: 0"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: needrestart unknown state remains unverified" \
+  "could not determine whether a reboot is required" "$result"
+_assert_not_contains "debup pending: needrestart unknown state never claims no reboot" \
+  "ok: no reboot required" "$result"
+
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_STATUS=2
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: needrestart failure leaves reboot state unverified" \
+  "could not determine whether a reboot is required" "$result"
+_assert_not_contains "debup pending: needrestart failure never claims no reboot" \
+  "ok: no reboot required" "$result"
+
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_OUTPUT="unexpected output"
+: >"$DEBUP_REBOOT_REQUIRED_FILE"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: reboot flag remains authoritative after an unknown needrestart response" \
+  "reboot required" "$result"
+
+_debup_reset
+saved_conffile_root="$DEBUP_CONFFILE_ROOT"
+DEBUP_CONFFILE_ROOT="$DEBUP_FIXTURE_ETC/missing"
+result=$(report_pending_state 2>&1)
+DEBUP_CONFFILE_ROOT="$saved_conffile_root"
+_assert_contains "debup pending: failed conffile scan is reported as unverified" \
+  "could not completely scan for config files" "$result"
+_assert_not_contains "debup pending: failed conffile scan never claims an all-clear" \
+  "ok: no config files awaiting a manual merge" "$result"
+
+_debup_reset
+mkdir -p "$DEBUP_FIXTURE_ETC/ssh"
+: >"$DEBUP_FIXTURE_ETC/ssh/sshd_config.dpkg-dist"
+: >"$DEBUP_FIXTURE_ETC/hosts.ucf-dist"
+result=$(report_pending_state 2>&1)
+_assert_contains "debup pending: reports a pending .dpkg-dist conffile" \
+  "sshd_config.dpkg-dist" "$result"
+_assert_contains "debup pending: reports a pending .ucf-dist conffile" \
+  "hosts.ucf-dist" "$result"
+
+_debup_reset
+DEBUP_MOCK_AUDIT="half configured: broken-pkg"
+: >"$DEBUP_REBOOT_REQUIRED_FILE"
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "debup checks: a fatal check fails the run" "1" "$status"
+_assert_contains "debup checks: advisory checks still run after a fatal one" \
+  "reboot required" "$result"
+
+# A pending reboot is the expected result of a successful kernel upgrade, so it
+# must not turn a clean run into a failure.
+_debup_reset
+: >"$DEBUP_REBOOT_REQUIRED_FILE"
+mkdir -p "$DEBUP_FIXTURE_ETC/ssh"
+: >"$DEBUP_FIXTURE_ETC/ssh/sshd_config.dpkg-dist"
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "debup checks: advisory findings alone keep the run successful" \
+  "0" "$status"
+_assert_contains "debup checks: advisory findings are still reported" \
+  "sshd_config.dpkg-dist" "$result"
+
+echo ""
+echo "=== debup: package snapshot ==="
+
+_debup_reset
+DEBUP_MOCK_INSTALLED=$'ii zsh 5.9\nii bash 5.2\nrc removed-pkg 1.0\niU unpacked-pkg 2.0'
+snapshot=$(sysup_backend_snapshot)
+_assert_eq "debup snapshot: keeps install-desired transitional packages for failure recovery" \
+  $'bash 5.2\nunpacked-pkg 2.0\nzsh 5.9' "$snapshot"
+# shellcheck disable=SC2016 # This assertion intentionally matches dpkg's literal format token.
+_assert_contains "debup snapshot: requests architecture-qualified package identities" \
+  '${binary:Package}' "$(cat "$DEBUP_DPKG_QUERY_ARGS_LOG")"
+
+echo ""
+echo "=== debup: service restarts ==="
+
+_debup_reset
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+result=$(sysup_backend_restart_services openssh-server 2>&1)
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_contains "debup restart: restarts an active service from an upgraded package" \
+  "try-restart ssh.service" "$systemctl_log"
+_assert_contains "debup restart: reloads systemd before restarting" \
+  "daemon-reload" "$systemctl_log"
+_assert_contains "debup restart: reports the restart" \
+  "restarting active services from upgraded packages" "$result"
+
+# Debian packages predating merged-usr record their units under /lib.
+_debup_reset
+DEBUP_MOCK_PACKAGE_FILES=$'legacy-pkg /lib/systemd/system/legacy.service'
+DEBUP_MOCK_ACTIVE_UNITS="legacy.service"
+sysup_backend_restart_services legacy-pkg >/dev/null 2>&1
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_contains "debup restart: recognizes pre-merged-usr unit paths" \
+  "try-restart legacy.service" "$systemctl_log"
+
+_debup_reset
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+_debup_install_needrestart
+sysup_backend_restart_services openssh-server >/dev/null 2>&1
+needrestart_log=$(cat "$DEBUP_NEEDRESTART_LOG")
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_contains "debup restart: prefers needrestart when installed" \
+  "-r a" "$needrestart_log"
+_assert_not_contains "debup restart: needrestart replaces the built-in restart" \
+  "try-restart" "$systemctl_log"
+
+echo ""
+echo "=== debup: full run ==="
+
+# Capture output rather than discarding it: a non-zero status anywhere in the
+# composed driver path is otherwise invisible, and the assertion message is the
+# only place the cause would surface.
+_debup_main() {
+  set +e
+  DEBUP_RESULT=$(sysup_main "$@" 2>&1)
+  DEBUP_STATUS=$?
+  set -e
+}
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii openssh-server 1.0"
+DEBUP_MOCK_UPGRADED="ii openssh-server 2.0"
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+_debup_main
+_assert_eq "debup main: a clean upgrade succeeds (output: $DEBUP_RESULT)" \
+  "0" "$DEBUP_STATUS"
+
+# Running as root skips the sudo mock, so commands execute in this shell and
+# get hashed. A needrestart mock installed and then removed must not leave the
+# backend believing needrestart is still available.
+_debup_install_needrestart
+sysup_run_as_root_orig=$(declare -f sysup_run_as_root)
+sysup_run_as_root() { "$@"; }
+sysup_backend_restart_services openssh-server >/dev/null 2>&1
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii openssh-server 1.0"
+DEBUP_MOCK_UPGRADED="ii openssh-server 2.0"
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+_debup_main
+eval "$sysup_run_as_root_orig"
+_assert_eq "debup main: a removed needrestart does not linger in the command hash (output: $DEBUP_RESULT)" \
+  "0" "$DEBUP_STATUS"
+_assert_contains "debup main: falls back to the built-in restart once needrestart is gone" \
+  "try-restart ssh.service" "$(cat "$DEBUP_SYSTEMCTL_LOG")"
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_contains "debup main: restarts services for packages whose version changed" \
+  "try-restart ssh.service" "$systemctl_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED=$'ii libdemo:amd64 1.0\nii libdemo:i386 1.0'
+DEBUP_MOCK_UPGRADED=$'ii libdemo:amd64 1.0\nii libdemo:i386 2.0'
+DEBUP_MOCK_PACKAGE_FILES=$'libdemo:i386 /usr/lib/systemd/system/libdemo32.service'
+DEBUP_MOCK_ACTIVE_UNITS="libdemo32.service"
+_debup_main
+_assert_contains "debup main: preserves multi-arch identity through service discovery" \
+  "try-restart libdemo32.service" "$(cat "$DEBUP_SYSTEMCTL_LOG")"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii openssh-server 1.0"
+DEBUP_MOCK_UPGRADED="ii openssh-server 2.0"
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+_debup_main --no-restart-upgraded-services
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_not_contains "debup main: opt-out skips the upgraded service restart" \
+  "try-restart" "$systemctl_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_main --check-only
+_assert_eq "debup main: --check-only succeeds (output: $DEBUP_RESULT)" \
+  "0" "$DEBUP_STATUS"
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_not_contains "debup main: --check-only does not upgrade" \
+  "upgrade" "$apt_log"
+_assert_contains "debup main: --check-only still verifies package state" \
+  "check" "$apt_log"
+
+# --check-only must not mutate the host. debup defers restarts to needrestart,
+# which finds work on its own rather than from the (empty) upgraded set, so the
+# driver has to suppress the whole restart step.
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_install_needrestart
+_debup_main --check-only
+needrestart_log=$(cat "$DEBUP_NEEDRESTART_LOG")
+_assert_not_contains "debup main: --check-only never restarts services" \
+  "-r a" "$needrestart_log"
+_assert_contains "debup main: --check-only still queries the kernel status" \
+  "-b -k" "$needrestart_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_FAILED_UNITS="broken.service loaded failed failed Broken"
+_debup_main --check-only --restart-failed
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_not_contains "debup main: --check-only overrides --restart-failed mutations" \
+  "reset-failed" "$systemctl_log"
+_assert_not_contains "debup main: --check-only never restarts failed units" \
+  "restart broken.service" "$systemctl_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_HOLDS=$'pinned-pkg\n'
+_debup_main --check-only
+_assert_contains "debup main: surfaces held packages before upgrading" \
+  "pinned-pkg" "$DEBUP_RESULT"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_APT_MARK_STATUS=2
+_debup_main --check-only
+_assert_eq "debup main: an unverified held-package query fails before upgrading" \
+  "1" "$DEBUP_STATUS"
+_assert_contains "debup main: held-package query failure is actionable" \
+  "could not list held packages" "$DEBUP_RESULT"
+_assert_not_contains "debup main: held-package query failure never reports none held" \
+  "  (none)" "$DEBUP_RESULT"
+
+# Flags must work through the driver's argument loop, not just when the backend
+# hook is called directly.
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_AUTOREMOVE="stale-lib"
+_debup_main --autoremove
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup main: --autoremove reaches the backend through the driver" \
+  "--purge autoremove -y" "$apt_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_main --full-upgrade
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup main: --full-upgrade reaches the backend through the driver" \
+  "full-upgrade -y" "$apt_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_main -- --no-install-recommends
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup main: passes arguments after -- to apt-get" \
+  "--no-install-recommends" "$apt_log"
+
+# apt options are load-bearing: without force-confold an upgrade can replace a
+# locally modified config file, and the mock previously discarded them entirely.
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_main
+apt_options=$(cat "$DEBUP_APT_OPTIONS_LOG")
+apt_env=$(cat "$DEBUP_APT_ENV_LOG")
+_assert_contains "debup main: keeps locally modified config files" \
+  "Dpkg::Options::=--force-confold" "$apt_options"
+_assert_contains "debup main: prefers packaged defaults when there is no local edit" \
+  "Dpkg::Options::=--force-confdef" "$apt_options"
+_assert_contains "debup main: waits for the dpkg lock" \
+  "DPkg::Lock::Timeout=300" "$apt_options"
+_assert_contains "debup main: runs apt non-interactively" \
+  "DEBIAN_FRONTEND=noninteractive" "$apt_env"
+_assert_contains "debup main: stops needrestart's apt hook from prompting" \
+  "NEEDRESTART_MODE=l" "$apt_env"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_UPGRADE_STATUS=7
+_debup_main
+_assert_eq "debup main: propagates an apt-get upgrade failure" "7" "$DEBUP_STATUS"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii partial-service 1.0"
+DEBUP_MOCK_UPGRADED="iF partial-service 2.0"
+DEBUP_MOCK_PACKAGE_FILES=$'partial-service /usr/lib/systemd/system/partial.service'
+DEBUP_MOCK_ACTIVE_UNITS="partial.service"
+DEBUP_MOCK_FAILED_UNITS="failed-after-upgrade.service loaded failed failed Failed"
+DEBUP_MOCK_AUDIT="half configured: partial-service"
+DEBUP_MOCK_APPLY_BEFORE_FAILURE=1
+DEBUP_MOCK_UPGRADE_STATUS=7
+_debup_main
+_assert_eq "debup main: partially applied upgrade preserves the apt failure" \
+  "7" "$DEBUP_STATUS"
+_assert_contains "debup main: partially applied upgrade continues with checks" \
+  "continuing with best-effort post-upgrade checks" "$DEBUP_RESULT"
+_assert_contains "debup main: partially applied upgrade checks package integrity" \
+  "check" "$(cat "$DEBUP_APT_LOG")"
+_assert_contains "debup main: partially applied upgrade restarts changed services" \
+  "try-restart partial.service" "$(cat "$DEBUP_SYSTEMCTL_LOG")"
+_assert_contains "debup main: partially applied upgrade still reports failed units" \
+  "failed-after-upgrade.service" "$DEBUP_RESULT"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii unknown-diff-service 1.0"
+DEBUP_MOCK_UPGRADED="ii unknown-diff-service 2.0"
+DEBUP_MOCK_DPKG_QUERY_FAIL_ON=2
+DEBUP_MOCK_FAILED_UNITS="failed-after-snapshot.service loaded failed failed Failed"
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_OUTPUT="NEEDRESTART-KSTA: 1"
+_debup_main
+_assert_eq "debup main: failed post-upgrade snapshot preserves its status" \
+  "8" "$DEBUP_STATUS"
+_assert_contains "debup main: failed post-upgrade snapshot continues with checks" \
+  "continuing with best-effort post-upgrade checks" "$DEBUP_RESULT"
+_assert_contains "debup main: failed post-upgrade snapshot still checks integrity" \
+  "check" "$(cat "$DEBUP_APT_LOG")"
+_assert_contains "debup main: needrestart handles services when the package diff is unavailable" \
+  "-r a" "$(cat "$DEBUP_NEEDRESTART_LOG")"
+_assert_contains "debup main: failed post-upgrade snapshot still reports failed units" \
+  "failed-after-snapshot.service" "$DEBUP_RESULT"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_AUDIT="half configured: broken-pkg"
+_debup_main
+_assert_eq "debup main: a failed check fails the run" "1" "$DEBUP_STATUS"
+
+# The family guard is what stops debup running apt against a pacman system. Drop
+# the stub for this one case so the guard is proven to run inside sysup_main.
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+debup_test_os_root=$(_tmpdir)
+mkdir -p "$debup_test_os_root/etc"
+printf 'ID=arch\n' >"$debup_test_os_root/etc/os-release"
+# Restore the real guard for this case; unset alone would leave it undefined.
+unset -f sysup_require_family
+# shellcheck source=../lib/sysup/detect.sh
+. "$REPO_ROOT/lib/sysup/detect.sh"
+SYSUP_OS_ROOT="$debup_test_os_root"
+_debup_main
+# shellcheck disable=SC2034 # read by the sourced detect.sh.
+SYSUP_OS_ROOT=""
+# shellcheck disable=SC2329 # invoked indirectly by the sourced debup.
+sysup_require_family() { return 0; }
+_assert_eq "debup main: refuses to run on a non-Debian host" "1" "$DEBUP_STATUS"
+_assert_contains "debup main: names the host it refused" \
+  "only supports Debian-based hosts" "$DEBUP_RESULT"
+_assert_eq "debup main: runs no apt command on the wrong family" \
+  "" "$(cat "$DEBUP_APT_LOG")"
+
+echo ""
+echo "=== debup: needrestart resolution ==="
+
+# Regression: needrestart installs into /usr/sbin, which a normal user's PATH
+# omits on Debian. debup runs unprivileged and escalates per command, so
+# detecting with the caller's PATH reported needrestart missing on a host where
+# it was installed, and the needrestart restart path was silently never used.
+_debup_reset
+debup_sbin=$(_tmpdir)
+# A name no host can ship, so `command -v` cannot find a real needrestart and
+# the sbin search path is the only thing under test. Ubuntu and WSL images do
+# install needrestart, and CI runs as root with /usr/sbin on PATH.
+debup_nr_fixture="needrestart-sysup-test-fixture"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART_SEARCH_PATH="$debup_sbin"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART="$debup_nr_fixture"
+
+set +e
+debup_needrestart_path >/dev/null
+status=$?
+set -e
+_assert_eq "debup needrestart: absent everywhere is not found" "1" "$status"
+
+# Present only in an sbin directory the caller's PATH does not include.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$debup_sbin/$debup_nr_fixture"
+chmod +x "$debup_sbin/$debup_nr_fixture"
+set +e
+resolved=$(debup_needrestart_path)
+status=$?
+set -e
+_assert_eq "debup needrestart: found in sbin despite not being on PATH" "0" "$status"
+_assert_eq "debup needrestart: resolves to an absolute path" \
+  "$debup_sbin/$debup_nr_fixture" "$resolved"
+
+# The restart hook must actually use it once resolution succeeds.
+_debup_reset
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART_SEARCH_PATH="$debup_sbin"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART="$debup_nr_fixture"
+cat >"$debup_sbin/$debup_nr_fixture" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>"$DEBUP_NEEDRESTART_LOG"
+exit 0
+EOF
+chmod +x "$debup_sbin/$debup_nr_fixture"
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+sysup_backend_restart_services openssh-server >/dev/null 2>&1
+_assert_contains "debup needrestart: sbin-only needrestart drives the restart" \
+  "-r a" "$(cat "$DEBUP_NEEDRESTART_LOG")"
+_assert_not_contains "debup needrestart: built-in restart is not used as well" \
+  "try-restart" "$(cat "$DEBUP_SYSTEMCTL_LOG")"
+
+rm -f "$debup_sbin/$debup_nr_fixture"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART_SEARCH_PATH="/usr/local/sbin:/usr/sbin:/sbin"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART="$DEBUP_MOCK_BIN/needrestart"
+
+_test_summary

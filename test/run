@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Run behavior suites sequentially. They source backends and deliberately
+# redefine command names, so process isolation is part of the test contract.
+
+set -u
+
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+status=0
+
+for suite in sysup-test archup-test debup-test; do
+  bash "$TEST_DIR/$suite" || status=$?
+done
+
+if [[ "${SYSUP_SKIP_SHELLCHECK:-0}" != 1 ]] && command -v shellcheck >/dev/null 2>&1; then
+  shellcheck -x -P SCRIPTDIR \
+    "$TEST_DIR/../bin/sysup" \
+    "$TEST_DIR/../install.sh" \
+    "$TEST_DIR/../lib/sysup/archup" \
+    "$TEST_DIR/../lib/sysup/debup" \
+    "$TEST_DIR/../lib/sysup/common.sh" \
+    "$TEST_DIR/../lib/sysup/detect.sh" \
+    "$TEST_DIR/../lib/sysup/systemd.sh" \
+    "$TEST_DIR/run" \
+    "$TEST_DIR/lib/test.sh" \
+    "$TEST_DIR/sysup-test" \
+    "$TEST_DIR/archup-test" \
+    "$TEST_DIR/debup-test" || status=$?
+fi
+
+exit "$status"
