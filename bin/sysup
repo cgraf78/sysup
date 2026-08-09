@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# sysup - upgrade this host with the backend for its OS family.
+set -Eeuo pipefail
+
+_sysup_script_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_sysup_script_dir() {
+  local path="$1" dir target
+
+  # shdeps exposes bin/sysup through ~/.local/bin. Follow each portable
+  # readlink hop so private backends stay coupled to the same provider checkout
+  # instead of being resolved from the public symlink directory or PATH.
+  case "$path" in
+    */*) ;;
+    *) path=$(command -v "$path") || return 1 ;;
+  esac
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_sysup_script_parent "$path")" && pwd) || return 1
+    target=$(readlink "$path") || return 1
+    [[ "$target" == /* ]] || target="$dir/$target"
+    path="$target"
+  done
+  cd -P -- "$(_sysup_script_parent "$path")" && pwd
+}
+
+_SYSUP_BIN_DIR=$(_sysup_script_dir "${BASH_SOURCE[0]}") || {
+  printf 'error: sysup cannot resolve its installation directory\n' >&2
+  exit 1
+}
+_SYSUP_LIB_DIR=$(cd "$_SYSUP_BIN_DIR/../lib/sysup" >/dev/null 2>&1 && pwd -P) || {
+  printf 'error: sysup private library is not installed\n' >&2
+  exit 1
+}
+
+# shellcheck source=../lib/sysup/detect.sh
+. "$_SYSUP_LIB_DIR/detect.sh"
+
+usage() {
+  cat <<EOF
+Usage: sysup [backend args...]
+
+Detect this host's OS family and run its upgrade backend, forwarding every
+argument. Supported families: $(sysup_supported_families).
+
+  arch    -> archup
+  debian  -> debup
+
+On a supported host, --help also prints the selected backend's flags.
+EOF
+}
+
+# Backends are deliberately private implementation details. Resolving them from
+# the provider library keeps one public command and prevents a same-named PATH
+# program from changing which upgrade policy runs.
+resolve_backend() {
+  local backend="$1"
+
+  if [[ -x "$_SYSUP_LIB_DIR/$backend" ]]; then
+    printf '%s\n' "$_SYSUP_LIB_DIR/$backend"
+    return 0
+  fi
+  return 1
+}
+
+main() {
+  local family backend backend_path help=0
+
+  case "${1:-}" in
+    -h | --help) help=1 ;;
+  esac
+
+  if ! family=$(sysup_os_family); then
+    # Help still has to work on a host sysup cannot upgrade.
+    if ((help)); then
+      usage
+      return 0
+    fi
+    printf 'error: sysup does not support this host; detected %s\n' \
+      "$(sysup_os_description)" >&2
+    printf 'supported families: %s\n' "$(sysup_supported_families)" >&2
+    return 1
+  fi
+
+  backend="$(sysup_family_command "$family")"
+  if ! backend_path=$(resolve_backend "$backend"); then
+    printf 'error: %s host detected but the %s backend is not installed\n' \
+      "$(sysup_family_label "$family")" "$backend" >&2
+    return 1
+  fi
+
+  # Show the dispatcher's own usage first, then let the backend print the flags
+  # that actually apply to this host.
+  if ((help)); then
+    usage
+    printf '\n'
+  fi
+
+  exec "$backend_path" "$@"
+}
+
+main "$@"

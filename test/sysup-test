@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# sysup-test - unit tests for OS family detection and backend dispatch.
+#
+# SYSUP_OS_ROOT is reassigned throughout to steer detection at a fixture tree.
+# It is read by the sourced detect.sh, never by this file.
+# shellcheck disable=SC2034
+
+set -euo pipefail
+export NO_COLOR=1
+
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
+# shellcheck source=lib/test.sh
+. "$TEST_DIR/lib/test.sh"
+
+echo "=== test harness safety ==="
+
+# A failed fixture allocation must never collapse to an empty string that a
+# caller can extend into a root-level path such as /apt.log. Exercise the
+# helper fault paths directly, then separately require every suite to run with
+# errexit so an unchecked assignment cannot continue after that failure.
+tmpdir_failure_exit=0
+tmpdir_failure_output=$(
+  # shellcheck disable=SC2329  # resolved indirectly by _tmpdir
+  mktemp() { return 1; }
+  _tmpdir 2>&1
+) || tmpdir_failure_exit=$?
+_assert_eq "test harness: directory allocation failure is fatal" \
+  "1" "$tmpdir_failure_exit"
+_assert_contains "test harness: directory allocation failure is actionable" \
+  "could not create suite temporary directory" "$tmpdir_failure_output"
+
+tmpfile_failure_exit=0
+tmpfile_failure_output=$(
+  # shellcheck disable=SC2329  # resolved indirectly by _tmpfile
+  mktemp() { return 1; }
+  _tmpfile 2>&1
+) || tmpfile_failure_exit=$?
+_assert_eq "test harness: file allocation failure is fatal" \
+  "1" "$tmpfile_failure_exit"
+_assert_contains "test harness: file allocation failure is actionable" \
+  "could not create suite temporary file" "$tmpfile_failure_output"
+
+unchecked_failure_exit=0
+unchecked_failure_output=$(
+  SYSUP_TEST_LIB="$TEST_DIR/lib/test.sh" bash -euo pipefail -c '
+    . "$SYSUP_TEST_LIB"
+    mktemp() { return 1; }
+    derived="$(_tmpdir)/apt.log"
+    printf "continued with %s\n" "$derived"
+  ' 2>&1
+) || unchecked_failure_exit=$?
+_assert_eq "test harness: unchecked allocation aborts the caller" \
+  "1" "$unchecked_failure_exit"
+_assert_not_contains "test harness: unchecked allocation never derives /apt.log" \
+  "continued with /apt.log" "$unchecked_failure_output"
+
+case $- in
+  *e*) _pass "test harness: suite exits on an unchecked allocation failure" ;;
+  *) _fail "test harness: suite exits on an unchecked allocation failure" ;;
+esac
+
+SYSUP_MOCK_BIN=$(_mock_bin)
+export PATH="$SYSUP_MOCK_BIN:$PATH"
+
+# Detection is Linux-only by design. Pin uname so the suite asserts the same
+# behavior whether it runs on Linux or macOS.
+cat >"$SYSUP_MOCK_BIN/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SYSUP_TEST_KERNEL:-Linux}"
+EOF
+chmod +x "$SYSUP_MOCK_BIN/uname"
+
+# shellcheck source=../lib/sysup/detect.sh
+. "$REPO_ROOT/lib/sysup/detect.sh"
+
+# Build a fixture root holding the OS identification files detection reads.
+_sysup_os_root() {
+  local root
+  root=$(_tmpdir)
+  mkdir -p "$root/etc"
+  printf '%s\n' "$root"
+}
+
+_sysup_write_os_release() {
+  local root="$1"
+  shift
+  printf '%s\n' "$@" >"$root/etc/os-release"
+}
+
+echo "=== sysup: OS family detection ==="
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=arch'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: Arch by ID" "arch" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian' 'VERSION_ID="13"'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: Debian by ID" "debian" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=ubuntu' 'ID_LIKE=debian'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: Ubuntu by ID" "debian" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=endeavouros' 'ID_LIKE=arch'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: Arch derivative by ID_LIKE" "arch" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=linuxmint' 'ID_LIKE="ubuntu debian"'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: multi-token ID_LIKE resolves to Debian" \
+  "debian" "$(sysup_os_family)"
+
+# An unhelpful os-release must not defeat detection when the family marker file
+# is present.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=homegrown'
+: >"$os_root/etc/debian_version"
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: falls back to /etc/debian_version" \
+  "debian" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=homegrown'
+: >"$os_root/etc/arch-release"
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: falls back to /etc/arch-release" \
+  "arch" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+SYSUP_OS_ROOT="$os_root"
+set +e
+result=$(sysup_os_family)
+status=$?
+set -e
+_assert_eq "sysup detect: unsupported family fails" "1" "$status"
+_assert_eq "sysup detect: unsupported family prints nothing" "" "$result"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=arch'
+SYSUP_OS_ROOT="$os_root"
+export SYSUP_TEST_KERNEL=Darwin
+set +e
+sysup_os_family >/dev/null
+status=$?
+set -e
+export SYSUP_TEST_KERNEL=Linux
+_assert_eq "sysup detect: non-Linux kernel is unsupported" "1" "$status"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: describes the host for error messages" \
+  "ID=fedora ID_LIKE=rhel" "$(sysup_os_description)"
+
+# A host with no os-release at all still has to produce a readable message.
+os_root=$(_sysup_os_root)
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: missing os-release still describes the host" \
+  "ID=unknown ID_LIKE=unknown" "$(sysup_os_description)"
+
+# Sourcing os-release must not leak its assignments into the caller.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian' 'NAME="Debian GNU/Linux"'
+SYSUP_OS_ROOT="$os_root"
+sysup_os_family >/dev/null
+_assert_eq "sysup detect: os-release assignments do not leak into the caller" \
+  "" "${ID:-}${NAME:-}"
+
+_assert_eq "sysup detect: supported families are reported for errors" \
+  "arch,debian" "$(sysup_supported_families)"
+
+echo ""
+echo "=== sysup: family guard ==="
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian'
+SYSUP_OS_ROOT="$os_root"
+set +e
+result=$(SYSUP_BACKEND_NAME=archup sysup_require_family arch 2>&1)
+status=$?
+set -e
+_assert_eq "sysup guard: wrong family fails before the package manager runs" \
+  "1" "$status"
+_assert_contains "sysup guard: names the backend that refused" \
+  "archup only supports Arch Linux hosts" "$result"
+_assert_contains "sysup guard: reports what it detected" "ID=debian" "$result"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian'
+SYSUP_OS_ROOT="$os_root"
+set +e
+SYSUP_BACKEND_NAME=debup sysup_require_family debian
+status=$?
+set -e
+_assert_eq "sysup guard: matching family passes" "0" "$status"
+
+echo ""
+echo "=== sysup: backend dispatch ==="
+
+# Model shdeps' github:repo shape: only bin/sysup is exposed publicly, through
+# a relative symlink, while detection and both private backends stay in the
+# provider checkout. Resolving the invoked symlink instead of ~/.local/bin is
+# the key compatibility boundary for this extraction.
+SYSUP_FIXTURE=$(_tmpdir)
+SYSUP_PROVIDER="$SYSUP_FIXTURE/provider"
+SYSUP_PUBLIC_BIN="$SYSUP_FIXTURE/public/bin"
+mkdir -p "$SYSUP_PROVIDER/bin" "$SYSUP_PROVIDER/lib/sysup" "$SYSUP_PUBLIC_BIN"
+cp "$REPO_ROOT/bin/sysup" "$SYSUP_PROVIDER/bin/sysup"
+cp "$REPO_ROOT/lib/sysup/detect.sh" "$SYSUP_PROVIDER/lib/sysup/detect.sh"
+ln -s ../../provider/bin/sysup "$SYSUP_PUBLIC_BIN/sysup"
+
+SYSUP_DISPATCH_LOG="$SYSUP_FIXTURE/dispatch.log"
+for backend in archup debup; do
+  cat >"$SYSUP_PROVIDER/lib/sysup/$backend" <<EOF
+#!/usr/bin/env bash
+{
+  printf '$backend'
+  if ((\$#)); then
+    printf ' <%s>' "\$@"
+  fi
+  printf '\n'
+} >"$SYSUP_DISPATCH_LOG"
+EOF
+  chmod +x "$SYSUP_PROVIDER/lib/sysup/$backend"
+done
+
+_sysup_dispatch() {
+  local root="$1"
+  shift
+  : >"$SYSUP_DISPATCH_LOG"
+  SYSUP_OS_ROOT="$root" "$SYSUP_PUBLIC_BIN/sysup" "$@"
+}
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=arch'
+_sysup_dispatch "$os_root" >/dev/null 2>&1
+_assert_eq "sysup dispatch: Arch host runs archup" \
+  "archup" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=ubuntu' 'ID_LIKE=debian'
+_sysup_dispatch "$os_root" >/dev/null 2>&1
+_assert_eq "sysup dispatch: Ubuntu host runs debup" \
+  "debup" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian'
+_sysup_dispatch "$os_root" --check-only -- --extra >/dev/null 2>&1
+_assert_eq "sysup dispatch: forwards every argument to the backend" \
+  "debup <--check-only> <--> <--extra>" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+_sysup_dispatch "$os_root" '' 'two words' '*' -- tail >/dev/null 2>&1
+_assert_eq "sysup dispatch: preserves empty and shell-sensitive arguments" \
+  "debup <> <two words> <*> <--> <tail>" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+set +e
+result=$(_sysup_dispatch "$os_root" 2>&1)
+status=$?
+set -e
+_assert_eq "sysup dispatch: unsupported host fails" "1" "$status"
+_assert_contains "sysup dispatch: names the detected host" "ID=fedora" "$result"
+_assert_contains "sysup dispatch: lists the families it supports" \
+  "arch,debian" "$result"
+_assert_eq "sysup dispatch: unsupported host runs no backend" \
+  "" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+# --help has to work on a host sysup cannot upgrade, so it must not be gated
+# behind detection.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+set +e
+result=$(_sysup_dispatch "$os_root" --help 2>&1)
+status=$?
+set -e
+_assert_eq "sysup dispatch: --help succeeds on an unsupported host" "0" "$status"
+_assert_contains "sysup dispatch: --help explains the dispatch" \
+  "Usage: sysup" "$result"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian'
+result=$(_sysup_dispatch "$os_root" --help 2>&1)
+_assert_contains "sysup dispatch: --help still reaches the backend" \
+  "Usage: sysup" "$result"
+_assert_eq "sysup dispatch: --help forwards to the backend for its flags" \
+  "debup <--help>" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+# Restricting PATH to the system directories also picks the system bash, which
+# on macOS is 3.2. That is deliberate: the dispatcher has to reach its
+# unsupported-host and missing-backend messages under the oldest shell it can
+# land on, rather than aborting inside the library it sources.
+rm "$SYSUP_PROVIDER/lib/sysup/debup"
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian'
+set +e
+result=$(PATH="$SYSUP_MOCK_BIN:/usr/bin:/bin" _sysup_dispatch "$os_root" 2>&1)
+status=$?
+set -e
+_assert_eq "sysup dispatch: missing backend fails" "1" "$status"
+_assert_contains "sysup dispatch: missing backend names what to install" \
+  "debup backend is not installed" "$result"
+
+# Absolute links are also used when shdeps exposes a configured local checkout.
+# Exercise both link forms so the launcher never relies on GNU readlink -f.
+SYSUP_ABSOLUTE_BIN=$(_tmpdir)
+ln -s "$SYSUP_PROVIDER/bin/sysup" "$SYSUP_ABSOLUTE_BIN/sysup"
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=fedora'
+set +e
+result=$(SYSUP_OS_ROOT="$os_root" "$SYSUP_ABSOLUTE_BIN/sysup" 2>&1)
+status=$?
+set -e
+_assert_eq "sysup dispatch: absolute install symlink loads provider detection" \
+  "1" "$status"
+_assert_contains "sysup dispatch: absolute install symlink reports the host" \
+  "ID=fedora" "$result"
+
+echo ""
+echo "=== sysup: installation layout ==="
+
+SYSUP_PREFIX=$(_tmpdir)
+PREFIX="$SYSUP_PREFIX" "$REPO_ROOT/install.sh" >/dev/null
+if [[ -x "$SYSUP_PREFIX/bin/sysup" ]]; then
+  _pass "sysup install: publishes the dispatcher"
+else
+  _fail "sysup install: publishes the dispatcher"
+fi
+if [[ ! -e "$SYSUP_PREFIX/lib/sysup" && ! -L "$SYSUP_PREFIX/lib/sysup" ]]; then
+  _pass "sysup install: keeps the provider library in its checkout"
+else
+  _fail "sysup install: keeps the provider library in its checkout"
+fi
+if [[ ! -e "$SYSUP_PREFIX/bin/archup" && ! -e "$SYSUP_PREFIX/bin/debup" ]]; then
+  _pass "sysup install: keeps backends out of the public command directory"
+else
+  _fail "sysup install: keeps backends out of the public command directory"
+fi
+
+echo ""
+echo "=== sysup: dispatcher portability ==="
+
+# The dispatcher and detect.sh are the only parts that must run on a host sysup
+# cannot upgrade, so they are held to bash 3.2 (what macOS ships as /bin/bash).
+# The backends and the shared driver are Linux-only and may use bash 4 freely.
+detect_source=$(cat "$REPO_ROOT/lib/sysup/detect.sh")
+dispatcher_source=$(cat "$REPO_ROOT/bin/sysup")
+_assert_contains "sysup portability: detect.sh was read for the scan" \
+  "sysup_os_family" "$detect_source"
+_assert_contains "sysup portability: the dispatcher was read for the scan" \
+  "resolve_backend" "$dispatcher_source"
+for portability_source in "$detect_source" "$dispatcher_source"; do
+  _assert_not_contains "sysup portability: no associative arrays (need bash 4)" \
+    "declare -A" "$portability_source"
+  _assert_not_contains "sysup portability: no mapfile (needs bash 4)" \
+    "mapfile" "$portability_source"
+  _assert_not_contains "sysup portability: no \${var^^} case conversion (needs bash 4)" \
+    '^^' "$portability_source"
+done
+
+# The family lookups replaced associative arrays; prove they still resolve.
+_assert_eq "sysup families: arch resolves to its backend" \
+  "archup" "$(sysup_family_command arch)"
+_assert_eq "sysup families: debian resolves to its backend" \
+  "debup" "$(sysup_family_command debian)"
+_assert_eq "sysup families: arch resolves to its label" \
+  "Arch Linux" "$(sysup_family_label arch)"
+_assert_eq "sysup families: debian resolves to its label" \
+  "Debian-based" "$(sysup_family_label debian)"
+set +e
+sysup_family_command fedora >/dev/null
+status=$?
+set -e
+_assert_eq "sysup families: an unknown family has no backend" "1" "$status"
+
+_test_summary

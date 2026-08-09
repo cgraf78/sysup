@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    # main is the only maintained branch. Keep this trigger aligned with the
+    # default branch so retired aliases cannot hide CI drift.
+    branches: [main]
+  schedule:
+    # Stagger sibling repositories so scheduled full matrices do not compete
+    # for the same runner capacity at the top of the hour.
+    - cron: "37 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
+    with:
+      # The dispatcher must survive macOS Bash 3.2, while the Linux backends
+      # exercise package and service policy under several userlands. Keep the
+      # complete compatibility matrix on every change to this safety boundary.
+      matrix-set: full
+      profiles: base
+      shellcheck-inventory-path: .github/shellcheck-files.txt
+      test-command: SYSUP_SKIP_SHELLCHECK=1 test/run
+
+  actions-sync:
+    name: cgraf78/actions sync
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # GitHub resolves literal `uses:` refs before a job can read repository
+      # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
+      # verifies every unavoidable cgraf78/actions literal still matches that
+      # single reviewed dependency decision.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
