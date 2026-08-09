@@ -156,6 +156,23 @@ pacdiff() {
   return "$ARCHUP_PACDIFF_STATUS"
 }
 
+id() {
+  local user
+
+  [[ "${1:-}" == -u ]] || {
+    printf 'unexpected id args: %s\n' "$*" >&2
+    return 2
+  }
+  shift
+  [[ "${1:-}" == -- ]] && shift
+  user="${1:-}"
+  case "$user" in
+    chris) printf '1000\n' ;;
+    root) printf '0\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 yay() {
   if [[ "$1" == "-Si" && "$2" == "--aur" ]]; then
     if ((ARCHUP_YAY_AUR_QUERY_STATUS != 0)); then
@@ -358,6 +375,17 @@ _assert_contains "archup root: ambiguous ownership explains the explicit overrid
   "SYSUP_ARCH_USER" "$result"
 _assert_not_contains "archup root: never invokes yay as root" \
   "-Syu" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+
+_archup_mock_reset
+ARCHUP_IS_ROOT=1
+SYSUP_ARCH_USER="missing-user"
+set +e
+result=$(sysup_backend_upgrade 2>&1)
+status=$?
+set -e
+_assert_eq "archup root: unknown explicit user fails closed" "1" "$status"
+_assert_contains "archup root: unknown user error is actionable" \
+  "existing non-root user" "$result"
 
 usage=$(sysup_backend_usage)
 _assert_contains "archup usage: documents unattended package installation" \

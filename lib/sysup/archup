@@ -28,7 +28,7 @@ archup_yay_user() {
     printf 'error: running yay as root is unsafe; set SYSUP_ARCH_USER to the non-root AUR owner\n' >&2
     return 1
   fi
-  if ! uid=$(id -u "$user" 2>/dev/null) || [[ "$uid" == 0 ]]; then
+  if ! uid=$(id -u -- "$user" 2>/dev/null) || [[ "$uid" == 0 ]]; then
     printf 'error: SYSUP_ARCH_USER/SUDO_USER must name an existing non-root user\n' >&2
     return 1
   fi
