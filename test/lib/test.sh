@@ -71,21 +71,43 @@ trap _sysup_test_cleanup EXIT
 
 _tmpdir() {
   local path
-  path=$(mktemp -d "$_SYSUP_TEST_TMP_ROOT/dir.XXXXXXXX") || return 1
+  path=$(mktemp -d "$_SYSUP_TEST_TMP_ROOT/dir.XXXXXXXX") || {
+    printf 'sysup test: could not create suite temporary directory\n' >&2
+    return 1
+  }
   case "$path" in
     "$_SYSUP_TEST_TMP_ROOT"/*) ;;
-    *) return 1 ;;
+    *)
+      printf 'sysup test: unsafe suite temporary directory: %s\n' "$path" >&2
+      return 1
+      ;;
   esac
+  [[ -d "$path" ]] || {
+    printf 'sysup test: suite temporary directory does not exist: %s\n' \
+      "$path" >&2
+    return 1
+  }
   printf '%s\n' "$path"
 }
 
 _tmpfile() {
   local path
-  path=$(mktemp "$_SYSUP_TEST_TMP_ROOT/file.XXXXXXXX") || return 1
+  path=$(mktemp "$_SYSUP_TEST_TMP_ROOT/file.XXXXXXXX") || {
+    printf 'sysup test: could not create suite temporary file\n' >&2
+    return 1
+  }
   case "$path" in
     "$_SYSUP_TEST_TMP_ROOT"/*) ;;
-    *) return 1 ;;
+    *)
+      printf 'sysup test: unsafe suite temporary file: %s\n' "$path" >&2
+      return 1
+      ;;
   esac
+  [[ -f "$path" ]] || {
+    printf 'sysup test: suite temporary file does not exist: %s\n' \
+      "$path" >&2
+    return 1
+  }
   printf '%s\n' "$path"
 }
 

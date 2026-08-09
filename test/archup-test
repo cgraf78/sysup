@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # archup-test - unit tests for the Arch upgrade helper.
 
-set -o pipefail
+set -euo pipefail
 export NO_COLOR=1
 
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

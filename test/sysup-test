@@ -5,13 +5,60 @@
 # It is read by the sourced detect.sh, never by this file.
 # shellcheck disable=SC2034
 
-set -o pipefail
+set -euo pipefail
 export NO_COLOR=1
 
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
 # shellcheck source=lib/test.sh
 . "$TEST_DIR/lib/test.sh"
+
+echo "=== test harness safety ==="
+
+# A failed fixture allocation must never collapse to an empty string that a
+# caller can extend into a root-level path such as /apt.log. Exercise the
+# helper fault paths directly, then separately require every suite to run with
+# errexit so an unchecked assignment cannot continue after that failure.
+tmpdir_failure_exit=0
+tmpdir_failure_output=$(
+  # shellcheck disable=SC2329  # resolved indirectly by _tmpdir
+  mktemp() { return 1; }
+  _tmpdir 2>&1
+) || tmpdir_failure_exit=$?
+_assert_eq "test harness: directory allocation failure is fatal" \
+  "1" "$tmpdir_failure_exit"
+_assert_contains "test harness: directory allocation failure is actionable" \
+  "could not create suite temporary directory" "$tmpdir_failure_output"
+
+tmpfile_failure_exit=0
+tmpfile_failure_output=$(
+  # shellcheck disable=SC2329  # resolved indirectly by _tmpfile
+  mktemp() { return 1; }
+  _tmpfile 2>&1
+) || tmpfile_failure_exit=$?
+_assert_eq "test harness: file allocation failure is fatal" \
+  "1" "$tmpfile_failure_exit"
+_assert_contains "test harness: file allocation failure is actionable" \
+  "could not create suite temporary file" "$tmpfile_failure_output"
+
+unchecked_failure_exit=0
+unchecked_failure_output=$(
+  SYSUP_TEST_LIB="$TEST_DIR/lib/test.sh" bash -euo pipefail -c '
+    . "$SYSUP_TEST_LIB"
+    mktemp() { return 1; }
+    derived="$(_tmpdir)/apt.log"
+    printf "continued with %s\n" "$derived"
+  ' 2>&1
+) || unchecked_failure_exit=$?
+_assert_eq "test harness: unchecked allocation aborts the caller" \
+  "1" "$unchecked_failure_exit"
+_assert_not_contains "test harness: unchecked allocation never derives /apt.log" \
+  "continued with /apt.log" "$unchecked_failure_output"
+
+case $- in
+  *e*) _pass "test harness: suite exits on an unchecked allocation failure" ;;
+  *) _fail "test harness: suite exits on an unchecked allocation failure" ;;
+esac
 
 SYSUP_MOCK_BIN=$(_mock_bin)
 export PATH="$SYSUP_MOCK_BIN:$PATH"

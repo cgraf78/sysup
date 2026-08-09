@@ -5,7 +5,7 @@
 # mocks have to be real executables on PATH rather than shell functions: `env`
 # resolves a binary and would never see a function.
 
-set -o pipefail
+set -euo pipefail
 export NO_COLOR=1
 
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
