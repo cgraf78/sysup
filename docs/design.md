@@ -75,8 +75,10 @@ require extending the parser contract.
 3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, snapshot
    again, and diff to get the upgraded set.
 4. `sysup_backend_checks`.
-5. Restart active services shipped by upgraded packages, unless
-   `--no-restart-upgraded-services`.
+5. Restart affected services unless `--no-restart-upgraded-services`. The
+   shared fallback maps upgraded package files to active units; Debian instead
+   prefers `needrestart`'s runtime deleted-file analysis when available, which
+   can include services owned by other packages.
 6. With `--restart-failed`, restart failed enabled units.
 7. Report failed systemd units.
 

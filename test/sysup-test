@@ -286,10 +286,10 @@ if [[ -x "$SYSUP_PREFIX/bin/sysup" ]]; then
 else
   _fail "sysup install: publishes the dispatcher"
 fi
-if [[ -L "$SYSUP_PREFIX/lib/sysup" ]]; then
-  _pass "sysup install: publishes one private library tree"
+if [[ ! -e "$SYSUP_PREFIX/lib/sysup" && ! -L "$SYSUP_PREFIX/lib/sysup" ]]; then
+  _pass "sysup install: keeps the provider library in its checkout"
 else
-  _fail "sysup install: publishes one private library tree"
+  _fail "sysup install: keeps the provider library in its checkout"
 fi
 if [[ ! -e "$SYSUP_PREFIX/bin/archup" && ! -e "$SYSUP_PREFIX/bin/debup" ]]; then
   _pass "sysup install: keeps backends out of the public command directory"

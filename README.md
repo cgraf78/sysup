@@ -21,8 +21,7 @@ ok: dpkg and apt report a consistent package state
 
 ## Installation
 
-Clone the repository and install a PATH-visible dispatcher plus its private
-library tree:
+Clone the repository and install a PATH-visible dispatcher:
 
 ```bash
 git clone https://github.com/cgraf78/sysup.git
@@ -30,10 +29,10 @@ cd sysup
 ./install.sh
 ```
 
-`PREFIX` defaults to `$HOME/.local`. `BIN_DIR` and `LIB_DIR` can override its
-`bin` and `lib` children independently. Dependency managers can instead expose
-`bin/sysup` from the checkout directly; the launcher follows its own symlink
-back to the matching `lib/sysup` tree. For example, a shdeps entry is:
+`PREFIX` defaults to `$HOME/.local`; `BIN_DIR` can override its `bin` child.
+Dependency managers can instead expose `bin/sysup` from the checkout directly.
+In either case, the launcher follows its own symlink back to the matching
+provider-private `lib/sysup` tree. For example, a shdeps entry is:
 
 ```text
 cgraf78/sysup  github
@@ -88,9 +87,12 @@ applied upgrade may already require service restarts. The original package
 manager status retains precedence, while independent check and restart
 failures are also surfaced instead of short-circuiting one another.
 
-Only active units owned by packages proven to have changed are restarted.
-Missing systemd is a supported no-op; an unreachable or failed systemd query is
-an error rather than being mistaken for a healthy empty result.
+The shared Arch and Debian fallback restarts only active units owned by packages
+proven to have changed. When `needrestart` is available, Debian instead uses its
+runtime deleted-file analysis, which may restart another service affected by an
+upgraded library even when that service belongs to a different package. Missing
+systemd is a supported no-op; an unreachable or failed systemd query is an
+error rather than being mistaken for a healthy empty result.
 
 See [`docs/design.md`](docs/design.md) for the hook contract and detailed run
 ordering.
@@ -100,8 +102,8 @@ ordering.
 Upgrading a supported host requires Bash 4 or newer, `sudo` when not already
 root, and the host's normal package tools. The Arch path additionally uses
 `file`, `ldd`, and `sort`; `yay` is optional. The Debian path uses `apt-get`,
-`apt-mark`, `dpkg`, `dpkg-query`, `find`, and `sort`; `needrestart` is optional.
-systemd integration is used when `systemctl` is available.
+`apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
+optional. systemd integration is used when `systemctl` is available.
 
 The dispatcher and OS detection remain compatible with Bash 3.2 so an
 unsupported macOS host can still run `sysup --help` and receive a clear
