@@ -61,11 +61,20 @@ Common options:
 
 The Arch backend reports foreign packages, upgrades with `yay -Syu --devel`
 when available or `pacman -Syu` otherwise, and scans foreign-package ELF files
-for missing shared libraries. Broken AUR packages are rebuilt and their active
-services are restarted even when the rebuilt package version is unchanged.
+for missing shared libraries. It also reports `.pacnew` and `.pacsave` files
+that await manual review when `pacdiff` is available. Broken AUR packages are
+rebuilt and their active services are restarted even when the rebuilt package
+version is unchanged.
 
 Package operations are noninteractive by default. Pass `--confirm` after `--`
 to restore package-manager prompts.
+
+When `sysup` is started from an interactive root shell, it never runs `yay` as
+root. It uses the non-root account in `SUDO_USER`, or `SYSUP_ARCH_USER` when
+that must be supplied explicitly, and warms that account's sudo credential
+before starting the upgrade. An unattended root invocation therefore fails
+closed unless the account already has noninteractive sudo authorization;
+`sysup --check-only` remains suitable for unattended diagnostics.
 
 ### Debian and Ubuntu
 
@@ -99,9 +108,10 @@ ordering.
 
 ## Requirements
 
-Upgrading a supported host requires Bash 4 or newer, `sudo` when not already
-root, and the host's normal package tools. The Arch path additionally uses
-`file`, `ldd`, and `sort`; `yay` is optional. The Debian path uses `apt-get`,
+Upgrading a supported host requires Bash 4 or newer, `sudo` for privilege
+transitions, and the host's normal package tools. The Arch path additionally uses
+`file`, `id`, `ldd`, and `sort`; `yay` and `pacdiff` from `pacman-contrib` are
+optional. The Debian path uses `apt-get`,
 `apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
 optional. systemd integration is used when `systemctl` is available.
 

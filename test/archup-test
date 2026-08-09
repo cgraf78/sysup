@@ -18,9 +18,13 @@ echo "=== archup: conditional AUR rebuilds ==="
 _archup_mock_reset() {
   ARCHUP_MOCK_ROOT=$(_tmpdir)
   ARCHUP_YAY_COMMAND_LOG="$ARCHUP_MOCK_ROOT/yay-commands.log"
+  ARCHUP_SUDO_COMMAND_LOG="$ARCHUP_MOCK_ROOT/sudo-commands.log"
   ARCHUP_PACMAN_COMMAND_LOG="$ARCHUP_MOCK_ROOT/pacman-commands.log"
+  ARCHUP_PACDIFF_COMMAND_LOG="$ARCHUP_MOCK_ROOT/pacdiff-commands.log"
   : >"$ARCHUP_YAY_COMMAND_LOG"
+  : >"$ARCHUP_SUDO_COMMAND_LOG"
   : >"$ARCHUP_PACMAN_COMMAND_LOG"
+  : >"$ARCHUP_PACDIFF_COMMAND_LOG"
   ARCHUP_PACKAGES=()
   declare -gA ARCHUP_PACKAGE_FILES=()
   declare -gA ARCHUP_PACKAGE_VERSIONS=()
@@ -38,12 +42,22 @@ _archup_mock_reset() {
   ARCHUP_YAY_AUR_QUERY_STATUS=0
   ARCHUP_YAY_AUR_QUERY_ERROR=""
   ARCHUP_HAS_YAY=1
+  ARCHUP_HAS_PACDIFF=1
+  ARCHUP_PACDIFF_OUTPUT=""
+  ARCHUP_PACDIFF_STATUS=0
+  ARCHUP_IS_ROOT=0
+  SYSUP_ARCH_USER=""
+  SUDO_USER=""
   ARCHUP_PACMAN_FOREIGN_STATUS=0
   ARCHUP_PACMAN_FILES_STATUS=0
   ARCHUP_FILE_STATUS=0
   ARCHUP_LDD_STATUS=0
   ARCHUP_SYSTEMCTL_LOG="$ARCHUP_MOCK_ROOT/systemctl-commands.log"
   : >"$ARCHUP_SYSTEMCTL_LOG"
+}
+
+archup_is_root() {
+  ((ARCHUP_IS_ROOT != 0))
 }
 
 _archup_mock_add_package() {
@@ -127,8 +141,19 @@ command() {
     printf 'yay\n'
     return 0
   fi
+  if [[ "${1:-}" == "-v" && "${2:-}" == pacdiff ]]; then
+    ((ARCHUP_HAS_PACDIFF != 0)) || return 1
+    printf 'pacdiff\n'
+    return 0
+  fi
 
   builtin command "$@"
+}
+
+pacdiff() {
+  printf '%s\n' "$*" >>"$ARCHUP_PACDIFF_COMMAND_LOG"
+  printf '%s\n' "$ARCHUP_PACDIFF_OUTPUT"
+  return "$ARCHUP_PACDIFF_STATUS"
 }
 
 yay() {
@@ -189,8 +214,15 @@ ldd() {
 
 # shellcheck disable=SC2329 # Exercised indirectly by the shared driver.
 sudo() {
+  printf '%s\n' "$*" >>"$ARCHUP_SUDO_COMMAND_LOG"
   if [[ "${1:-}" == "-v" ]]; then
     return 0
+  fi
+
+  if [[ "${1:-}" == "-u" ]]; then
+    shift 2
+    [[ "${1:-}" == "-H" ]] && shift
+    [[ "${1:-}" == "--" ]] && shift
   fi
 
   "$@"
@@ -294,15 +326,92 @@ _assert_contains "archup fallback: pacman honors the prompt override" \
 _assert_not_contains "archup fallback: prompt override removes unattended mode" \
   "--noconfirm" "$pacman_commands"
 
+_archup_mock_reset
+_archup_mock_add_package root-sudo-user 1 ok
+ARCHUP_IS_ROOT=1
+SUDO_USER=chris
+sysup_backend_upgrade >/dev/null
+sudo_commands=$(cat "$ARCHUP_SUDO_COMMAND_LOG")
+_assert_contains "archup root: warms the invoking user's sudo credential" \
+  "-u chris -H -- sudo -v" "$sudo_commands"
+_assert_contains "archup root: runs yay as the invoking non-root user" \
+  "-u chris -H -- yay -Syu --devel --noconfirm" "$sudo_commands"
+
+_archup_mock_reset
+_archup_mock_add_package root-explicit-user 1 ok
+ARCHUP_IS_ROOT=1
+export SYSUP_ARCH_USER=chris
+export SUDO_USER=root
+sysup_backend_upgrade >/dev/null
+sudo_commands=$(cat "$ARCHUP_SUDO_COMMAND_LOG")
+_assert_contains "archup root: explicit user overrides an unusable SUDO_USER" \
+  "-u chris -H -- yay -Syu --devel --noconfirm" "$sudo_commands"
+
+_archup_mock_reset
+ARCHUP_IS_ROOT=1
+set +e
+result=$(sysup_backend_upgrade 2>&1)
+status=$?
+set -e
+_assert_eq "archup root: ambiguous AUR ownership fails closed" "1" "$status"
+_assert_contains "archup root: ambiguous ownership explains the explicit override" \
+  "SYSUP_ARCH_USER" "$result"
+_assert_not_contains "archup root: never invokes yay as root" \
+  "-Syu" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+
 usage=$(sysup_backend_usage)
 _assert_contains "archup usage: documents unattended package installation" \
   "upgrade packages noninteractively" "$usage"
 _assert_contains "archup usage: documents the package-manager prompt override" \
   "--confirm" "$usage"
 _assert_contains "archup usage: documents checks before service restarts" \
-  "run post-upgrade shared-library checks" "$usage"
+  "check shared libraries" "$usage"
 _assert_contains "archup usage: documents failed-unit reporting last" \
   "report failed systemd units" "$usage"
+_assert_contains "archup usage: documents root AUR ownership" \
+  "SYSUP_ARCH_USER" "$usage"
+
+echo ""
+echo "=== archup: pending package configuration ==="
+
+_archup_mock_reset
+ARCHUP_PACDIFF_OUTPUT=$'/etc/example.conf.pacnew\n/etc/removed.conf.pacsave'
+result=$(report_pending_pacman_configs 2>&1)
+_assert_eq "archup pending config: requests output-only pacdiff scan" \
+  "--output" "$(cat "$ARCHUP_PACDIFF_COMMAND_LOG")"
+_assert_contains "archup pending config: reports package config requiring review" \
+  "config files awaiting a manual merge" "$result"
+_assert_contains "archup pending config: reports .pacnew files" \
+  "/etc/example.conf.pacnew" "$result"
+_assert_contains "archup pending config: reports .pacsave files" \
+  "/etc/removed.conf.pacsave" "$result"
+_assert_contains "archup pending config: indents every pending path" \
+  "  /etc/removed.conf.pacsave" "$result"
+
+_archup_mock_reset
+result=$(report_pending_pacman_configs 2>&1)
+_assert_contains "archup pending config: clean scan reports an all-clear" \
+  "ok: no config files awaiting a manual merge" "$result"
+
+_archup_mock_reset
+ARCHUP_PACDIFF_STATUS=8
+set +e
+result=$(report_pending_pacman_configs 2>&1)
+status=$?
+set -e
+_assert_eq "archup pending config: failed scan remains advisory" "0" "$status"
+_assert_contains "archup pending config: failed scan is reported as unverified" \
+  "could not scan for config files awaiting a manual merge" "$result"
+_assert_not_contains "archup pending config: failed scan never claims an all-clear" \
+  "ok: no config files" "$result"
+
+_archup_mock_reset
+ARCHUP_HAS_PACDIFF=0
+result=$(report_pending_pacman_configs 2>&1)
+_assert_contains "archup pending config: missing pacdiff is actionable" \
+  "install pacman-contrib" "$result"
+_assert_not_contains "archup pending config: missing pacdiff never claims an all-clear" \
+  "ok: no config files" "$result"
 
 echo ""
 echo "=== archup: missing-library scan failures ==="

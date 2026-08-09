@@ -17,6 +17,49 @@ _archup_lib_dir() {
 # shellcheck source=common.sh
 . "$(_archup_lib_dir)/common.sh"
 
+archup_is_root() {
+  ((EUID == 0))
+}
+
+archup_yay_user() {
+  local user="${SYSUP_ARCH_USER:-${SUDO_USER:-}}" uid
+
+  if [[ -z "$user" || "$user" == root ]]; then
+    printf 'error: running yay as root is unsafe; set SYSUP_ARCH_USER to the non-root AUR owner\n' >&2
+    return 1
+  fi
+  if ! uid=$(id -u "$user" 2>/dev/null) || [[ "$uid" == 0 ]]; then
+    printf 'error: SYSUP_ARCH_USER/SUDO_USER must name an existing non-root user\n' >&2
+    return 1
+  fi
+  printf '%s\n' "$user"
+}
+
+archup_prepare_yay() {
+  local user
+
+  archup_is_root || return 0
+  user=$(archup_yay_user) || return
+  sysup_need_cmds sudo || return
+
+  # yay must build as the owning user, but its nested pacman invocation still
+  # needs that user's sudo credential. Warming it through the same terminal
+  # makes an interactive root shell safe and makes unattended cron fail closed.
+  sudo -u "$user" -H -- sudo -v
+}
+
+archup_run_yay() {
+  local user
+
+  if ! archup_is_root; then
+    yay "$@"
+    return
+  fi
+
+  user=$(archup_yay_user) || return
+  sudo -u "$user" -H -- yay "$@"
+}
+
 sysup_backend_usage() {
   cat <<'EOF'
 Usage: archup [--check-only] [--no-restart-upgraded-services]
@@ -31,7 +74,7 @@ Default flow:
   2. warm sudo credentials
   3. upgrade packages noninteractively with yay, or pacman when yay is absent
   4. rebuild installed AUR packages whose ELF files have missing libraries
-  5. run post-upgrade shared-library checks
+  5. report pending .pacnew/.pacsave merges and check shared libraries
   6. restart active services shipped by packages upgraded or rebuilt in this run
   7. optionally restart failed enabled units with --restart-failed
   8. report failed systemd units when systemd is available
@@ -44,6 +87,11 @@ EOF
 Extra arguments are passed to both yay upgrade and automatic AUR rebuild
 invocations, or to the pacman fallback. Package installation is noninteractive
 by default; pass --confirm after -- to restore package-manager prompts.
+
+When invoked as root, yay runs as the non-root user named by SUDO_USER. Set
+SYSUP_ARCH_USER explicitly when that value is unavailable. The user must be
+able to authenticate sudo interactively; unattended root AUR upgrades fail
+closed instead of building packages as root.
 EOF
 }
 
@@ -81,7 +129,7 @@ _archup_aur_package_status() {
   local pkg="$1" output line other_output=""
   local saw_missing=0 saw_other=0
 
-  if output="$(LC_ALL=C NO_COLOR=1 yay -Si --aur "$pkg" 2>&1)"; then
+  if output="$(LC_ALL=C NO_COLOR=1 archup_run_yay -Si --aur "$pkg" 2>&1)"; then
     return 0
   fi
 
@@ -258,6 +306,28 @@ scan_missing_libs() {
   esac
 }
 
+report_pending_pacman_configs() {
+  local listing
+  local -a configs=()
+
+  sysup_log "checking for pending package configuration"
+  if ! command -v pacdiff >/dev/null 2>&1; then
+    printf 'warning: could not scan for config files awaiting a manual merge; install pacman-contrib\n' >&2
+    return 0
+  fi
+  if ! listing=$(pacdiff --output); then
+    printf 'warning: could not scan for config files awaiting a manual merge\n' >&2
+    return 0
+  fi
+  if [[ -n "$listing" ]]; then
+    mapfile -t configs <<<"$listing"
+    printf 'config files awaiting a manual merge:\n'
+    printf '  %s\n' "${configs[@]}"
+  else
+    printf 'ok: no config files awaiting a manual merge\n'
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # sysup backend hooks
 # ---------------------------------------------------------------------------
@@ -295,7 +365,11 @@ sysup_backend_package_files() {
 }
 
 sysup_backend_checks() {
-  scan_missing_libs
+  local status=0
+
+  scan_missing_libs || status=$?
+  report_pending_pacman_configs
+  return "$status"
 }
 
 sysup_backend_upgrade() {
@@ -320,7 +394,8 @@ sysup_backend_upgrade() {
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
 
   if command -v yay >/dev/null 2>&1; then
-    yay -Syu --devel "${upgrade_args[@]}" || return
+    archup_prepare_yay || return
+    archup_run_yay -Syu --devel "${upgrade_args[@]}" || return
 
     broken_output="$(broken_foreign_packages)" || scan_status=$?
     if ((scan_status != 0)); then
@@ -349,7 +424,7 @@ sysup_backend_upgrade() {
       # driver's best-effort failure path restarts any service that did change.
       # Restarting an untouched active service is the safe conservative case.
       SYSUP_EXTRA_UPGRADED_PACKAGES+=("${rebuild_targets[@]}")
-      yay -S --aur --rebuild --redownload --answerclean All \
+      archup_run_yay -S --aur --rebuild --redownload --answerclean All \
         "${upgrade_args[@]}" "${rebuild_targets[@]}" || return
     elif ((rebuild_status == 0)); then
       sysup_log "broken foreign packages are not available in AUR"
