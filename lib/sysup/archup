@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# archup - the Arch backend for sysup.
+#
+# Shared run sequence, systemd handling, and family detection live beside this
+# private backend; this file only supplies the pacman/yay specifics.
+set -Eeuo pipefail
+
+# Read by the sysup library sourced below, for messages and the family guard.
+# shellcheck disable=SC2034
+SYSUP_BACKEND_NAME=archup
+
+_archup_lib_dir() {
+  local src="${BASH_SOURCE[0]}"
+  (cd "$(dirname "$src")" >/dev/null 2>&1 && pwd -P)
+}
+
+# shellcheck source=common.sh
+. "$(_archup_lib_dir)/common.sh"
+
+sysup_backend_usage() {
+  cat <<'EOF'
+Usage: archup [--check-only] [--no-restart-upgraded-services]
+              [--restart-failed] [--] [extra yay/pacman args...]
+
+Upgrade an Arch host, rebuilding broken AUR packages when yay is available,
+then verify the failure modes most likely to leave services broken after the
+upgrade.
+
+Default flow:
+  1. report installed foreign packages
+  2. warm sudo credentials
+  3. upgrade packages noninteractively with yay, or pacman when yay is absent
+  4. rebuild installed AUR packages whose ELF files have missing libraries
+  5. run post-upgrade shared-library checks
+  6. restart active services shipped by packages upgraded or rebuilt in this run
+  7. optionally restart failed enabled units with --restart-failed
+  8. report failed systemd units when systemd is available
+
+Options:
+EOF
+  sysup_usage_common_options
+  cat <<'EOF'
+
+Extra arguments are passed to both yay upgrade and automatic AUR rebuild
+invocations, or to the pacman fallback. Package installation is noninteractive
+by default; pass --confirm after -- to restore package-manager prompts.
+EOF
+}
+
+foreign_packages() {
+  pacman -Qqm | sort
+}
+
+aur_rebuild_targets() {
+  local pkg lookup_status status=0
+
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    if _archup_aur_package_status "$pkg"; then
+      printf '%s\n' "$pkg"
+      continue
+    else
+      lookup_status=$?
+    fi
+
+    ((lookup_status == 1)) && continue
+    printf 'warning: could not verify whether %s can be rebuilt from AUR; skipped automatic rebuild\n' \
+      "$pkg" >&2
+    status=2
+  done
+
+  return "$status"
+}
+
+# yay reports every requested package as missing when the AUR query itself
+# fails. Under a stable C locale, a lone "not found" diagnostic proves absence;
+# any additional diagnostic means membership is unverified instead.
+#
+# Returns 0 when present, 1 when confirmed absent, and 2 when the lookup failed.
+_archup_aur_package_status() {
+  local pkg="$1" output line other_output=""
+  local saw_missing=0 saw_other=0
+
+  if output="$(LC_ALL=C NO_COLOR=1 yay -Si --aur "$pkg" 2>&1)"; then
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == *"No AUR package found for"* && "$line" == *"$pkg"* ]]; then
+      saw_missing=1
+      continue
+    fi
+
+    other_output+="${other_output:+$'\n'}$line"
+    saw_other=1
+  done <<<"$output"
+
+  if ((saw_missing && saw_other == 0)); then
+    return 1
+  fi
+
+  if [[ -n "$other_output" ]]; then
+    printf '%s\n' "$other_output" >&2
+  else
+    printf 'yay could not query AUR package %s and returned no diagnostic\n' "$pkg" >&2
+  fi
+  return 2
+}
+
+# Foreign packages missing from the AUR cannot be rebuilt automatically, so the
+# operator has to know they are now their own responsibility.
+warn_non_aur_foreign_packages() {
+  local packages pkg lookup_status
+  local missing_found=0 unverified_found=0
+
+  if ! packages="$(foreign_packages)"; then
+    printf 'warning: could not list foreign packages; AUR membership is unverified\n' >&2
+    return 0
+  fi
+
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    if _archup_aur_package_status "$pkg"; then
+      continue
+    else
+      lookup_status=$?
+    fi
+
+    if ((lookup_status == 1)); then
+      if ((missing_found == 0)); then
+        sysup_log "foreign packages not found in AUR"
+        missing_found=1
+      fi
+      printf '  %s\n' "$pkg"
+      continue
+    fi
+
+    if ((unverified_found == 0)); then
+      sysup_log "could not verify AUR membership for foreign packages"
+      unverified_found=1
+    fi
+    printf '  %s\n' "$pkg"
+  done <<<"$packages"
+}
+
+# A repository upgrade can bump a shared library past the soname an AUR package
+# was built against. The package still looks installed and current, but its
+# binaries no longer load, so scan the ones built locally.
+scan_foreign_package_libs() {
+  local mode="${1:-report}"
+  local packages pkg listing file desc dependencies missing line
+  local found=0 pkg_printed
+
+  if ! packages="$(foreign_packages)"; then
+    printf 'error: could not list foreign packages; missing-library state is unverified\n' >&2
+    return 2
+  fi
+
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    pkg_printed=0
+
+    if ! listing="$(pacman -Qlq "$pkg")"; then
+      printf 'error: could not list files owned by %s; missing-library state is unverified\n' \
+        "$pkg" >&2
+      return 2
+    fi
+
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+
+      if ! desc="$(file -b "$file")"; then
+        printf 'error: could not identify %s with file; missing-library state is unverified\n' \
+          "$file" >&2
+        return 2
+      fi
+      [[ "$desc" == *ELF* ]] || continue
+      # Static executables and relocatable objects have no runtime shared-library
+      # dependencies; ldd legitimately rejects them.
+      [[ "$desc" == *"dynamically linked"* ]] || continue
+      # Separated debug info is never loaded at runtime, so it has no library
+      # dependencies to verify. It still reports itself as dynamically linked
+      # (with an empty interpreter), so the check above does not exclude it and
+      # ldd rejects it. Every `*-debug` package ships these, which makes them
+      # common among foreign packages.
+      case "$file" in
+        /usr/lib/debug/* | *.debug) continue ;;
+      esac
+
+      if ! dependencies="$(ldd "$file")"; then
+        printf 'error: could not inspect shared-library dependencies for %s; state is unverified\n' \
+          "$file" >&2
+        return 2
+      fi
+
+      missing=""
+      while IFS= read -r line; do
+        [[ "$line" == *"not found"* ]] || continue
+        missing+="${missing:+$'\n'}$line"
+      done <<<"$dependencies"
+      [[ -n "$missing" ]] || continue
+
+      if [[ "$mode" == "packages" ]]; then
+        if ((pkg_printed == 0)); then
+          printf '%s\n' "$pkg"
+          pkg_printed=1
+        fi
+        found=1
+        continue
+      fi
+
+      if ((pkg_printed == 0)); then
+        printf 'broken libraries in %s:\n' "$pkg"
+        pkg_printed=1
+      fi
+
+      printf '  %s\n' "$file"
+      while IFS= read -r line; do
+        printf '    %s\n' "$line"
+      done <<<"$missing"
+      found=1
+    done <<<"$listing"
+  done <<<"$packages"
+
+  ((found == 0))
+}
+
+broken_foreign_packages() {
+  local status=0
+
+  scan_foreign_package_libs packages || status=$?
+  case "$status" in
+    0 | 1) return 0 ;;
+    *) return "$status" ;;
+  esac
+}
+
+scan_missing_libs() {
+  local status=0
+
+  sysup_log "checking foreign packages for missing shared libraries"
+
+  scan_foreign_package_libs report || status=$?
+  case "$status" in
+    0)
+      printf 'ok: no missing shared libraries found in foreign packages\n'
+      return 0
+      ;;
+    1)
+      printf '\nerror: at least one foreign package has missing libraries\n' >&2
+      return 1
+      ;;
+    *)
+      printf '\nerror: could not complete the foreign-package library scan\n' >&2
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# sysup backend hooks
+# ---------------------------------------------------------------------------
+
+sysup_backend_require() {
+  sysup_require_family arch || return
+  sysup_need_cmds pacman file ldd sort
+}
+
+sysup_backend_preamble() {
+  local -a packages=()
+  local package_listing
+
+  if ! package_listing="$(foreign_packages)"; then
+    printf 'error: could not list foreign packages\n' >&2
+    return 1
+  fi
+  if [[ -n "$package_listing" ]]; then
+    mapfile -t packages <<<"$package_listing"
+  fi
+  sysup_log "foreign packages (${#packages[@]})"
+  if ((${#packages[@]})); then
+    printf '  %s\n' "${packages[@]}"
+  else
+    printf '  (none)\n'
+  fi
+}
+
+sysup_backend_snapshot() {
+  pacman -Q | sort
+}
+
+sysup_backend_package_files() {
+  pacman -Qlq "$1"
+}
+
+sysup_backend_checks() {
+  scan_missing_libs
+}
+
+sysup_backend_upgrade() {
+  local confirmation_arg=--noconfirm arg
+  local -a upgrade_args=()
+  local -a broken_packages=()
+  local -a rebuild_targets=()
+  local broken_output="" rebuild_output=""
+  local scan_status=0 rebuild_status=0
+
+  # yay tracks its own no-confirm state separately from the options it passes
+  # to pacman, so giving it both flags restores pacman's prompt but not yay's
+  # menus. Normalize the pair so the caller's last choice controls both.
+  for arg in "$@"; do
+    case "$arg" in
+      --confirm | --noconfirm) confirmation_arg="$arg" ;;
+      *) upgrade_args+=("$arg") ;;
+    esac
+  done
+  upgrade_args=("$confirmation_arg" "${upgrade_args[@]}")
+
+  SYSUP_EXTRA_UPGRADED_PACKAGES=()
+
+  if command -v yay >/dev/null 2>&1; then
+    yay -Syu --devel "${upgrade_args[@]}" || return
+
+    broken_output="$(broken_foreign_packages)" || scan_status=$?
+    if ((scan_status != 0)); then
+      printf 'warning: automatic AUR rebuild scan was incomplete; continuing to post-upgrade checks\n' >&2
+      warn_non_aur_foreign_packages
+      return 0
+    fi
+    if [[ -n "$broken_output" ]]; then
+      mapfile -t broken_packages <<<"$broken_output"
+    fi
+    if ((${#broken_packages[@]} == 0)); then
+      sysup_log "no broken foreign package libraries found after upgrade"
+      warn_non_aur_foreign_packages
+      return
+    fi
+
+    rebuild_output="$(printf '%s\n' "${broken_packages[@]}" | aur_rebuild_targets)" || rebuild_status=$?
+    if [[ -n "$rebuild_output" ]]; then
+      mapfile -t rebuild_targets <<<"$rebuild_output"
+    fi
+    if ((${#rebuild_targets[@]})); then
+      sysup_log "rebuilding broken AUR packages (${#rebuild_targets[@]})"
+      printf '  %s\n' "${rebuild_targets[@]}"
+      # yay can install one target and fail later (another target or a hook).
+      # Mark every attempted same-version rebuild before invoking it so the
+      # driver's best-effort failure path restarts any service that did change.
+      # Restarting an untouched active service is the safe conservative case.
+      SYSUP_EXTRA_UPGRADED_PACKAGES+=("${rebuild_targets[@]}")
+      yay -S --aur --rebuild --redownload --answerclean All \
+        "${upgrade_args[@]}" "${rebuild_targets[@]}" || return
+    elif ((rebuild_status == 0)); then
+      sysup_log "broken foreign packages are not available in AUR"
+    fi
+
+    warn_non_aur_foreign_packages
+    return
+  fi
+
+  sysup_log "yay not found; upgrading repository packages only"
+  sysup_run_as_root pacman -Syu "${upgrade_args[@]}"
+}
+
+if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then
+  sysup_main "$@"
+fi

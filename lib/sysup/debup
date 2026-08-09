@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# debup - the Debian backend for sysup.
+#
+# Shared run sequence, systemd handling, and family detection live beside this
+# private backend; this file only supplies the apt/dpkg specifics.
+#
+# This upgrades packages within the installed release. It never edits APT
+# sources and never performs a release upgrade.
+set -Eeuo pipefail
+
+# Read by the sysup library sourced below, for messages and the family guard.
+# shellcheck disable=SC2034
+SYSUP_BACKEND_NAME=debup
+
+_debup_lib_dir() {
+  local src="${BASH_SOURCE[0]}"
+  (cd "$(dirname "$src")" >/dev/null 2>&1 && pwd -P)
+}
+
+# shellcheck source=common.sh
+. "$(_debup_lib_dir)/common.sh"
+
+# `upgrade --with-new-pkgs` installs new dependencies, so kernel ABI bumps and
+# renamed packages land, but never removes an installed package. `--full-upgrade`
+# opts into removals when a dependency change requires them.
+DEBUP_UPGRADE_VERB=upgrade
+DEBUP_AUTOREMOVE=0
+
+# Seconds apt waits for the dpkg lock. These hosts run unattended-upgrades, so a
+# collision is expected rather than exceptional and should be waited out.
+#
+# This covers only the dpkg locks (Debian #1012173). `apt-get update` takes the
+# lists lock instead, which has no wait, so that step is retried separately.
+DEBUP_LOCK_TIMEOUT="${DEBUP_LOCK_TIMEOUT:-300}"
+
+# Bounded retry for `apt-get update`, whose lists lock ignores the timeout above.
+DEBUP_UPDATE_ATTEMPTS="${DEBUP_UPDATE_ATTEMPTS:-5}"
+DEBUP_UPDATE_RETRY_DELAY="${DEBUP_UPDATE_RETRY_DELAY:-30}"
+
+# The needrestart command, resolved through PATH by default. Overridable so
+# tests can select a fixture, or point at a path that does not exist to
+# exercise the built-in fallback on a host where needrestart is installed.
+DEBUP_NEEDRESTART="${DEBUP_NEEDRESTART:-needrestart}"
+
+# Directories searched when the caller's PATH does not carry needrestart. These
+# are the sbin entries sudo's secure_path provides, which is where it will
+# actually be run from.
+DEBUP_NEEDRESTART_SEARCH_PATH="${DEBUP_NEEDRESTART_SEARCH_PATH:-/usr/local/sbin:/usr/sbin:/sbin}"
+
+# System paths the advisory checks read. Overridable so tests can point them at
+# a fixture tree instead of the live system.
+DEBUP_REBOOT_REQUIRED_FILE="${DEBUP_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
+DEBUP_CONFFILE_ROOT="${DEBUP_CONFFILE_ROOT:-/etc}"
+
+sysup_backend_usage() {
+  cat <<'EOF'
+Usage: debup [--full-upgrade] [--autoremove] [--check-only]
+             [--no-restart-upgraded-services] [--restart-failed] [--]
+             [extra apt-get args...]
+
+Upgrade a Debian or Ubuntu host within its installed release, then verify the
+failure modes most likely to leave services broken after the upgrade.
+
+Default flow:
+  1. report held packages
+  2. warm sudo credentials
+  3. update package lists and upgrade packages noninteractively
+  4. optionally autoremove unused packages, then autoclean the package cache
+  5. run dpkg/apt, pending-config, and reboot-required checks
+  6. restart services affected by upgraded packages, preferring needrestart
+  7. optionally restart failed enabled units with --restart-failed
+  8. report failed systemd units when systemd is available
+
+Options:
+  --full-upgrade                  use apt-get full-upgrade, allowing packages to
+                                  be removed to resolve dependencies. Stays
+                                  within the installed release.
+  --autoremove                    purge packages no longer required, instead of
+                                  only reporting them
+EOF
+  sysup_usage_common_options
+  cat <<'EOF'
+
+Extra arguments are passed through to the apt-get upgrade invocation. Package
+installation is noninteractive by default.
+
+debup never performs a release upgrade; use the distribution's documented
+release-upgrade procedure for that.
+EOF
+}
+
+# apt options shared by every invocation.
+#
+# force-confdef/force-confold keep a package from replacing a config file that
+# was modified locally; the pending-conffile check reports what needs merging.
+debup_apt_options() {
+  printf '%s\n' \
+    -o "DPkg::Lock::Timeout=$DEBUP_LOCK_TIMEOUT" \
+    -o 'Dpkg::Options::=--force-confdef' \
+    -o 'Dpkg::Options::=--force-confold'
+}
+
+debup_apt_get() {
+  local -a options=()
+
+  mapfile -t options < <(debup_apt_options)
+
+  # needrestart hooks into apt and prompts interactively by default, which would
+  # stall an unattended run. Restrict it to listing; debup drives the restart
+  # itself once the package diff is known.
+  sysup_run_as_root env \
+    DEBIAN_FRONTEND=noninteractive \
+    NEEDRESTART_MODE=l \
+    apt-get "${options[@]}" "$@"
+}
+
+# Resolve needrestart to an absolute path, or return 1 when it is not installed.
+#
+# needrestart lives in /usr/sbin, which a normal user's PATH omits on Debian.
+# debup runs unprivileged and escalates per command, so detection sees the
+# caller's PATH while execution sees sudo's secure_path -- which does include
+# the sbin directories. Detecting with the caller's PATH alone reports
+# needrestart missing on a host where it is installed and runs fine, and debup
+# then silently falls back to the built-in restart path.
+#
+# Resolving to one absolute path keeps detection and execution in agreement.
+debup_needrestart_path() {
+  local candidate dir
+
+  # An explicit path (tests, or a deliberate override) is used as given.
+  case "$DEBUP_NEEDRESTART" in
+    */*)
+      [[ -x "$DEBUP_NEEDRESTART" ]] || return 1
+      printf '%s\n' "$DEBUP_NEEDRESTART"
+      return 0
+      ;;
+  esac
+
+  if candidate="$(command -v "$DEBUP_NEEDRESTART" 2>/dev/null)"; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  while IFS= read -r dir; do
+    [[ -n "$dir" && -x "$dir/$DEBUP_NEEDRESTART" ]] || continue
+    printf '%s\n' "$dir/$DEBUP_NEEDRESTART"
+    return 0
+  done < <(tr ':' '\n' <<<"$DEBUP_NEEDRESTART_SEARCH_PATH")
+
+  return 1
+}
+
+debup_held_packages() {
+  apt-mark showhold 2>/dev/null | sort
+}
+
+# `apt-get update` fails immediately on lock contention rather than waiting, and
+# unattended-upgrades holds that lock routinely on these hosts. Retry instead of
+# aborting a whole run over a collision that clears on its own.
+debup_apt_update() {
+  local attempt=1
+
+  while :; do
+    # apt-get otherwise exits zero when one repository fails and stale indexes
+    # are reused, which would turn a missed security update into a clean run.
+    debup_apt_get -o APT::Update::Error-Mode=any update && return 0
+    ((attempt < DEBUP_UPDATE_ATTEMPTS)) || break
+    printf 'apt-get update failed (attempt %s/%s); retrying in %ss\n' \
+      "$attempt" "$DEBUP_UPDATE_ATTEMPTS" "$DEBUP_UPDATE_RETRY_DELAY" >&2
+    sleep "$DEBUP_UPDATE_RETRY_DELAY"
+    attempt=$((attempt + 1))
+  done
+
+  printf 'error: apt-get update failed after %s attempts\n' "$DEBUP_UPDATE_ATTEMPTS" >&2
+  return 1
+}
+
+# Ubuntu writes the reboot flag from update-notifier-common. Debian dropped that
+# package, so on stock Debian nothing creates it and the file alone is a false
+# negative after a kernel upgrade. Prefer needrestart's kernel status, which is
+# derived from the running kernel rather than from a package hook.
+#
+# NEEDRESTART-KSTA: 0 unknown, 1 none pending, 2 ABI-compatible upgrade pending,
+# 3 version upgrade pending.
+debup_reboot_required() {
+  local output ksta="" line needrestart
+
+  if needrestart="$(debup_needrestart_path)"; then
+    if output="$(sysup_run_as_root "$needrestart" -b -k 2>&1)"; then
+      while IFS= read -r line; do
+        case "$line" in
+          "NEEDRESTART-KSTA: "*)
+            ksta="${line#NEEDRESTART-KSTA: }"
+            break
+            ;;
+        esac
+      done <<<"$output"
+      case "$ksta" in
+        2 | 3) return 0 ;;
+        1) return 1 ;;
+      esac
+    fi
+
+    # A positive flag remains conclusive even if needrestart failed or emitted
+    # an unfamiliar response. An absent flag is not a clean result on stock
+    # Debian, where no package normally creates it.
+    [[ -f "$DEBUP_REBOOT_REQUIRED_FILE" ]] && return 0
+    return 2
+  fi
+
+  [[ -f "$DEBUP_REBOOT_REQUIRED_FILE" ]] && return 0
+  return 2
+}
+
+# Config files a package upgrade could not install because the local copy
+# diverged. They are inert until merged, so the new defaults are not in effect.
+#
+# This runs unprivileged, so a root-only directory under /etc can make the scan
+# incomplete. The caller reports that uncertainty rather than escalating just
+# to list filenames.
+debup_pending_conffiles() {
+  find "$DEBUP_CONFFILE_ROOT" \
+    \( -name '*.dpkg-dist' -o -name '*.dpkg-new' -o -name '*.ucf-dist' \) \
+    -type f -print 2>/dev/null | sort
+}
+
+check_package_integrity() {
+  local audit status=0
+
+  sysup_log "checking dpkg and apt integrity"
+
+  # `dpkg --audit` always exits 0 and writes its problem report to stdout, so
+  # non-empty stdout is the only available signal. Deliberately do not fold in
+  # stderr: dpkg emits unrelated warnings there (a missing *.list file, say),
+  # and treating those as breakage would fail every run on such a host forever.
+  if ! audit="$(dpkg --audit)"; then
+    printf '\nerror: dpkg --audit failed; package database state is unverified\n' >&2
+    status=1
+  elif [[ -n "$audit" ]]; then
+    printf '%s\n' "$audit"
+    printf '\nerror: dpkg reports packages in a broken state\n' >&2
+    status=1
+  fi
+
+  # Routed through debup_apt_get so this takes the same lock timeout as the
+  # upgrade; `apt-get check` opens the cache with a lock and would otherwise
+  # fail outright against a concurrent unattended-upgrades run.
+  if ! debup_apt_get check; then
+    # sysup_run_as_root fails for privilege reasons too, so do not assert a
+    # cause the exit status does not establish.
+    printf '\nerror: apt-get check failed; see its output above (a privilege failure looks the same here)\n' >&2
+    status=1
+  fi
+
+  ((status == 0)) && printf 'ok: dpkg and apt report a consistent package state\n'
+  return "$status"
+}
+
+# Advisory: the upgrade succeeded, but its result is not fully live yet.
+report_pending_state() {
+  local -a conffiles=() packages=()
+  local conffile_listing="" reboot_status=0 conffile_status=0
+
+  sysup_log "checking for pending post-upgrade work"
+
+  if debup_reboot_required; then
+    printf 'reboot required to complete this upgrade\n'
+    if [[ -r "$DEBUP_REBOOT_REQUIRED_FILE.pkgs" ]]; then
+      mapfile -t packages < <(sort -u "$DEBUP_REBOOT_REQUIRED_FILE.pkgs" 2>/dev/null || true)
+      ((${#packages[@]} == 0)) || printf '  %s\n' "${packages[@]}"
+    fi
+  else
+    reboot_status=$?
+    if ((reboot_status == 1)); then
+      printf 'ok: no reboot required\n'
+    else
+      printf 'warning: could not determine whether a reboot is required; install or repair needrestart and check again\n' >&2
+    fi
+  fi
+
+  conffile_listing="$(debup_pending_conffiles)" || conffile_status=$?
+  if [[ -n "$conffile_listing" ]]; then
+    mapfile -t conffiles <<<"$conffile_listing"
+  fi
+  if ((${#conffiles[@]})); then
+    printf '\nconfig files awaiting a manual merge:\n'
+    printf '  %s\n' "${conffiles[@]}"
+  fi
+  if ((conffile_status != 0)); then
+    printf 'warning: could not completely scan for config files awaiting a manual merge\n' >&2
+  elif ((${#conffiles[@]} == 0)); then
+    printf 'ok: no config files awaiting a manual merge\n'
+  fi
+}
+
+report_autoremovable() {
+  local simulated output
+
+  # --simulate takes no lock and needs no root, so this runs unprivileged.
+  if ! simulated="$(apt-get --simulate autoremove 2>&1)"; then
+    printf '%s\n' "$simulated" >&2
+    printf 'warning: could not determine which packages are no longer required\n' >&2
+    return 0
+  fi
+
+  # `Remv`/`Purg` are untranslated literals from pkgSimulate, so this parse is
+  # locale-independent. Purg appears when APT::Get::Purge is set host-wide.
+  #
+  # -E, because `\|` alternation is a GNU sed extension that BSD sed ignores.
+  output="$(printf '%s\n' "$simulated" |
+    sed -E -n 's/^(Remv|Purg) ([^ ]*).*/  \2/p')"
+
+  if [[ -z "$output" ]]; then
+    printf 'ok: no packages are eligible for autoremove\n'
+    return 0
+  fi
+
+  sysup_log "packages no longer required"
+  printf '%s\n' "$output"
+  printf '\nhint: run: debup --autoremove\n'
+}
+
+# ---------------------------------------------------------------------------
+# sysup backend hooks
+# ---------------------------------------------------------------------------
+
+sysup_backend_require() {
+  sysup_require_family debian || return
+  sysup_need_cmds apt-get apt-mark dpkg dpkg-query find sed sort
+}
+
+sysup_backend_preamble() {
+  local -a held=()
+  local held_listing
+
+  if ! held_listing="$(debup_held_packages)"; then
+    printf 'error: could not list held packages; upgrade eligibility is unverified\n' >&2
+    return 1
+  fi
+  if [[ -n "$held_listing" ]]; then
+    mapfile -t held <<<"$held_listing"
+  fi
+  sysup_log "held packages (${#held[@]})"
+  if ((${#held[@]})); then
+    # Held packages are deliberately excluded from the upgrade, so surface them
+    # rather than letting a pinned package silently go stale.
+    printf '  %s\n' "${held[@]}"
+  else
+    printf '  (none)\n'
+  fi
+}
+
+# dpkg-query also lists packages that were removed but kept their config. Keep
+# packages whose desired state is installed, including unpacked/half-configured
+# states: a failed upgrade can already have replaced their files, and the
+# failure-recovery path still needs to discover and restart their services.
+#
+# binary:Package, not Package: it appends the architecture for foreign-arch
+# packages. A bare name would collapse the two rows of a multi-arch pair into
+# one version, hiding an upgrade, and `dpkg -L` rejects it as ambiguous.
+sysup_backend_snapshot() {
+  dpkg-query -W -f '${db:Status-Abbrev}\t${binary:Package}\t${Version}\n' 2>/dev/null |
+    while IFS=$'\t' read -r state pkg version; do
+      [[ "$state" == i* ]] || continue
+      [[ -n "$pkg" ]] || continue
+      printf '%s %s\n' "$pkg" "$version"
+    done | sort
+}
+
+sysup_backend_package_files() {
+  dpkg -L "$1"
+}
+
+sysup_backend_parse_arg() {
+  case "$1" in
+    --full-upgrade)
+      DEBUP_UPGRADE_VERB=full-upgrade
+      ;;
+    --autoremove)
+      DEBUP_AUTOREMOVE=1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+sysup_backend_checks() {
+  local status=0
+
+  check_package_integrity || status=1
+  # Advisory: a pending reboot or unmerged config file is expected output from a
+  # successful upgrade, not a failure, so it never changes the exit status.
+  report_pending_state
+  return "$status"
+}
+
+# needrestart is the canonical Debian answer here: it inspects running processes
+# for deleted mappings rather than inferring from package contents, so it also
+# catches services linking an upgraded library they do not own.
+sysup_backend_restart_services() {
+  local needrestart
+
+  if needrestart="$(debup_needrestart_path)"; then
+    sysup_log "restarting services reported by needrestart"
+    sysup_run_as_root "$needrestart" -r a
+    return
+  fi
+
+  sysup_restart_upgraded_services "$@"
+}
+
+sysup_backend_upgrade() {
+  local -a extra_args=("$@")
+
+  debup_apt_update || return
+
+  if [[ "$DEBUP_UPGRADE_VERB" == upgrade ]]; then
+    debup_apt_get --with-new-pkgs upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
+  else
+    debup_apt_get full-upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
+  fi
+
+  if ((DEBUP_AUTOREMOVE)); then
+    sysup_log "purging packages no longer required"
+    debup_apt_get --purge autoremove -y || return
+  else
+    report_autoremovable
+  fi
+
+  # Reclaiming the package cache is cosmetic. Its status must not become this
+  # function's status: the driver treats a failed upgrade as fatal and skips
+  # every post-upgrade check and service restart, which would be badly wrong
+  # after the packages themselves installed successfully.
+  debup_apt_get autoclean -y ||
+    printf 'warning: apt-get autoclean failed; the package cache was not reclaimed\n' >&2
+  return 0
+}
+
+if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then
+  sysup_main "$@"
+fi
