@@ -175,7 +175,9 @@ for backend in archup debup; do
 #!/usr/bin/env bash
 {
   printf '$backend'
-  printf ' <%s>' "\$@"
+  if ((\$#)); then
+    printf ' <%s>' "\$@"
+  fi
   printf '\n'
 } >"$SYSUP_DISPATCH_LOG"
 EOF
