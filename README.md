@@ -21,7 +21,15 @@ ok: dpkg and apt report a consistent package state
 
 ## Installation
 
-Clone the repository and install a PATH-visible dispatcher:
+For the simplest checkout-backed install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cgraf78/sysup/main/install.sh | bash
+```
+
+This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
+absolute, or under `$HOME/.local/share` otherwise, and links the dispatcher
+into the selected prefix. To manage the checkout path yourself:
 
 ```bash
 git clone https://github.com/cgraf78/sysup.git
