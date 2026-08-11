@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@464468328f050e43299298fc0eac8b971ddd38b7
     with:
       # The dispatcher must survive macOS Bash 3.2, while the Linux backends
       # exercise package and service policy under several userlands. Keep the
@@ -26,6 +26,45 @@ jobs:
       profiles: base
       shellcheck-inventory-path: .github/shellcheck-files.txt
       test-command: SYSUP_SKIP_SHELLCHECK=1 test/run
+
+  macos-bash32:
+    name: Stock macOS Bash 3.2
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exercise installed dispatcher with stock macOS Bash
+        shell: /bin/bash {0}
+        run: |-
+          set -euo pipefail
+          [[ ${BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2 ]]
+
+          install_prefix="$RUNNER_TEMP/sysup-bash32"
+          PREFIX="$install_prefix" /bin/bash install.sh
+          [[ -L "$install_prefix/bin/sysup" ]]
+
+          help_output=$(/bin/bash "$install_prefix/bin/sysup" --help)
+          [[ "$help_output" == *"Usage: sysup"* ]]
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs: [shell, macos-bash32]
+    runs-on: ubuntu-24.04
+    env:
+      SHELL_RESULT: ${{ needs.shell.result }}
+      BASH32_RESULT: ${{ needs.macos-bash32.result }}
+    steps:
+      - name: Require all Sysup compatibility checks
+        shell: bash
+        run: |-
+          printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
+          printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
+
+          test "$SHELL_RESULT" = success
+          test "$BASH32_RESULT" = success
 
   actions-sync:
     name: cgraf78/actions sync
@@ -41,4 +80,4 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@464468328f050e43299298fc0eac8b971ddd38b7
