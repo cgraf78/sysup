@@ -333,6 +333,13 @@ if [[ -x "$SYSUP_PREFIX/bin/sysup" ]]; then
 else
   _fail "sysup install: publishes the dispatcher"
 fi
+if [[ -L "$SYSUP_PREFIX/bin/sysup" ]]; then
+  _pass "sysup install: publishes a version-coupled link"
+else
+  _fail "sysup install: publishes a version-coupled link"
+fi
+_assert_eq "sysup install: link selects this checkout" \
+  "$REPO_ROOT/bin/sysup" "$(readlink "$SYSUP_PREFIX/bin/sysup")"
 if [[ ! -e "$SYSUP_PREFIX/lib/sysup" && ! -L "$SYSUP_PREFIX/lib/sysup" ]]; then
   _pass "sysup install: keeps the provider library in its checkout"
 else
@@ -343,6 +350,46 @@ if [[ ! -e "$SYSUP_PREFIX/bin/archup" && ! -e "$SYSUP_PREFIX/bin/debup" ]]; then
 else
   _fail "sysup install: keeps backends out of the public command directory"
 fi
+
+PREFIX="$SYSUP_PREFIX" "$REPO_ROOT/install.sh" >/dev/null
+_assert_eq "sysup install: reinstall is idempotent" \
+  "$REPO_ROOT/bin/sysup" "$(readlink "$SYSUP_PREFIX/bin/sysup")"
+
+SYSUP_CUSTOM_BIN=$(_tmpdir)/commands
+BIN_DIR="$SYSUP_CUSTOM_BIN" "$REPO_ROOT/install.sh" >/dev/null
+_assert_eq "sysup install: honors BIN_DIR" \
+  "$REPO_ROOT/bin/sysup" "$(readlink "$SYSUP_CUSTOM_BIN/sysup")"
+
+SYSUP_BLOCKED_BIN=$(_tmpdir)/commands
+mkdir -p "$SYSUP_BLOCKED_BIN"
+printf 'owned elsewhere\n' >"$SYSUP_BLOCKED_BIN/sysup"
+set +e
+blocked_output=$(BIN_DIR="$SYSUP_BLOCKED_BIN" "$REPO_ROOT/install.sh" 2>&1)
+blocked_status=$?
+set -e
+_assert_eq "sysup install: refuses a non-symlink destination" "1" "$blocked_status"
+_assert_eq "sysup install: preserves a non-symlink destination" \
+  "owned elsewhere" "$(cat "$SYSUP_BLOCKED_BIN/sysup")"
+_assert_contains "sysup install: destination refusal is actionable" \
+  "refusing to replace non-symlink" "$blocked_output"
+
+SYSUP_MISSING_ROOT=$(_tmpdir)
+SYSUP_MISSING_PREFIX=$(_tmpdir)
+cp "$REPO_ROOT/install.sh" "$SYSUP_MISSING_ROOT/install.sh"
+set +e
+missing_output=$(PREFIX="$SYSUP_MISSING_PREFIX" \
+  "$SYSUP_MISSING_ROOT/install.sh" 2>&1)
+missing_status=$?
+set -e
+_assert_eq "sysup install: missing command source fails" "1" "$missing_status"
+if [[ ! -e "$SYSUP_MISSING_PREFIX/bin/sysup" &&
+  ! -L "$SYSUP_MISSING_PREFIX/bin/sysup" ]]; then
+  _pass "sysup install: missing source publishes no command"
+else
+  _fail "sysup install: missing source publishes no command"
+fi
+_assert_contains "sysup install: missing source is actionable" \
+  "command source is not executable" "$missing_output"
 
 echo ""
 echo "=== sysup: dispatcher portability ==="
