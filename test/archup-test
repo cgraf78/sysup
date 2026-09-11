@@ -33,6 +33,10 @@ _archup_mock_reset() {
   declare -gA ARCHUP_LDD_OUTPUT=()
   ARCHUP_LDD_REJECTED_FILES=""
   ARCHUP_ACTIVE_UNITS=()
+  ARCHUP_NON_RESTARTABLE_UNITS=""
+  ARCHUP_NON_RESTARTABLE_AFTER_RELOAD_UNITS=""
+  ARCHUP_SYSTEMCTL_SHOW_STATUS=0
+  ARCHUP_SYSTEMCTL_SHOW_MALFORMED=0
   ARCHUP_FAILED_UNITS=""
   ARCHUP_DISABLED_UNITS=""
   ARCHUP_SYSTEMCTL_QUERY_STATUS=0
@@ -257,6 +261,24 @@ systemctl() {
       for unit in "${ARCHUP_ACTIVE_UNITS[@]}"; do
         printf '%s loaded active running mock unit\n' "$unit"
       done
+      ;;
+    show)
+      if ((ARCHUP_SYSTEMCTL_SHOW_STATUS != 0)); then
+        printf 'Failed to query unit properties\n' >&2
+        return "$ARCHUP_SYSTEMCTL_SHOW_STATUS"
+      fi
+      local unit="${!#}"
+      if ((ARCHUP_SYSTEMCTL_SHOW_MALFORMED != 0)); then
+        printf 'unknown\n'
+        return 0
+      fi
+      if [[ " $ARCHUP_NON_RESTARTABLE_UNITS " == *" $unit "* ]] ||
+        { [[ " $ARCHUP_NON_RESTARTABLE_AFTER_RELOAD_UNITS " == *" $unit "* ]] &&
+          [[ "$(cat "$ARCHUP_SYSTEMCTL_LOG")" == *daemon-reload* ]]; }; then
+        printf 'no\n'
+      else
+        printf 'yes\n'
+      fi
       ;;
     daemon-reload | try-restart | reset-failed | restart)
       printf '%s\n' "$*" >>"$ARCHUP_SYSTEMCTL_LOG"
@@ -567,6 +589,60 @@ _assert_contains "archup restart: reports upgraded service restart" \
   "restarting active services from upgraded packages" "$result"
 _assert_not_contains "archup restart: a later unrelated unit is not unverified" \
   "could not fully determine active services" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package system-manager 1 ok
+_archup_mock_add_service system-manager daemon.service
+_archup_mock_add_service system-manager dependency-only.service
+ARCHUP_ACTIVE_UNITS=(daemon.service dependency-only.service)
+ARCHUP_NON_RESTARTABLE_UNITS="dependency-only.service"
+sysup_restart_upgraded_services system-manager >/dev/null
+systemctl_commands=$(cat "$ARCHUP_SYSTEMCTL_LOG")
+_assert_contains "archup restart: keeps active units that support manual restart" \
+  "try-restart daemon.service" "$systemctl_commands"
+_assert_not_contains "archup restart: skips active units that refuse manual stop" \
+  "dependency-only.service" "$systemctl_commands"
+
+_archup_mock_reset
+_archup_mock_add_package changed-manager 1 ok
+_archup_mock_add_service changed-manager changed-policy.service
+ARCHUP_ACTIVE_UNITS=(changed-policy.service)
+ARCHUP_NON_RESTARTABLE_AFTER_RELOAD_UNITS="changed-policy.service"
+sysup_restart_upgraded_services changed-manager >/dev/null
+systemctl_commands=$(cat "$ARCHUP_SYSTEMCTL_LOG")
+_assert_contains "archup restart: reloads definitions before capability checks" \
+  "daemon-reload" "$systemctl_commands"
+_assert_not_contains "archup restart: honors a newly installed manual-stop refusal" \
+  "try-restart" "$systemctl_commands"
+
+_archup_mock_reset
+_archup_mock_add_package uncertain-manager 1 ok
+_archup_mock_add_service uncertain-manager uncertain.service
+ARCHUP_ACTIVE_UNITS=(uncertain.service)
+ARCHUP_SYSTEMCTL_SHOW_STATUS=6
+set +e
+result=$(sysup_restart_upgraded_services uncertain-manager 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: property query failure leaves coverage unverified" \
+  "1" "$status"
+_assert_contains "archup restart: property query failure names the skipped unit" \
+  "could not determine whether uncertain.service supports manual restart" "$result"
+_assert_not_contains "archup restart: property query failure does not attempt an unsafe restart" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package malformed-manager 1 ok
+_archup_mock_add_service malformed-manager malformed.service
+ARCHUP_ACTIVE_UNITS=(malformed.service)
+ARCHUP_SYSTEMCTL_SHOW_MALFORMED=1
+set +e
+result=$(sysup_restart_upgraded_services malformed-manager 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: malformed capability remains unverified" "1" "$status"
+_assert_contains "archup restart: malformed capability names the skipped unit" \
+  "could not determine whether malformed.service supports manual restart" "$result"
 
 _archup_mock_reset
 _archup_mock_add_package unlistable-service 1 ok

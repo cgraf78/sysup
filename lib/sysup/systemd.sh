@@ -191,7 +191,8 @@ sysup_upgraded_active_service_units() {
 
 sysup_restart_upgraded_services() {
   local -a units=()
-  local unit_listing
+  local -a active_units=()
+  local can_stop unit unit_listing
   local discovery_status=0
 
   if (($# == 0)); then
@@ -210,8 +211,38 @@ sysup_restart_upgraded_services() {
 
   unit_listing="$(sysup_upgraded_active_service_units "$@")" || discovery_status=$?
   if [[ -n "$unit_listing" ]]; then
-    mapfile -t units <<<"$unit_listing"
+    mapfile -t active_units <<<"$unit_listing"
   fi
+
+  if ((${#active_units[@]})); then
+    # Capability properties must come from the newly installed definitions.
+    # Otherwise an upgrade that introduces a manual-control refusal can pass
+    # the old check and then reject the restart after daemon-reload.
+    sysup_run_as_root systemctl daemon-reload || return
+  fi
+
+  # Active includes boot-time oneshots that remain active after they exit.
+  # Some of those deliberately refuse manual stop, so sending the entire set
+  # through one try-restart request makes an otherwise healthy upgrade noisy
+  # and fails the restart batch. Ask systemd for the effective capability
+  # instead of maintaining a release-sensitive list of special unit names.
+  for unit in "${active_units[@]}"; do
+    if ! can_stop="$(systemctl show --property=CanStop --value -- "$unit")"; then
+      printf 'warning: could not determine whether %s supports manual restart\n' \
+        "$unit" >&2
+      discovery_status=1
+      continue
+    fi
+    case "$can_stop" in
+      yes) units+=("$unit") ;;
+      no) ;;
+      *)
+        printf 'warning: could not determine whether %s supports manual restart\n' \
+          "$unit" >&2
+        discovery_status=1
+        ;;
+    esac
+  done
   if ((${#units[@]} == 0)); then
     if ((discovery_status != 0)); then
       printf 'error: could not fully determine active services from upgraded packages; service restarts are unverified\n' >&2
@@ -222,9 +253,6 @@ sysup_restart_upgraded_services() {
   fi
 
   sysup_log "restarting active services from upgraded packages: ${units[*]}"
-  # A failed reload means the units below would restart against stale in-memory
-  # definitions, so the new unit files would not actually be in effect.
-  sysup_run_as_root systemctl daemon-reload || return
   # try-restart, not restart: a unit that stopped between the listing and now
   # must not be started back up by an upgrade.
   sysup_run_as_root systemctl try-restart "${units[@]}" || return
