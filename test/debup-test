@@ -175,6 +175,7 @@ case "${1:-}" in
       [[ -n "$unit" ]] && printf '%s loaded active running mock unit\n' "$unit"
     done <<<"$DEBUP_MOCK_ACTIVE_UNITS"
     ;;
+  show) printf 'yes\n' ;;
   --failed) printf '%s' "$DEBUP_MOCK_FAILED_UNITS" ;;
   is-enabled) printf 'enabled\n' ;;
   *) printf '%s\n' "$*" >>"$DEBUP_SYSTEMCTL_LOG" ;;
