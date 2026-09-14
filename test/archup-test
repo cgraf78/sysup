@@ -41,6 +41,9 @@ _archup_mock_reset() {
   ARCHUP_DISABLED_UNITS=""
   ARCHUP_SYSTEMCTL_QUERY_STATUS=0
   ARCHUP_SYSTEMCTL_ACTIVE_QUERY_STATUS=0
+  ARCHUP_NVIDIA_VERSION_FILE="$ARCHUP_MOCK_ROOT/nvidia-version"
+  ARCHUP_NVIDIA_INSTALLED_VERSION=""
+  ARCHUP_MODINFO_STATUS=0
   ARCHUP_YAY_FAIL_UPGRADE=0
   ARCHUP_YAY_FAIL_REBUILD=0
   ARCHUP_YAY_AUR_QUERY_STATUS=0
@@ -231,6 +234,19 @@ ldd() {
     return 1
   fi
   printf '%s\n' "${ARCHUP_LDD_OUTPUT[$1]:-}"
+}
+
+# shellcheck disable=SC2329 # Exercised indirectly by the backend restart policy.
+modinfo() {
+  if ((ARCHUP_MODINFO_STATUS != 0)); then
+    printf 'mock modinfo failure\n' >&2
+    return "$ARCHUP_MODINFO_STATUS"
+  fi
+  [[ "$*" == "-F version nvidia" ]] || {
+    printf 'unexpected modinfo args: %s\n' "$*" >&2
+    return 2
+  }
+  printf '%s\n' "$ARCHUP_NVIDIA_INSTALLED_VERSION"
 }
 
 # shellcheck disable=SC2329 # Exercised indirectly by the shared driver.
@@ -589,6 +605,103 @@ _assert_contains "archup restart: reports upgraded service restart" \
   "restarting active services from upgraded packages" "$result"
 _assert_not_contains "archup restart: a later unrelated unit is not unverified" \
   "could not fully determine active services" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package nvidia-utils 0 ok
+_archup_mock_add_service nvidia-utils nvidia-persistenced.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
+printf '%s\n' \
+  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build' \
+  >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_NVIDIA_INSTALLED_VERSION=615.71.09
+result=$(sysup_backend_restart_services nvidia-utils 2>&1)
+_assert_not_contains "archup restart: defers persistence daemon across a driver mismatch" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: mismatched NVIDIA driver gives recovery guidance" \
+  "loaded NVIDIA driver 610.57.04 differs from installed 615.71.09" "$result"
+_assert_contains "archup restart: deferred unit is reported distinctly" \
+  "no active services eligible for immediate restart" "$result"
+_assert_not_contains "archup restart: deferred unit is not reported as no active service" \
+  "no active services shipped by upgraded packages" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package nvidia-utils 0 ok
+_archup_mock_add_service nvidia-utils nvidia-persistenced.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
+printf '%s\n' \
+  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build' \
+  >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_NVIDIA_INSTALLED_VERSION=615.71.09
+sysup_backend_restart_services nvidia-utils >/dev/null
+_assert_contains "archup restart: matching NVIDIA driver permits persistence restart" \
+  "try-restart nvidia-persistenced.service" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package nvidia-utils 0 ok
+_archup_mock_add_service nvidia-utils nvidia-persistenced.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
+printf '%s\n' 'unparsable loaded driver version' >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_NVIDIA_INSTALLED_VERSION=615.71.09
+set +e
+result=$(sysup_backend_restart_services nvidia-utils 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: unknown loaded NVIDIA version fails closed" "1" "$status"
+_assert_not_contains "archup restart: unknown loaded NVIDIA version preserves the daemon" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: unknown loaded NVIDIA version is actionable" \
+  "could not determine the loaded NVIDIA driver version" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package nvidia-utils 0 ok
+_archup_mock_add_service nvidia-utils nvidia-persistenced.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
+printf '%s\n' \
+  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build' \
+  >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_MODINFO_STATUS=3
+set +e
+result=$(sysup_backend_restart_services nvidia-utils 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: unknown installed NVIDIA version fails closed" "1" "$status"
+_assert_not_contains "archup restart: unknown installed NVIDIA version preserves the daemon" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: unknown installed NVIDIA version is actionable" \
+  "could not determine the installed NVIDIA driver version" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package nvidia-utils 0 ok
+_archup_mock_add_service nvidia-utils nvidia-persistenced.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
+mkdir "$ARCHUP_NVIDIA_VERSION_FILE"
+set +e
+result=$(sysup_backend_restart_services nvidia-utils 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: unreadable loaded NVIDIA version fails closed" "1" "$status"
+_assert_not_contains "archup restart: unreadable loaded NVIDIA version preserves the daemon" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: unreadable loaded NVIDIA version is actionable" \
+  "could not determine the loaded NVIDIA driver version" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package nvidia-utils 0 ok
+_archup_mock_add_service nvidia-utils nvidia-persistenced.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
+printf '%s\n' \
+  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build' \
+  >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_NVIDIA_INSTALLED_VERSION=not-a-version
+set +e
+result=$(sysup_backend_restart_services nvidia-utils 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: malformed installed NVIDIA version fails closed" "1" "$status"
+_assert_not_contains "archup restart: malformed installed NVIDIA version preserves the daemon" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: malformed installed NVIDIA version is actionable" \
+  "could not determine the installed NVIDIA driver version" "$result"
 
 _archup_mock_reset
 _archup_mock_add_package system-manager 1 ok
