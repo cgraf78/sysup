@@ -60,6 +60,56 @@ archup_run_yay() {
   sudo -u "$user" -H -- yay "$@"
 }
 
+archup_loaded_nvidia_version() {
+  local version_file="${ARCHUP_NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}"
+
+  [[ -r "$version_file" ]] || return 1
+  sed -n '1s/.*  \([0-9][0-9.]*\)  .*/\1/p' "$version_file"
+}
+
+archup_nvidia_version_valid() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)+$ ]]
+}
+
+# nvidia-persistenced links against the upgraded userspace library. Restarting
+# it while the previous kernel module remains loaded stops a healthy daemon and
+# cannot start its replacement, so leave it running until the operator reloads
+# the modules or reboots.
+sysup_backend_check_service_restart() {
+  local unit="$1" installed loaded version_file
+
+  [[ "$unit" == nvidia-persistenced.service ]] || return 0
+  version_file="${ARCHUP_NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}"
+  [[ -e "$version_file" ]] || return 0
+  if [[ ! -r "$version_file" ]]; then
+    printf 'warning: could not determine the loaded NVIDIA driver version; preserving %s\n' \
+      "$unit"
+    return 2
+  fi
+
+  loaded="$(archup_loaded_nvidia_version)" || {
+    printf 'warning: could not determine the loaded NVIDIA driver version; preserving %s\n' \
+      "$unit"
+    return 2
+  }
+  if ! archup_nvidia_version_valid "$loaded"; then
+    printf 'warning: could not determine the loaded NVIDIA driver version; preserving %s\n' \
+      "$unit"
+    return 2
+  fi
+  if ! installed="$(modinfo -F version nvidia 2>/dev/null)" ||
+    ! archup_nvidia_version_valid "$installed"; then
+    printf 'warning: could not determine the installed NVIDIA driver version; preserving %s\n' \
+      "$unit"
+    return 2
+  fi
+  [[ "$loaded" == "$installed" ]] && return 0
+
+  printf 'deferred: loaded NVIDIA driver %s differs from installed %s; reload NVIDIA modules or reboot before restarting %s\n' \
+    "$loaded" "$installed" "$unit"
+  return 1
+}
+
 sysup_backend_usage() {
   cat <<'EOF'
 Usage: archup [--check-only] [--no-restart-upgraded-services]

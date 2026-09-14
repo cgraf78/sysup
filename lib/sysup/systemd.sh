@@ -192,8 +192,8 @@ sysup_upgraded_active_service_units() {
 sysup_restart_upgraded_services() {
   local -a units=()
   local -a active_units=()
-  local can_stop unit unit_listing
-  local discovery_status=0
+  local can_stop policy_output policy_status unit unit_listing
+  local deferred_count=0 discovery_status=0
 
   if (($# == 0)); then
     if [[ "${SYSUP_PACKAGE_DIFF_UNVERIFIED:-0}" == 1 ]]; then
@@ -234,7 +234,20 @@ sysup_restart_upgraded_services() {
       continue
     fi
     case "$can_stop" in
-      yes) units+=("$unit") ;;
+      yes)
+        if policy_output="$(sysup_backend_check_service_restart "$unit")"; then
+          units+=("$unit")
+          continue
+        else
+          policy_status=$?
+        fi
+        [[ -z "$policy_output" ]] || printf '%s\n' "$policy_output" >&2
+        if ((policy_status == 1)); then
+          ((deferred_count += 1))
+        else
+          discovery_status=1
+        fi
+        ;;
       no) ;;
       *)
         printf 'warning: could not determine whether %s supports manual restart\n' \
@@ -247,6 +260,10 @@ sysup_restart_upgraded_services() {
     if ((discovery_status != 0)); then
       printf 'error: could not fully determine active services from upgraded packages; service restarts are unverified\n' >&2
       return "$discovery_status"
+    fi
+    if ((deferred_count != 0)); then
+      printf 'ok: no active services eligible for immediate restart\n'
+      return 0
     fi
     printf 'ok: no active services shipped by upgraded packages\n'
     return 0

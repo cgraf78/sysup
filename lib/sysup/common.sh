@@ -122,6 +122,14 @@ sysup_backend_checks() {
   return 0
 }
 
+# Backends may reject a restart that systemd itself permits when package and
+# kernel runtime state make the newly installed userspace temporarily unsafe.
+# Return 0 to allow it, 1 to defer it safely, or another status when the
+# decision could not be verified. Any output is shown to the operator.
+sysup_backend_check_service_restart() {
+  return 0
+}
+
 # Restart services shipped by the packages named in "$@".
 sysup_backend_restart_services() {
   sysup_restart_upgraded_services "$@"
