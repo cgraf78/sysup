@@ -674,10 +674,7 @@ _archup_mock_reset
 _archup_mock_add_package nvidia-utils 0 ok
 _archup_mock_add_service nvidia-utils nvidia-persistenced.service
 ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service)
-printf '%s\n' \
-  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build' \
-  >"$ARCHUP_NVIDIA_VERSION_FILE"
-chmod 000 "$ARCHUP_NVIDIA_VERSION_FILE"
+mkdir "$ARCHUP_NVIDIA_VERSION_FILE"
 set +e
 result=$(sysup_backend_restart_services nvidia-utils 2>&1)
 status=$?
