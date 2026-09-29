@@ -953,10 +953,10 @@ set -e
 _assert_eq "archup failed units: a failed unit fails the run" "1" "$status"
 _assert_contains "archup failed units: names the failed unit" \
   "postgresql.service" "$result"
-# The hint was hardcoded to archup before the shared library existed; debup must
-# not tell users to run archup.
-_assert_contains "archup failed units: hint names the running backend" \
-  "archup --restart-failed" "$result"
+# Backends are private and not on PATH, so the hint must name the public
+# dispatcher that forwards --restart-failed to them.
+_assert_contains "archup failed units: hint names the public sysup command" \
+  "sysup --restart-failed" "$result"
 
 # An unverifiable unit state must never be reported as healthy: that is the
 # exact claim this tool exists to make.

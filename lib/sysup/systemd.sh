@@ -39,7 +39,7 @@ sysup_report_failed_units() {
   done <<<"$failed"
 
   if ((${#restartable[@]})); then
-    printf '\nhint: run: %s --restart-failed\n' "${SYSUP_BACKEND_NAME:-sysup}" >&2
+    printf '\nhint: run: sysup --restart-failed\n' >&2
     printf 'hint: failed enabled units: %s\n' "${restartable[*]}" >&2
   fi
 
