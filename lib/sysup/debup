@@ -54,7 +54,7 @@ DEBUP_CONFFILE_ROOT="${DEBUP_CONFFILE_ROOT:-/etc}"
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: debup [--full-upgrade] [--autoremove] [--check-only]
+Usage: sysup [--full-upgrade] [--autoremove] [--check-only]
              [--no-restart-upgraded-services] [--restart-failed] [--]
              [extra apt-get args...]
 
@@ -317,7 +317,7 @@ report_autoremovable() {
 
   sysup_log "packages no longer required"
   printf '%s\n' "$output"
-  printf '\nhint: run: debup --autoremove\n'
+  printf '\nhint: run: sysup --autoremove\n'
 }
 
 # ---------------------------------------------------------------------------

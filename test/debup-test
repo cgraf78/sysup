@@ -354,7 +354,7 @@ apt_log=$(cat "$DEBUP_APT_LOG")
 _assert_contains "debup autoremove: reports removable packages by default" \
   "stale-lib" "$result"
 _assert_contains "debup autoremove: points at the opt-in flag" \
-  "debup --autoremove" "$result"
+  "sysup --autoremove" "$result"
 _assert_not_contains "debup autoremove: does not purge without the flag" \
   "--purge autoremove" "$apt_log"
 

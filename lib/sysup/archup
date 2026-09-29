@@ -112,8 +112,8 @@ sysup_backend_check_service_restart() {
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: archup [--check-only] [--no-restart-upgraded-services]
-              [--restart-failed] [--] [extra yay/pacman args...]
+Usage: sysup [--check-only] [--no-restart-upgraded-services]
+             [--restart-failed] [--] [extra yay/pacman args...]
 
 Upgrade an Arch host, rebuilding broken AUR packages when yay is available,
 then verify the failure modes most likely to leave services broken after the
@@ -138,10 +138,10 @@ Extra arguments are passed to both yay upgrade and automatic AUR rebuild
 invocations, or to the pacman fallback. Package installation is noninteractive
 by default; pass --confirm after -- to restore package-manager prompts.
 
-When invoked as root, yay runs as the non-root user named by SUDO_USER. Set
-SYSUP_ARCH_USER explicitly when that value is unavailable. The user must be
-able to authenticate sudo interactively; unattended root AUR upgrades fail
-closed instead of building packages as root.
+When invoked as root, yay runs as the non-root user named by SYSUP_ARCH_USER,
+or by SUDO_USER when SYSUP_ARCH_USER is unset. The user must be able to
+authenticate sudo interactively; unattended root AUR upgrades fail closed
+instead of building packages as root.
 EOF
 }
 

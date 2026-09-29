@@ -58,7 +58,13 @@ Optional hooks, with defaults in `common.sh`:
 | `sysup_backend_parse_arg <arg>` | unhandled (arg falls through to the package manager) | `debup` adds `--autoremove`, `--full-upgrade` |
 | `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
+| `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one, and reports it unverified when either version cannot be read |
 | `sysup_backend_restart_services <pkg...>` | shared systemd restart | `debup` prefers `needrestart` |
+
+`sysup_backend_check_service_restart` returns 0 to allow a restart, 1 to defer
+it, or another status to mark service restarts unverified, which fails the run.
+Only the shared upgraded-service restart path consults it; `needrestart`
+restarts and `--restart-failed` do not.
 
 Backends set `SYSUP_BACKEND_NAME` for user-facing messages and may append to
 `SYSUP_EXTRA_UPGRADED_PACKAGES` for packages a version diff cannot detect

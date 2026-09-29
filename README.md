@@ -78,8 +78,8 @@ Package operations are noninteractive by default. Pass `--confirm` after `--`
 to restore package-manager prompts.
 
 When `sysup` is started from an interactive root shell, it never runs `yay` as
-root. It uses the non-root account in `SUDO_USER`, or `SYSUP_ARCH_USER` when
-that must be supplied explicitly, and warms that account's sudo credential
+root. It uses the non-root account in `SYSUP_ARCH_USER`, falling back to
+`SUDO_USER` when that is unset, and warms that account's sudo credential
 before starting the upgrade. An unattended root invocation therefore fails
 closed unless the account already has noninteractive sudo authorization;
 `sysup --check-only` remains suitable for unattended diagnostics.
