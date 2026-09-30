@@ -99,8 +99,9 @@ require extending the parser contract.
 7. Repeat the deferred-restart reminder (below).
 8. Report failed systemd units.
 
-Steps 4 through 8 each contribute to the exit status rather than short-circuiting,
-so one run surfaces every problem.
+Steps 4 through 8 each run rather than short-circuiting, and every one except
+the advisory reminder in step 7 contributes to the exit status, so one run
+surfaces every problem.
 
 Once the package-manager command starts, those follow-up steps also run after a
 failure: an upgrade can install some packages before returning nonzero. The
@@ -117,17 +118,21 @@ host-wide and root-owned (directory `0755`, file `0644`, written through
 `sudo` like the restarts themselves and replaced by an atomic rename), because
 sysup runs both as the operator and as root and each run must see the same
 record. Each line holds the kernel `boot_id`, the unit, and the unit's
-`ActiveEnterTimestampMonotonic` at deferral time.
+`ActiveEnterTimestampMonotonic` at deferral time. `user-runtime-dir@` is
+deferred but not recorded: it is a oneshot with no code left running.
 
 Every run reads the record, including `--check-only`, and prints one
 `reboot recommended: ...` line on stderr while any entry still applies. An
-entry is spent once `boot_id` changes, the unit is no longer active (stopped
-or removed), or its activation timestamp changes (restarted manually). When
+entry is spent once `boot_id` changes, the unit is inactive or failed (stopped
+or removed), or its activation timestamp changes (restarted manually).
+Transient states such as `reloading` still count as running. When
 the boot or the unit cannot be checked the entry is kept, trading a redundant
 reminder for never dropping one silently. Only mutating runs prune spent
 entries or remove the file; `--check-only` never writes. The reminder is
 advisory, matching debup's reboot-required report, and a failure to record it
-is a warning rather than a failed run.
+is a warning rather than a failed run, and an unreadable record is never
+overwritten. Concurrent sysup runs could race on the rename; package-manager
+locks make overlapping upgrade runs unlikely, and the loser only warns.
 
 ## Detection
 

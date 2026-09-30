@@ -688,7 +688,7 @@ _debup_main --check-only
 _assert_eq "debup main: pending reminder keeps check-only successful (output: $DEBUP_RESULT)" \
   "0" "$DEBUP_STATUS"
 _assert_contains "debup main: check-only run repeats the deferred-restart reminder" \
-  "reboot recommended: session-critical units still run pre-upgrade code: getty@tty1.service user@1000.service;" \
+  "reboot recommended: session-critical units may still run pre-upgrade code: getty@tty1.service user@1000.service;" \
   "$DEBUP_RESULT"
 
 _debup_reset

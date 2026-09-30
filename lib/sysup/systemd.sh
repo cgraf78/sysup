@@ -223,10 +223,15 @@ sysup_session_critical_unit() {
       greetd.service | ly.service | ly@*.service) return 0 ;;
     # logind tracks sessions, seats, and device ACLs (Debian #798097);
     # seatd fills that role for seatd-based compositors.
-    systemd-logind.service | elogind.service | seatd.service) return 0 ;;
-    # The system bus, in both implementations plus its activation socket;
-    # logind, polkit, and desktop sessions depend on it.
-    dbus.service | dbus.socket | dbus-broker.service) return 0 ;;
+    # systemd 258+ also has logind's Varlink socket, which pam_systemd uses;
+    # restarting it rebinds the socket while logind keeps the old one.
+    systemd-logind.service | systemd-logind-varlink.socket | elogind.service | \
+      seatd.service) return 0 ;;
+    # The system bus, in every implementation plus its activation socket;
+    # logind, polkit, and desktop sessions depend on it. dbus.service is only
+    # an alias where the daemon ships as dbus-daemon.service (Fedora, Arch's
+    # dbus-daemon-units), and list-units reports the real name.
+    dbus.service | dbus-daemon.service | dbus-broker.service | dbus.socket) return 0 ;;
     # These are the operator's shell when active.
     emergency.service | rescue.service) return 0 ;;
   esac
@@ -257,22 +262,28 @@ sysup_boot_id() {
   printf '%s\n' "$id"
 }
 
-# Print when an active unit last entered the active state, on systemd's own
-# monotonic clock. A deferred unit whose value changes was restarted since the
-# deferral. Returns 1 when the unit is not active (stopped or gone, so nothing
-# runs the old code) and 2 when systemd could not be queried.
+# Print when a unit last entered the active state, on systemd's own monotonic
+# clock. A deferred unit whose value changes was restarted since the deferral.
+# Returns 1 when the unit is inactive or failed (stopped or gone, so nothing
+# runs the old code) and 2 when systemd could not be queried. Transient states
+# (reloading, activating, deactivating) still count as running: pruning on
+# them would drop a reminder for good.
 sysup_unit_active_since() {
   local output line state="" since=""
 
   output="$(systemctl show --property=ActiveState \
-    --property=ActiveEnterTimestampMonotonic -- "$1" 2>/dev/null)" || return 2
+    --property=ActiveEnterTimestampMonotonic -- "$1" 2>/dev/null </dev/null)" || return 2
   while IFS= read -r line; do
     case "$line" in
       ActiveState=*) state="${line#*=}" ;;
       ActiveEnterTimestampMonotonic=*) since="${line#*=}" ;;
     esac
   done <<<"$output"
-  [[ "$state" == active && -n "$since" ]] || return 1
+  case "$state" in
+    inactive | failed) return 1 ;;
+    "") return 2 ;;
+  esac
+  [[ -n "$since" ]] || return 2
   printf '%s\n' "$since"
 }
 
@@ -281,7 +292,7 @@ sysup_unit_active_since() {
 # restarted. When the boot or the unit cannot be checked the entry is kept:
 # a redundant reminder is safer than silently dropping one.
 sysup_pending_deferred_restarts() {
-  local state boot="" entry_boot unit since current rc
+  local state boot="" entry_boot unit since current rc seen=" "
 
   state="$(sysup_deferred_state_file)"
   [[ -e "$state" ]] || return 0
@@ -295,6 +306,8 @@ sysup_pending_deferred_restarts() {
   while IFS=$'\t' read -r entry_boot unit since _ || [[ -n "${entry_boot:-}" ]]; do
     [[ -n "${entry_boot:-}" && "$entry_boot" != \#* ]] || continue
     [[ -n "${unit:-}" && -n "${since:-}" ]] || continue
+    # A hand-edited duplicate is reported once.
+    [[ "$seen" != *" $unit "* ]] || continue
     if [[ -n "$boot" && "$entry_boot" != unknown && "$entry_boot" != "$boot" ]]; then
       continue
     fi
@@ -304,6 +317,7 @@ sysup_pending_deferred_restarts() {
     if ((rc == 0)) && [[ "$since" != - && "$current" != "$since" ]]; then
       continue
     fi
+    seen+="$unit "
     printf '%s\t%s\t%s\n' "$entry_boot" "$unit" "$since"
   done <"$state"
 }
@@ -327,10 +341,10 @@ sysup_write_deferred_state() {
     printf '%s\n' "$@"
   } >"$tmp" || status=$?
   if ((status == 0)); then
-    sysup_run_as_root install -d -m 0755 -- "$SYSUP_STATE_DIR" 2>/dev/null || status=$?
+    sysup_run_as_root install -d -m 0755 -- "$SYSUP_STATE_DIR" || status=$?
   fi
   if ((status == 0)); then
-    sysup_run_as_root install -m 0644 -- "$tmp" "$state.new" 2>/dev/null || status=$?
+    sysup_run_as_root install -m 0644 -- "$tmp" "$state.new" || status=$?
   fi
   if ((status == 0)); then
     sysup_run_as_root mv -f -- "$state.new" "$state" || status=$?
@@ -341,12 +355,22 @@ sysup_write_deferred_state() {
 
 # Add the units deferred by this run to the pending record. A unit deferred
 # again is refreshed: this upgrade is the one a restart has to pick up.
+# user-runtime-dir@ is deferred but not recorded: it is a oneshot that only
+# mounts XDG_RUNTIME_DIR, so there is no old code left running to remind about.
 sysup_record_deferred_restarts() {
   local boot listing entry_boot unit since new
-  local -a entries=()
+  local -a entries=() record=()
+
+  for unit in "$@"; do
+    [[ "$unit" == user-runtime-dir@* ]] || record+=("$unit")
+  done
+  ((${#record[@]})) || return 0
+  set -- "${record[@]}"
 
   boot="$(sysup_boot_id)" || boot=unknown
-  listing="$(sysup_pending_deferred_restarts 2>/dev/null)" || listing=""
+  # An existing record that cannot be read must not be overwritten: that
+  # would silently drop the reminders it holds.
+  listing="$(sysup_pending_deferred_restarts)" || return 1
   while IFS=$'\t' read -r entry_boot unit since; do
     [[ -n "${unit:-}" ]] || continue
     for new in "$@"; do
@@ -397,7 +421,9 @@ sysup_report_deferred_restarts() {
     IFS=$'\t' read -r entry_boot unit _ <<<"$line"
     units+=("$unit")
   done
-  printf 'reboot recommended: session-critical units still run pre-upgrade code: %s; restart them manually or reboot\n' \
+  # "may": package scripts can re-exec some managers in place without
+  # changing their activation time, so this cannot be certain.
+  printf 'reboot recommended: session-critical units may still run pre-upgrade code: %s; restart them manually or reboot\n' \
     "${units[*]}" >&2
 }
 

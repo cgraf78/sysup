@@ -115,7 +115,7 @@ session-related defaults; it
 reports them as deferred until a reboot or manual restart instead. Deferrals
 are recorded in `/var/lib/sysup/deferred-restarts`, and every later run,
 including `--check-only`, repeats one stable stderr line,
-`reboot recommended: session-critical units still run pre-upgrade code: ...`,
+`reboot recommended: session-critical units may still run pre-upgrade code: ...`,
 until the host reboots or each unit is restarted or stopped. The reminder is
 advisory and never changes the exit status. Missing
 systemd is a supported no-op; an unreachable or failed systemd query is an
