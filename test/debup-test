@@ -175,7 +175,18 @@ case "${1:-}" in
       [[ -n "$unit" ]] && printf '%s loaded active running mock unit\n' "$unit"
     done <<<"$DEBUP_MOCK_ACTIVE_UNITS"
     ;;
-  show) printf 'yes\n' ;;
+  show)
+    unit="${!#}"
+    if [[ "$*" == *--property=ActiveState* ]]; then
+      if grep -qxF -- "$unit" <<<"$DEBUP_MOCK_ACTIVE_UNITS"; then
+        printf 'ActiveState=active\nActiveEnterTimestampMonotonic=100\n'
+      else
+        printf 'ActiveState=inactive\nActiveEnterTimestampMonotonic=0\n'
+      fi
+    else
+      printf 'yes\n'
+    fi
+    ;;
   --failed) printf '%s' "$DEBUP_MOCK_FAILED_UNITS" ;;
   is-enabled) printf 'enabled\n' ;;
   *) printf '%s\n' "$*" >>"$DEBUP_SYSTEMCTL_LOG" ;;
@@ -184,6 +195,10 @@ exit 0
 EOF
 
 export SYSUP_SOURCE_ONLY=1
+# Never read or write the host's deferred-restart state or boot identity.
+SYSUP_STATE_DIR="$(_tmpdir)/state"
+SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
+printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
 # shellcheck source=../lib/sysup/debup
 . "$REPO_ROOT/lib/sysup/debup"
 
@@ -243,6 +258,7 @@ _debup_reset() {
   DEBUP_AUTOREMOVE=0
   rm -f "$DEBUP_REBOOT_REQUIRED_FILE" "$DEBUP_REBOOT_REQUIRED_FILE.pkgs"
   rm -rf "${DEBUP_FIXTURE_ETC:?}"/*
+  rm -rf "${SYSUP_STATE_DIR:?}"
   # needrestart is absent unless a test installs the mock. Clear bash's command
   # hash too: a prior direct invocation (which is what happens when the suite
   # runs as root and sysup_run_as_root skips sudo) leaves the deleted path
@@ -566,6 +582,25 @@ systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
 _assert_contains "debup restart: recognizes pre-merged-usr unit paths" \
   "try-restart legacy.service" "$systemctl_log"
 
+# Without needrestart, the shared fallback owns session safety: a systemd
+# upgrade must not restart the user manager or gettys it maps to.
+_debup_reset
+DEBUP_MOCK_PACKAGE_FILES=$'systemd /lib/systemd/system/user@.service\nsystemd /lib/systemd/system/getty@.service\nsystemd /lib/systemd/system/systemd-timesyncd.service'
+DEBUP_MOCK_ACTIVE_UNITS=$'user@1000.service\ngetty@tty1.service\nsystemd-timesyncd.service'
+result=$(sysup_backend_restart_services systemd 2>&1)
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_contains "debup restart: fallback still restarts ordinary units" \
+  "try-restart systemd-timesyncd.service" "$systemctl_log"
+_assert_not_contains "debup restart: fallback defers the user manager" \
+  "user@1000.service" "$systemctl_log"
+_assert_not_contains "debup restart: fallback defers gettys" \
+  "getty@tty1.service" "$systemctl_log"
+_assert_contains "debup restart: fallback reports deferred session units" \
+  "units not restarted: getty@tty1.service user@1000.service" "$result"
+_assert_eq "debup restart: fallback records the deferral for later runs" \
+  $'boot-a\tgetty@tty1.service\t100\nboot-a\tuser@1000.service\t100' \
+  "$(grep -v '^#' "$SYSUP_STATE_DIR/deferred-restarts")"
+
 _debup_reset
 DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
 DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
@@ -640,6 +675,21 @@ _debup_main --no-restart-upgraded-services
 systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
 _assert_not_contains "debup main: opt-out skips the upgraded service restart" \
   "try-restart" "$systemctl_log"
+
+# A deferral recorded by an earlier run is repeated on later runs, including
+# --check-only ones, independently of debup's kernel reboot check.
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_ACTIVE_UNITS=$'user@1000.service\ngetty@tty1.service'
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' $'boot-a\tgetty@tty1.service\t100' $'boot-a\tuser@1000.service\t100' \
+  >"$SYSUP_STATE_DIR/deferred-restarts"
+_debup_main --check-only
+_assert_eq "debup main: pending reminder keeps check-only successful (output: $DEBUP_RESULT)" \
+  "0" "$DEBUP_STATUS"
+_assert_contains "debup main: check-only run repeats the deferred-restart reminder" \
+  "reboot recommended: session-critical units may still run pre-upgrade code: getty@tty1.service user@1000.service;" \
+  "$DEBUP_RESULT"
 
 _debup_reset
 DEBUP_MOCK_INSTALLED="ii base 1.0"

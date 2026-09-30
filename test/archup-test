@@ -10,6 +10,9 @@ REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
 . "$TEST_DIR/lib/test.sh"
 
 export SYSUP_SOURCE_ONLY=1
+# Never read or write the host's deferred-restart state or boot identity.
+SYSUP_STATE_DIR="$(_tmpdir)/state"
+SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
 # shellcheck source=../lib/sysup/archup
 . "$REPO_ROOT/lib/sysup/archup"
 
@@ -37,6 +40,8 @@ _archup_mock_reset() {
   ARCHUP_NON_RESTARTABLE_AFTER_RELOAD_UNITS=""
   ARCHUP_SYSTEMCTL_SHOW_STATUS=0
   ARCHUP_SYSTEMCTL_SHOW_MALFORMED=0
+  ARCHUP_DISPLAY_MANAGER_ID="display-manager.service"
+  ARCHUP_DISPLAY_MANAGER_ID_STATUS=0
   ARCHUP_FAILED_UNITS=""
   ARCHUP_DISABLED_UNITS=""
   ARCHUP_SYSTEMCTL_QUERY_STATUS=0
@@ -61,6 +66,13 @@ _archup_mock_reset() {
   ARCHUP_LDD_STATUS=0
   ARCHUP_SYSTEMCTL_LOG="$ARCHUP_MOCK_ROOT/systemctl-commands.log"
   : >"$ARCHUP_SYSTEMCTL_LOG"
+  declare -gA ARCHUP_ACTIVE_SINCE=()
+  declare -gA ARCHUP_UNIT_STATE=()
+  # No state directory yet, as on a host sysup has never deferred on.
+  SYSUP_STATE_DIR="$ARCHUP_MOCK_ROOT/state"
+  ARCHUP_STATE_FILE="$SYSUP_STATE_DIR/deferred-restarts"
+  SYSUP_BOOT_ID_FILE="$ARCHUP_MOCK_ROOT/boot_id"
+  printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
 }
 
 archup_is_root() {
@@ -284,6 +296,26 @@ systemctl() {
         return "$ARCHUP_SYSTEMCTL_SHOW_STATUS"
       fi
       local unit="${!#}"
+      # An unset display-manager.service alias reports its own name.
+      if [[ "$2" == --property=Id && "$unit" == display-manager.service ]]; then
+        if ((ARCHUP_DISPLAY_MANAGER_ID_STATUS != 0)); then
+          printf 'Failed to get properties: Access denied\n' >&2
+          return "$ARCHUP_DISPLAY_MANAGER_ID_STATUS"
+        fi
+        printf '%s\n' "$ARCHUP_DISPLAY_MANAGER_ID"
+        return 0
+      fi
+      if [[ "$*" == *--property=ActiveState* ]]; then
+        if [[ -n "${ARCHUP_UNIT_STATE[$unit]:-}" ]]; then
+          printf 'ActiveState=%s\n' "${ARCHUP_UNIT_STATE[$unit]}"
+        elif [[ " ${ARCHUP_ACTIVE_UNITS[*]} " == *" $unit "* ]]; then
+          printf 'ActiveState=active\n'
+        else
+          printf 'ActiveState=inactive\n'
+        fi
+        printf 'ActiveEnterTimestampMonotonic=%s\n' "${ARCHUP_ACTIVE_SINCE[$unit]:-100}"
+        return 0
+      fi
       if ((ARCHUP_SYSTEMCTL_SHOW_MALFORMED != 0)); then
         printf 'unknown\n'
         return 0
@@ -797,6 +829,194 @@ _assert_contains "archup restart: restarts active template instances" \
 _assert_not_contains "archup restart: ignores unrelated active services" \
   "unrelated.service" "$systemctl_commands"
 
+# A systemd upgrade ships user@.service; template expansion maps it to the
+# running per-user manager, whose restart would end the operator's session.
+_archup_mock_reset
+_archup_mock_add_package session-manager 1 ok
+_archup_mock_add_service session-manager user@.service
+ARCHUP_ACTIVE_UNITS=(user@1000.service)
+set +e
+result=$(sysup_restart_upgraded_services session-manager 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: deferring a session unit is not a failure" "0" "$status"
+_assert_not_contains "archup restart: never restarts an expanded user@ instance" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: names the deferred user@ instance" \
+  "deferred: session-critical units not restarted: user@1000.service" "$result"
+_assert_contains "archup restart: deferred session unit needs a reboot or manual restart" \
+  "reboot" "$result"
+_assert_contains "archup restart: session-only upgrade reports deferral distinctly" \
+  "no active services eligible for immediate restart" "$result"
+
+# Everything a login or graphical session depends on is deferred together,
+# while ordinary units from the same package still restart.
+_archup_mock_reset
+_archup_mock_add_package session-stack 1 ok
+for unit in user-runtime-dir@.service getty@.service serial-getty@.service \
+  systemd-logind.service seatd.service dbus-broker.service dbus.socket \
+  journal-like.service; do
+  _archup_mock_add_service session-stack "$unit"
+done
+ARCHUP_ACTIVE_UNITS=(user-runtime-dir@1000.service getty@tty1.service
+  serial-getty@ttyS0.service systemd-logind.service seatd.service
+  dbus-broker.service dbus.socket journal-like.service)
+result=$(sysup_restart_upgraded_services session-stack 2>&1)
+systemctl_commands=$(cat "$ARCHUP_SYSTEMCTL_LOG")
+_assert_eq "archup restart: only non-session units reach try-restart" \
+  $'daemon-reload\ntry-restart journal-like.service' "$systemctl_commands"
+deferred_line=$(grep '^deferred: session-critical' <<<"$result" || true)
+for unit in user-runtime-dir@1000.service getty@tty1.service \
+  serial-getty@ttyS0.service systemd-logind.service seatd.service \
+  dbus-broker.service dbus.socket; do
+  _assert_contains "archup restart: reports deferred $unit" "$unit" "$deferred_line"
+done
+_assert_not_contains "archup restart: restarted unit is not reported as deferred" \
+  "journal-like.service" "$deferred_line"
+
+_archup_mock_reset
+_archup_mock_add_package desktop-login 1 ok
+for unit in gdm.service sddm.service lightdm.service greetd.service ly@.service; do
+  _archup_mock_add_service desktop-login "$unit"
+done
+ARCHUP_ACTIVE_UNITS=(gdm.service sddm.service lightdm.service greetd.service
+  ly@tty2.service)
+result=$(sysup_restart_upgraded_services desktop-login 2>&1)
+_assert_not_contains "archup restart: never restarts display managers" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: reports deferred display managers" \
+  "units not restarted: gdm.service greetd.service lightdm.service ly@tty2.service sddm.service" "$result"
+
+# A display manager missing from the static list is still found through the
+# display-manager.service alias that enables it.
+_archup_mock_reset
+_archup_mock_add_package custom-login 1 ok
+_archup_mock_add_service custom-login custom-greeter.service
+ARCHUP_ACTIVE_UNITS=(custom-greeter.service)
+ARCHUP_DISPLAY_MANAGER_ID=custom-greeter.service
+result=$(sysup_restart_upgraded_services custom-login 2>&1)
+_assert_not_contains "archup restart: never restarts the aliased display manager" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: reports the aliased display manager as deferred" \
+  "units not restarted: custom-greeter.service" "$result"
+
+# Deferral must not mask an unverified capability query for another unit.
+_archup_mock_reset
+_archup_mock_add_package mixed-unverified 1 ok
+_archup_mock_add_service mixed-unverified user@.service
+_archup_mock_add_service mixed-unverified ordinary.service
+ARCHUP_ACTIVE_UNITS=(ordinary.service user@1000.service)
+ARCHUP_SYSTEMCTL_SHOW_STATUS=6
+set +e
+result=$(sysup_restart_upgraded_services mixed-unverified 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: deferral does not hide an unverified unit" "1" "$status"
+_assert_contains "archup restart: unverified run still reports the deferral" \
+  "units not restarted: user@1000.service" "$result"
+_assert_not_contains "archup restart: unverified run restarts nothing" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+
+# Every session-critical name the policy knows, checked directly so each one
+# is pinned by a test, plus near misses that share a prefix.
+for unit in user@0.service user-runtime-dir@1000.service getty@tty3.service \
+  autovt@tty2.service serial-getty@ttyS0.service container-getty@1.service \
+  console-getty.service gdm.service gdm3.service kdm.service lightdm.service \
+  lxdm.service nodm.service sddm.service slim.service wdm.service xdm.service \
+  greetd.service ly.service ly@tty2.service systemd-logind.service \
+  systemd-logind-varlink.socket elogind.service seatd.service dbus.service \
+  dbus-daemon.service dbus.socket dbus-broker.service emergency.service \
+  rescue.service; do
+  if sysup_session_critical_unit "$unit"; then
+    _pass "archup session policy: defers $unit"
+  else
+    _fail "archup session policy: defers $unit"
+  fi
+done
+for unit in wdmd.service gdm-helper.service slimbook.service xdmcp.service \
+  kdm-sync.service dbus-monitor.service systemd-logind-helper.service \
+  superuser@1000.service getty.target; do
+  if sysup_session_critical_unit "$unit"; then
+    _fail "archup session policy: restarts near miss $unit"
+  else
+    _pass "archup session policy: restarts near miss $unit"
+  fi
+done
+
+# A failed alias lookup is best effort: the static list still applies and
+# ordinary units still restart.
+_archup_mock_reset
+_archup_mock_add_package dm-lookup 1 ok
+_archup_mock_add_service dm-lookup gdm.service
+_archup_mock_add_service dm-lookup ordinary.service
+ARCHUP_ACTIVE_UNITS=(gdm.service ordinary.service)
+ARCHUP_DISPLAY_MANAGER_ID_STATUS=1
+set +e
+result=$(sysup_restart_upgraded_services dm-lookup 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: failed display-manager lookup is not a failure" "0" "$status"
+_assert_eq "archup restart: failed display-manager lookup keeps the static list" \
+  $'daemon-reload\ntry-restart ordinary.service' "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: failed lookup still reports the static deferral" \
+  "units not restarted: gdm.service" "$result"
+
+# Deferral alongside ordinary restarts is still a successful run.
+_archup_mock_reset
+_archup_mock_add_package defer-and-restart 1 ok
+_archup_mock_add_service defer-and-restart dbus.service
+_archup_mock_add_service defer-and-restart ordinary.service
+ARCHUP_ACTIVE_UNITS=(dbus.service ordinary.service)
+set +e
+result=$(sysup_restart_upgraded_services defer-and-restart 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: deferral with other restarts returns success" "0" "$status"
+_assert_contains "archup restart: deferral with other restarts still restarts the rest" \
+  "try-restart ordinary.service" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: deferral with other restarts reports the deferral" \
+  "units not restarted: dbus.service" "$result"
+_assert_contains "archup restart: hint offers a manual restart before a reboot" \
+  "restart them manually from outside the affected sessions, or reboot" "$result"
+
+# The backend's NVIDIA deferral and the session deferral combine: both are
+# reported, neither restarts, and the run succeeds.
+_archup_mock_reset
+_archup_mock_add_package nvidia-and-session 0 ok
+_archup_mock_add_service nvidia-and-session nvidia-persistenced.service
+_archup_mock_add_service nvidia-and-session user@.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service user@1000.service)
+printf '%s\n' \
+  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build' \
+  >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_NVIDIA_INSTALLED_VERSION=615.71.09
+set +e
+result=$(sysup_backend_restart_services nvidia-and-session 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: NVIDIA and session deferrals together succeed" "0" "$status"
+_assert_not_contains "archup restart: NVIDIA and session deferrals restart nothing" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: NVIDIA deferral is reported with the session one" \
+  "loaded NVIDIA driver 610.57.04 differs from installed 615.71.09" "$result"
+_assert_contains "archup restart: session deferral is reported with the NVIDIA one" \
+  "units not restarted: user@1000.service" "$result"
+_assert_contains "archup restart: combined deferral is reported distinctly" \
+  "no active services eligible for immediate restart" "$result"
+
+# Near misses must keep restarting: the policy matches whole unit names.
+_archup_mock_reset
+_archup_mock_add_package near-miss 1 ok
+_archup_mock_add_service near-miss worker@.service
+_archup_mock_add_service near-miss usersync.service
+_archup_mock_add_service near-miss wdmd.service
+ARCHUP_ACTIVE_UNITS=(worker@1000.service usersync.service wdmd.service)
+result=$(sysup_restart_upgraded_services near-miss 2>&1)
+_assert_contains "archup restart: similarly named units still restart" \
+  "try-restart usersync.service wdmd.service worker@1000.service" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_not_contains "archup restart: near misses are not reported as deferred" \
+  "deferred" "$result"
+
 _archup_mock_reset
 _archup_mock_add_package inactive-service 1 ok
 _archup_mock_add_service inactive-service inactive.service
@@ -940,6 +1160,247 @@ _assert_contains "archup main: failed upgrade block returns original status" \
   "status=7" "$result"
 _assert_not_contains "archup main: failed upgrade block removes snapshots" \
   "snapshot." "$result"
+
+echo ""
+echo "=== archup: deferred restart reminders ==="
+
+_path_state() {
+  if [[ -e "$1" ]]; then printf 'present\n'; else printf 'absent\n'; fi
+}
+# ls, not GNU stat: the suites also run on BSD userlands.
+_path_mode() {
+  local mode
+  mode=$(ls -ld -- "$1")
+  printf '%s\n' "${mode:0:10}"
+}
+
+# The deferring run records the unit with the boot and the unit's own
+# activation time, creating the root-owned state directory on first use.
+_archup_mock_reset
+_archup_mock_add_package reminder-session 1 ok
+_archup_mock_add_service reminder-session user@.service
+ARCHUP_ACTIVE_UNITS=(user@1000.service)
+sysup_restart_upgraded_services reminder-session >/dev/null 2>&1
+_assert_eq "archup reminder: records the deferred unit for this boot" \
+  $'boot-a\tuser@1000.service\t100' "$(grep -v '^#' "$ARCHUP_STATE_FILE")"
+_assert_eq "archup reminder: state file is world-readable, not writable" \
+  "-rw-r--r--" "$(_path_mode "$ARCHUP_STATE_FILE")"
+_assert_eq "archup reminder: state directory is created traversable" \
+  "drwxr-xr-x" "$(_path_mode "$SYSUP_STATE_DIR")"
+
+# Later runs keep reminding with one stable marker line, and a read-only
+# (check-only) reminder leaves the state untouched.
+state_before=$(cat "$ARCHUP_STATE_FILE")
+set +e
+result=$(sysup_report_deferred_restarts 0 2>&1 >/dev/null)
+status=$?
+set -e
+_assert_eq "archup reminder: reminding is advisory" "0" "$status"
+_assert_eq "archup reminder: later run prints one stable marker on stderr" \
+  "reboot recommended: session-critical units may still run pre-upgrade code: user@1000.service; restart them manually or reboot" \
+  "$result"
+_assert_eq "archup reminder: read-only reminder keeps the state" \
+  "$state_before" "$(cat "$ARCHUP_STATE_FILE")"
+
+# A newer boot clears the reminder; only a mutating run prunes the file.
+printf 'boot-b\n' >"$SYSUP_BOOT_ID_FILE"
+result=$(sysup_report_deferred_restarts 0 2>&1)
+_assert_not_contains "archup reminder: newer boot clears the reminder" \
+  "reboot recommended" "$result"
+_assert_eq "archup reminder: read-only run does not prune after a reboot" \
+  present "$(_path_state "$ARCHUP_STATE_FILE")"
+sysup_report_deferred_restarts 1 >/dev/null 2>&1
+_assert_eq "archup reminder: mutating run removes the stale state" \
+  absent "$(_path_state "$ARCHUP_STATE_FILE")"
+
+# A manual restart since the deferral clears the unit without a reboot.
+_archup_mock_reset
+_archup_mock_add_package manual-restart 1 ok
+_archup_mock_add_service manual-restart user@.service
+_archup_mock_add_service manual-restart gdm.service
+ARCHUP_ACTIVE_UNITS=(gdm.service user@1000.service)
+sysup_restart_upgraded_services manual-restart >/dev/null 2>&1
+ARCHUP_ACTIVE_SINCE[user@1000.service]=250
+result=$(sysup_report_deferred_restarts 1 2>&1)
+_assert_contains "archup reminder: unrestarted unit is still reported" \
+  "pre-upgrade code: gdm.service;" "$result"
+_assert_eq "archup reminder: manually restarted unit is pruned" \
+  $'boot-a\tgdm.service\t100' "$(grep -v '^#' "$ARCHUP_STATE_FILE")"
+
+# A unit that stopped or no longer exists runs no old code.
+ARCHUP_ACTIVE_UNITS=()
+result=$(sysup_report_deferred_restarts 1 2>&1)
+_assert_not_contains "archup reminder: stopped or removed unit is not reported" \
+  "reboot recommended" "$result"
+_assert_eq "archup reminder: stopped or removed unit is pruned" \
+  absent "$(_path_state "$ARCHUP_STATE_FILE")"
+
+# A later deferral merges with pending ones and refreshes a re-deferred unit.
+_archup_mock_reset
+_archup_mock_add_package merge-first 1 ok
+_archup_mock_add_service merge-first gdm.service
+_archup_mock_add_package merge-second 1 ok
+_archup_mock_add_service merge-second user@.service
+_archup_mock_add_service merge-second gdm.service
+ARCHUP_ACTIVE_UNITS=(gdm.service user@1000.service)
+sysup_restart_upgraded_services merge-first >/dev/null 2>&1
+ARCHUP_ACTIVE_SINCE[gdm.service]=300
+sysup_restart_upgraded_services merge-second >/dev/null 2>&1
+_assert_eq "archup reminder: merges and refreshes deferred units" \
+  $'boot-a\tgdm.service\t300\nboot-a\tuser@1000.service\t100' \
+  "$(grep -v '^#' "$ARCHUP_STATE_FILE" | LC_ALL=C sort)"
+
+# Without a readable boot identity the reminder persists until the unit is
+# restarted, rather than being dropped as if the host had rebooted.
+_archup_mock_reset
+_archup_mock_add_package no-boot-id 1 ok
+_archup_mock_add_service no-boot-id dbus.service
+ARCHUP_ACTIVE_UNITS=(dbus.service)
+rm -f "$SYSUP_BOOT_ID_FILE"
+sysup_restart_upgraded_services no-boot-id >/dev/null 2>&1
+printf 'boot-c\n' >"$SYSUP_BOOT_ID_FILE"
+result=$(sysup_report_deferred_restarts 1 2>&1)
+_assert_contains "archup reminder: unknown boot identity keeps reminding" \
+  "pre-upgrade code: dbus.service;" "$result"
+
+# Malformed lines are ignored rather than reported or passed to systemctl.
+_archup_mock_reset
+ARCHUP_ACTIVE_UNITS=(gdm.service)
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' '# comment' 'garbage' $'boot-a\tgdm.service\t100' $'boot-a\t\t' \
+  >"$ARCHUP_STATE_FILE"
+result=$(sysup_report_deferred_restarts 0 2>&1)
+_assert_eq "archup reminder: malformed lines are ignored" \
+  "reboot recommended: session-critical units may still run pre-upgrade code: gdm.service; restart them manually or reboot" \
+  "$result"
+
+# Failing to persist is a warning, not a failed run: this run's deferral was
+# already reported.
+_archup_mock_reset
+_archup_mock_add_package unwritable-state 1 ok
+_archup_mock_add_service unwritable-state user@.service
+ARCHUP_ACTIVE_UNITS=(user@1000.service)
+: >"$ARCHUP_MOCK_ROOT/not-a-dir"
+SYSUP_STATE_DIR="$ARCHUP_MOCK_ROOT/not-a-dir/state"
+set +e
+result=$(sysup_restart_upgraded_services unwritable-state 2>&1)
+status=$?
+set -e
+_assert_eq "archup reminder: unwritable state does not fail the restart step" \
+  "0" "$status"
+_assert_contains "archup reminder: unwritable state is reported" \
+  "could not record deferred restarts" "$result"
+
+# Transient states still run the unit's code; only inactive or failed spend
+# the entry.
+_archup_mock_reset
+ARCHUP_ACTIVE_UNITS=(gdm.service)
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' $'boot-a\tgdm.service\t100' >"$ARCHUP_STATE_FILE"
+ARCHUP_UNIT_STATE[gdm.service]=reloading
+result=$(sysup_report_deferred_restarts 1 2>&1)
+_assert_contains "archup reminder: reloading unit is still reported" \
+  "pre-upgrade code: gdm.service;" "$result"
+_assert_eq "archup reminder: reloading unit is not pruned" \
+  present "$(_path_state "$ARCHUP_STATE_FILE")"
+ARCHUP_UNIT_STATE[gdm.service]=failed
+sysup_report_deferred_restarts 1 >/dev/null 2>&1
+_assert_eq "archup reminder: failed unit is pruned" \
+  absent "$(_path_state "$ARCHUP_STATE_FILE")"
+
+# A unit systemd cannot be asked about keeps its entry.
+_archup_mock_reset
+ARCHUP_ACTIVE_UNITS=(gdm.service)
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' $'boot-a\tgdm.service\t100' >"$ARCHUP_STATE_FILE"
+ARCHUP_SYSTEMCTL_SHOW_STATUS=6
+result=$(sysup_report_deferred_restarts 1 2>&1)
+_assert_contains "archup reminder: unqueryable unit is still reported" \
+  "pre-upgrade code: gdm.service;" "$result"
+_assert_eq "archup reminder: unqueryable unit is not pruned" \
+  present "$(_path_state "$ARCHUP_STATE_FILE")"
+
+# A record without a trailing newline, and duplicate lines, are read once.
+_archup_mock_reset
+ARCHUP_ACTIVE_UNITS=(gdm.service sddm.service)
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n%s\n%s' $'boot-a\tsddm.service\t100' $'boot-a\tsddm.service\t100' \
+  $'boot-a\tgdm.service\t100' >"$ARCHUP_STATE_FILE"
+result=$(sysup_report_deferred_restarts 0 2>&1)
+_assert_contains "archup reminder: reads a last line without a newline, once per unit" \
+  "pre-upgrade code: sddm.service gdm.service;" "$result"
+
+# Without systemctl there is nothing to check, so the reminder is a no-op.
+_archup_mock_reset
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' $'boot-a\tgdm.service\t100' >"$ARCHUP_STATE_FILE"
+result=$(
+  unset -f systemctl
+  # shellcheck disable=SC2123 # Deliberately hide any host systemctl.
+  PATH=/nonexistent
+  sysup_report_deferred_restarts 1 2>&1
+)
+_assert_eq "archup reminder: no systemctl means no reminder" "" "$result"
+_assert_eq "archup reminder: no systemctl leaves the record" \
+  present "$(_path_state "$ARCHUP_STATE_FILE")"
+
+# user-runtime-dir@ has no running code, so it is deferred but not recorded.
+_archup_mock_reset
+_archup_mock_add_package runtime-dir 1 ok
+_archup_mock_add_service runtime-dir user-runtime-dir@.service
+ARCHUP_ACTIVE_UNITS=(user-runtime-dir@1000.service)
+result=$(sysup_restart_upgraded_services runtime-dir 2>&1)
+_assert_contains "archup reminder: user-runtime-dir@ is still deferred" \
+  "units not restarted: user-runtime-dir@1000.service" "$result"
+_assert_eq "archup reminder: user-runtime-dir@ is not recorded" \
+  absent "$(_path_state "$ARCHUP_STATE_FILE")"
+
+# An existing record that cannot be read is never overwritten.
+if ((EUID != 0)); then
+  _archup_mock_reset
+  _archup_mock_add_package unreadable-record 1 ok
+  _archup_mock_add_service unreadable-record user@.service
+  ARCHUP_ACTIVE_UNITS=(user@1000.service)
+  mkdir -p "$SYSUP_STATE_DIR"
+  printf '%s\n' $'boot-a\tgdm.service\t100' >"$ARCHUP_STATE_FILE"
+  chmod 000 "$ARCHUP_STATE_FILE"
+  result=$(sysup_restart_upgraded_services unreadable-record 2>&1)
+  chmod 644 "$ARCHUP_STATE_FILE"
+  _assert_contains "archup reminder: unreadable record is reported" \
+    "could not read $ARCHUP_STATE_FILE" "$result"
+  _assert_eq "archup reminder: unreadable record is left intact" \
+    $'boot-a\tgdm.service\t100' "$(cat "$ARCHUP_STATE_FILE")"
+fi
+
+# The driver reminds on every run, including --check-only, without pruning.
+_archup_mock_reset
+ARCHUP_ACTIVE_UNITS=(sddm.service)
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' $'boot-a\tsddm.service\t100' >"$ARCHUP_STATE_FILE"
+set +e
+result=$(sysup_main --check-only 2>&1)
+status=$?
+set -e
+_assert_eq "archup main: pending reminder keeps a clean check-only run successful" \
+  "0" "$status"
+_assert_contains "archup main: check-only run repeats the reminder" \
+  "reboot recommended: session-critical units may still run pre-upgrade code: sddm.service;" \
+  "$result"
+printf 'boot-b\n' >"$SYSUP_BOOT_ID_FILE"
+: >"$ARCHUP_SUDO_COMMAND_LOG"
+sysup_main --check-only >/dev/null 2>&1 || true
+_assert_eq "archup main: check-only run never prunes the state" \
+  present "$(_path_state "$ARCHUP_STATE_FILE")"
+_assert_eq "archup main: check-only run issues no privileged state writes" \
+  "" "$(grep -E '^(install|mv|rm) ' "$ARCHUP_SUDO_COMMAND_LOG" || true)"
+sysup_main --no-restart-upgraded-services >/dev/null 2>&1 || true
+_assert_eq "archup main: a no-restart upgrade run still prunes a spent record" \
+  absent "$(_path_state "$ARCHUP_STATE_FILE")"
+mkdir -p "$SYSUP_STATE_DIR"
+printf '%s\n' $'boot-a\tsddm.service\t100' >"$ARCHUP_STATE_FILE"
+sysup_main >/dev/null 2>&1 || true
+_assert_eq "archup main: an upgrade run prunes state from an earlier boot" \
+  absent "$(_path_state "$ARCHUP_STATE_FILE")"
 
 echo ""
 echo "=== archup: failed unit reporting ==="

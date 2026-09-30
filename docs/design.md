@@ -64,7 +64,9 @@ Optional hooks, with defaults in `common.sh`:
 `sysup_backend_check_service_restart` returns 0 to allow a restart, 1 to defer
 it, or another status to mark service restarts unverified, which fails the run.
 Only the shared upgraded-service restart path consults it; `needrestart`
-restarts and `--restart-failed` do not.
+restarts and `--restart-failed` do not. Session-critical units are deferred by
+the shared path itself, before this hook runs, so a backend cannot re-enable
+them.
 
 Backends set `SYSUP_BACKEND_NAME` for user-facing messages and may append to
 `SYSUP_EXTRA_UPGRADED_PACKAGES` for packages a version diff cannot detect
@@ -84,18 +86,53 @@ require extending the parser contract.
 5. Restart affected services unless `--no-restart-upgraded-services`. The
    shared fallback maps upgraded package files to active units; Debian instead
    prefers `needrestart`'s runtime deleted-file analysis when available, which
-   can include services owned by other packages.
+   can include services owned by other packages. The shared fallback defers
+   session-critical units (`sysup_session_critical_unit`: per-user managers
+   and their runtime directories, gettys, display managers, logind, D-Bus,
+   rescue shells) before consulting systemd or the backend, because template
+   expansion would otherwise restart the running `user@UID` or `getty@tty`
+   instances and end the operator's session. The list starts from the
+   session-related entries in `needrestart`'s default `override_rc`, with its
+   open-ended prefixes anchored to exact unit names. Deferred units are listed
+   with a hint to restart them manually or reboot, and do not fail the run.
 6. With `--restart-failed`, restart failed enabled units.
-7. Report failed systemd units.
+7. Repeat the deferred-restart reminder (below).
+8. Report failed systemd units.
 
-Steps 4 through 7 each contribute to the exit status rather than short-circuiting,
-so one run surfaces every problem.
+Steps 4 through 8 each run rather than short-circuiting, and every one except
+the advisory reminder in step 7 contributes to the exit status, so one run
+surfaces every problem.
 
 Once the package-manager command starts, those follow-up steps also run after a
 failure: an upgrade can install some packages before returning nonzero. The
 driver re-snapshots best-effort, restarts services for anything it can prove
 changed, reports unverified discovery explicitly, and preserves the original
 package-manager status.
+
+### Deferred restarts
+
+A deferral is reported once by the run that upgraded the package, which is
+easy to miss on an unattended host, so the shared path also records it in
+`/var/lib/sysup/deferred-restarts` (`SYSUP_STATE_DIR`). The record is
+host-wide and root-owned (directory `0755`, file `0644`, written through
+`sudo` like the restarts themselves and replaced by an atomic rename), because
+sysup runs both as the operator and as root and each run must see the same
+record. Each line holds the kernel `boot_id`, the unit, and the unit's
+`ActiveEnterTimestampMonotonic` at deferral time. `user-runtime-dir@` is
+deferred but not recorded: it is a oneshot with no code left running.
+
+Every run reads the record, including `--check-only`, and prints one
+`reboot recommended: ...` line on stderr while any entry still applies. An
+entry is spent once `boot_id` changes, the unit is inactive or failed (stopped
+or removed), or its activation timestamp changes (restarted manually).
+Transient states such as `reloading` still count as running. When
+the boot or the unit cannot be checked the entry is kept, trading a redundant
+reminder for never dropping one silently. Only mutating runs prune spent
+entries or remove the file; `--check-only` never writes. The reminder is
+advisory, matching debup's reboot-required report, and a failure to record it
+is a warning rather than a failed run, and an unreadable record is never
+overwritten. Concurrent sysup runs could race on the rename; package-manager
+locks make overlapping upgrade runs unlikely, and the loser only warns.
 
 ## Detection
 

@@ -189,10 +189,249 @@ sysup_upgraded_active_service_units() {
   return "$discovery_status"
 }
 
+# Units whose restart ends a login or graphical session, or takes down a
+# service every session depends on. An upgrade must not kill the operator's
+# session mid-run, so these keep running the old code until a reboot or a
+# deliberate manual restart. The list starts from the session-related defaults
+# in needrestart's override_rc, which only protect debup's needrestart path;
+# the shared package-based path needs the same protection because template
+# expansion maps a shipped user@.service or getty@.service to every running
+# instance. It adds units needrestart never has to consider: oneshots with no
+# process to inspect (user-runtime-dir@) and gettys and display managers
+# missing from its list. Patterns match whole unit names. needrestart matches
+# open-ended prefixes (^gdm, ^dbus); these are anchored to the real unit names
+# so an unrelated unit sharing a prefix (sanlock's wdmd, say) still restarts.
+#
+# Deliberately not listed: systemd-journald (it keeps client streams in its
+# fd store across restarts), sshd (live connections are separate processes),
+# and needrestart's network and virtualization entries, which risk
+# connectivity or guests rather than the local session.
+sysup_session_critical_unit() {
+  case "$1" in
+    # The per-user manager owns every user service and the graphical
+    # session; user-runtime-dir@ owns XDG_RUNTIME_DIR, and user@ Requires= it,
+    # so stopping it stops the manager too.
+    user@*.service | user-runtime-dir@*.service) return 0 ;;
+    # Restarting a getty kills the login shell on that terminal.
+    getty@* | autovt@* | serial-getty@* | container-getty@* | console-getty.service) return 0 ;;
+    # Display managers are the parent of every graphical session they host.
+    # needrestart's list plus gdm3 (Debian's historical name) and the Arch
+    # display managers greetd and ly; any other one is caught through the
+    # display-manager.service alias by the caller.
+    gdm.service | gdm3.service | kdm.service | lightdm.service | lxdm.service | \
+      nodm.service | sddm.service | slim.service | wdm.service | xdm.service | \
+      greetd.service | ly.service | ly@*.service) return 0 ;;
+    # logind tracks sessions, seats, and device ACLs (Debian #798097);
+    # seatd fills that role for seatd-based compositors.
+    # systemd 258+ also has logind's Varlink socket, which pam_systemd uses;
+    # restarting it rebinds the socket while logind keeps the old one.
+    systemd-logind.service | systemd-logind-varlink.socket | elogind.service | \
+      seatd.service) return 0 ;;
+    # The system bus, in every implementation plus its activation socket;
+    # logind, polkit, and desktop sessions depend on it. dbus.service is only
+    # an alias where the daemon ships as dbus-daemon.service (Fedora, Arch's
+    # dbus-daemon-units), and list-units reports the real name.
+    dbus.service | dbus-daemon.service | dbus-broker.service | dbus.socket) return 0 ;;
+    # These are the operator's shell when active.
+    emergency.service | rescue.service) return 0 ;;
+  esac
+  return 1
+}
+
+# Deferred session-critical restarts outlive the run that deferred them: an
+# unattended host could otherwise keep a D-Bus or logind security fix unloaded
+# indefinitely after one easily missed message. Record them host-wide, root-
+# owned under /var/lib, because sysup may run as the operator (through sudo)
+# or as root, and every later run must see the same record. Overridable for
+# tests.
+SYSUP_STATE_DIR="${SYSUP_STATE_DIR:-/var/lib/sysup}"
+# The kernel regenerates boot_id on every boot, so it decides "rebooted since
+# the deferral" without comparing wall clocks that may have been adjusted.
+SYSUP_BOOT_ID_FILE="${SYSUP_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+
+sysup_deferred_state_file() {
+  printf '%s/deferred-restarts\n' "$SYSUP_STATE_DIR"
+}
+
+sysup_boot_id() {
+  local id=""
+
+  [[ -r "$SYSUP_BOOT_ID_FILE" ]] || return 1
+  IFS= read -r id <"$SYSUP_BOOT_ID_FILE" || true
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$id"
+}
+
+# Print when a unit last entered the active state, on systemd's own monotonic
+# clock. A deferred unit whose value changes was restarted since the deferral.
+# Returns 1 when the unit is inactive or failed (stopped or gone, so nothing
+# runs the old code) and 2 when systemd could not be queried. Transient states
+# (reloading, activating, deactivating) still count as running: pruning on
+# them would drop a reminder for good.
+sysup_unit_active_since() {
+  local output line state="" since=""
+
+  output="$(systemctl show --property=ActiveState \
+    --property=ActiveEnterTimestampMonotonic -- "$1" 2>/dev/null </dev/null)" || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      ActiveState=*) state="${line#*=}" ;;
+      ActiveEnterTimestampMonotonic=*) since="${line#*=}" ;;
+    esac
+  done <<<"$output"
+  case "$state" in
+    inactive | failed) return 1 ;;
+    "") return 2 ;;
+  esac
+  [[ -n "$since" ]] || return 2
+  printf '%s\n' "$since"
+}
+
+# Print the recorded deferrals that still apply, as "boot<TAB>unit<TAB>since"
+# lines. An entry is spent once the host rebooted, or the unit stopped or was
+# restarted. When the boot or the unit cannot be checked the entry is kept:
+# a redundant reminder is safer than silently dropping one.
+sysup_pending_deferred_restarts() {
+  local state boot="" entry_boot unit since current rc seen=" "
+
+  state="$(sysup_deferred_state_file)"
+  [[ -e "$state" ]] || return 0
+  if [[ ! -r "$state" ]]; then
+    printf 'warning: could not read %s; deferred service restarts are unverified\n' \
+      "$state" >&2
+    return 1
+  fi
+  boot="$(sysup_boot_id)" || boot=""
+
+  while IFS=$'\t' read -r entry_boot unit since _ || [[ -n "${entry_boot:-}" ]]; do
+    [[ -n "${entry_boot:-}" && "$entry_boot" != \#* ]] || continue
+    [[ -n "${unit:-}" && -n "${since:-}" ]] || continue
+    # A hand-edited duplicate is reported once.
+    [[ "$seen" != *" $unit "* ]] || continue
+    if [[ -n "$boot" && "$entry_boot" != unknown && "$entry_boot" != "$boot" ]]; then
+      continue
+    fi
+    rc=0
+    current="$(sysup_unit_active_since "$unit")" || rc=$?
+    ((rc != 1)) || continue
+    if ((rc == 0)) && [[ "$since" != - && "$current" != "$since" ]]; then
+      continue
+    fi
+    seen+="$unit "
+    printf '%s\t%s\t%s\n' "$entry_boot" "$unit" "$since"
+  done <"$state"
+}
+
+# Replace the state with the given entries, or remove it when none remain.
+# The new file is installed beside the old one and renamed over it, so a
+# reader never sees a partial record.
+sysup_write_deferred_state() {
+  local state tmp status=0
+
+  state="$(sysup_deferred_state_file)"
+  if (($# == 0)); then
+    [[ -e "$state" ]] || return 0
+    sysup_run_as_root rm -f -- "$state"
+    return
+  fi
+
+  tmp="$(mktemp)" || return
+  {
+    printf '# sysup deferred session-critical restarts: boot id, unit, ActiveEnterTimestampMonotonic\n'
+    printf '%s\n' "$@"
+  } >"$tmp" || status=$?
+  if ((status == 0)); then
+    sysup_run_as_root install -d -m 0755 -- "$SYSUP_STATE_DIR" || status=$?
+  fi
+  if ((status == 0)); then
+    sysup_run_as_root install -m 0644 -- "$tmp" "$state.new" || status=$?
+  fi
+  if ((status == 0)); then
+    sysup_run_as_root mv -f -- "$state.new" "$state" || status=$?
+  fi
+  rm -f -- "$tmp"
+  return "$status"
+}
+
+# Add the units deferred by this run to the pending record. A unit deferred
+# again is refreshed: this upgrade is the one a restart has to pick up.
+# user-runtime-dir@ is deferred but not recorded: it is a oneshot that only
+# mounts XDG_RUNTIME_DIR, so there is no old code left running to remind about.
+sysup_record_deferred_restarts() {
+  local boot listing entry_boot unit since new
+  local -a entries=() record=()
+
+  for unit in "$@"; do
+    [[ "$unit" == user-runtime-dir@* ]] || record+=("$unit")
+  done
+  ((${#record[@]})) || return 0
+  set -- "${record[@]}"
+
+  boot="$(sysup_boot_id)" || boot=unknown
+  # An existing record that cannot be read must not be overwritten: that
+  # would silently drop the reminders it holds.
+  listing="$(sysup_pending_deferred_restarts)" || return 1
+  while IFS=$'\t' read -r entry_boot unit since; do
+    [[ -n "${unit:-}" ]] || continue
+    for new in "$@"; do
+      [[ "$new" != "$unit" ]] || continue 2
+    done
+    entries+=("$entry_boot"$'\t'"$unit"$'\t'"$since")
+  done <<<"$listing"
+  for unit in "$@"; do
+    since="$(sysup_unit_active_since "$unit")" || since=-
+    entries+=("$boot"$'\t'"$unit"$'\t'"$since")
+  done
+
+  if ! sysup_write_deferred_state "${entries[@]}"; then
+    printf 'warning: could not record deferred restarts in %s; later runs will not repeat this reminder\n' \
+      "$SYSUP_STATE_DIR" >&2
+    return 1
+  fi
+}
+
+# Remind on every run while deferred units still run pre-upgrade code. The
+# single "reboot recommended:" line on stderr is a stable marker automation can
+# match. Like debup's reboot-required report it is advisory and never changes
+# the exit status. With $1 = 1 the run also prunes spent entries; --check-only
+# passes 0 and leaves the host untouched.
+sysup_report_deferred_restarts() {
+  local may_prune="${1:-0}" state listing line entry_boot unit total=0
+  local -a pending=() units=()
+
+  command -v systemctl >/dev/null 2>&1 || return 0
+  state="$(sysup_deferred_state_file)"
+  [[ -e "$state" ]] || return 0
+  listing="$(sysup_pending_deferred_restarts)" || return 0
+  if [[ -n "$listing" ]]; then
+    mapfile -t pending <<<"$listing"
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    total=$((total + 1))
+  done <"$state"
+  if ((may_prune && ${#pending[@]} != total)); then
+    sysup_write_deferred_state "${pending[@]+"${pending[@]}"}" ||
+      printf 'warning: could not prune spent entries from %s\n' "$state" >&2
+  fi
+
+  ((${#pending[@]})) || return 0
+  for line in "${pending[@]}"; do
+    IFS=$'\t' read -r entry_boot unit _ <<<"$line"
+    units+=("$unit")
+  done
+  # "may": package scripts can re-exec some managers in place without
+  # changing their activation time, so this cannot be certain.
+  printf 'reboot recommended: session-critical units may still run pre-upgrade code: %s; restart them manually or reboot\n' \
+    "${units[*]}" >&2
+}
+
 sysup_restart_upgraded_services() {
   local -a units=()
   local -a active_units=()
-  local can_stop policy_output policy_status unit unit_listing
+  local -a session_units=()
+  local can_stop display_manager="" policy_output policy_status unit unit_listing
   local deferred_count=0 discovery_status=0
 
   if (($# == 0)); then
@@ -219,6 +458,12 @@ sysup_restart_upgraded_services() {
     # Otherwise an upgrade that introduces a manual-control refusal can pass
     # the old check and then reject the restart after daemon-reload.
     sysup_run_as_root systemctl daemon-reload || return
+    # list-units reports the display manager under its own name, never the
+    # display-manager.service alias, so resolve the alias to cover display
+    # managers the static list does not know. Best effort: the static list
+    # still applies when the alias is unset or the query fails.
+    display_manager="$(systemctl show --property=Id --value -- display-manager.service 2>/dev/null)" ||
+      display_manager=""
   fi
 
   # Active includes boot-time oneshots that remain active after they exit.
@@ -227,6 +472,13 @@ sysup_restart_upgraded_services() {
   # and fails the restart batch. Ask systemd for the effective capability
   # instead of maintaining a release-sensitive list of special unit names.
   for unit in "${active_units[@]}"; do
+    # Session safety is decided before systemd capability: a session unit
+    # is deferred even when systemd would allow restarting it.
+    if sysup_session_critical_unit "$unit" ||
+      [[ -n "$display_manager" && "$unit" == "$display_manager" ]]; then
+      session_units+=("$unit")
+      continue
+    fi
     if ! can_stop="$(systemctl show --property=CanStop --value -- "$unit")"; then
       printf 'warning: could not determine whether %s supports manual restart\n' \
         "$unit" >&2
@@ -256,6 +508,20 @@ sysup_restart_upgraded_services() {
         ;;
     esac
   done
+  # Report deferrals explicitly: silently skipping would leave the operator
+  # believing every upgraded service already runs the new code.
+  if ((${#session_units[@]})); then
+    ((deferred_count += ${#session_units[@]}))
+    printf 'deferred: session-critical units not restarted: %s\n' \
+      "${session_units[*]}" >&2
+    # Not reboot-only: some distributions' package scripts re-exec user
+    # managers themselves, and a manual restart from outside the affected
+    # sessions is enough for the rest.
+    printf 'hint: restart them manually from outside the affected sessions, or reboot, to load the upgraded code\n' >&2
+    # Advisory: this run already reported the deferral, so a failed record
+    # only costs the reminder on later runs.
+    sysup_record_deferred_restarts "${session_units[@]}" || true
+  fi
   if ((${#units[@]} == 0)); then
     if ((discovery_status != 0)); then
       printf 'error: could not fully determine active services from upgraded packages; service restarts are unverified\n' >&2
