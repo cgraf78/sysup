@@ -566,6 +566,22 @@ systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
 _assert_contains "debup restart: recognizes pre-merged-usr unit paths" \
   "try-restart legacy.service" "$systemctl_log"
 
+# Without needrestart, the shared fallback owns session safety: a systemd
+# upgrade must not restart the user manager or gettys it maps to.
+_debup_reset
+DEBUP_MOCK_PACKAGE_FILES=$'systemd /lib/systemd/system/user@.service\nsystemd /lib/systemd/system/getty@.service\nsystemd /lib/systemd/system/systemd-timesyncd.service'
+DEBUP_MOCK_ACTIVE_UNITS=$'user@1000.service\ngetty@tty1.service\nsystemd-timesyncd.service'
+result=$(sysup_backend_restart_services systemd 2>&1)
+systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
+_assert_contains "debup restart: fallback still restarts ordinary units" \
+  "try-restart systemd-timesyncd.service" "$systemctl_log"
+_assert_not_contains "debup restart: fallback defers the user manager" \
+  "user@1000.service" "$systemctl_log"
+_assert_not_contains "debup restart: fallback defers gettys" \
+  "getty@tty1.service" "$systemctl_log"
+_assert_contains "debup restart: fallback reports deferred session units" \
+  "units not restarted: getty@tty1.service user@1000.service" "$result"
+
 _debup_reset
 DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
 DEBUP_MOCK_ACTIVE_UNITS="ssh.service"

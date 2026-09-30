@@ -107,7 +107,12 @@ failures are also surfaced instead of short-circuiting one another.
 The shared Arch and Debian fallback restarts only active units owned by packages
 proven to have changed. When `needrestart` is available, Debian instead uses its
 runtime deleted-file analysis, which may restart another service affected by an
-upgraded library even when that service belongs to a different package. Missing
+upgraded library even when that service belongs to a different package. The
+shared fallback never restarts units whose restart would end a login or
+graphical session (`user@`, `user-runtime-dir@`, gettys, display managers,
+`systemd-logind`, D-Bus, rescue shells), starting from `needrestart`'s
+session-related defaults; it
+reports them as deferred until a reboot or manual restart instead. Missing
 systemd is a supported no-op; an unreachable or failed systemd query is an
 error rather than being mistaken for a healthy empty result.
 

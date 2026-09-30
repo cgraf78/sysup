@@ -37,6 +37,7 @@ _archup_mock_reset() {
   ARCHUP_NON_RESTARTABLE_AFTER_RELOAD_UNITS=""
   ARCHUP_SYSTEMCTL_SHOW_STATUS=0
   ARCHUP_SYSTEMCTL_SHOW_MALFORMED=0
+  ARCHUP_DISPLAY_MANAGER_ID="display-manager.service"
   ARCHUP_FAILED_UNITS=""
   ARCHUP_DISABLED_UNITS=""
   ARCHUP_SYSTEMCTL_QUERY_STATUS=0
@@ -284,6 +285,11 @@ systemctl() {
         return "$ARCHUP_SYSTEMCTL_SHOW_STATUS"
       fi
       local unit="${!#}"
+      # An unset display-manager.service alias reports its own name.
+      if [[ "$2" == --property=Id && "$unit" == display-manager.service ]]; then
+        printf '%s\n' "$ARCHUP_DISPLAY_MANAGER_ID"
+        return 0
+      fi
       if ((ARCHUP_SYSTEMCTL_SHOW_MALFORMED != 0)); then
         printf 'unknown\n'
         return 0
@@ -796,6 +802,107 @@ _assert_contains "archup restart: restarts active template instances" \
   "try-restart worker@alpha.service" "$systemctl_commands"
 _assert_not_contains "archup restart: ignores unrelated active services" \
   "unrelated.service" "$systemctl_commands"
+
+# A systemd upgrade ships user@.service; template expansion maps it to the
+# running per-user manager, whose restart would end the operator's session.
+_archup_mock_reset
+_archup_mock_add_package session-manager 1 ok
+_archup_mock_add_service session-manager user@.service
+ARCHUP_ACTIVE_UNITS=(user@1000.service)
+set +e
+result=$(sysup_restart_upgraded_services session-manager 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: deferring a session unit is not a failure" "0" "$status"
+_assert_not_contains "archup restart: never restarts an expanded user@ instance" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: names the deferred user@ instance" \
+  "deferred: session-critical units not restarted: user@1000.service" "$result"
+_assert_contains "archup restart: deferred session unit needs a reboot or manual restart" \
+  "reboot" "$result"
+_assert_contains "archup restart: session-only upgrade reports deferral distinctly" \
+  "no active services eligible for immediate restart" "$result"
+
+# Everything a login or graphical session depends on is deferred together,
+# while ordinary units from the same package still restart.
+_archup_mock_reset
+_archup_mock_add_package session-stack 1 ok
+for unit in user-runtime-dir@.service getty@.service serial-getty@.service \
+  systemd-logind.service seatd.service dbus-broker.service dbus.socket \
+  journal-like.service; do
+  _archup_mock_add_service session-stack "$unit"
+done
+ARCHUP_ACTIVE_UNITS=(user-runtime-dir@1000.service getty@tty1.service
+  serial-getty@ttyS0.service systemd-logind.service seatd.service
+  dbus-broker.service dbus.socket journal-like.service)
+result=$(sysup_restart_upgraded_services session-stack 2>&1)
+systemctl_commands=$(cat "$ARCHUP_SYSTEMCTL_LOG")
+_assert_eq "archup restart: only non-session units reach try-restart" \
+  $'daemon-reload\ntry-restart journal-like.service' "$systemctl_commands"
+deferred_line=$(grep '^deferred: session-critical' <<<"$result" || true)
+for unit in user-runtime-dir@1000.service getty@tty1.service \
+  serial-getty@ttyS0.service systemd-logind.service seatd.service \
+  dbus-broker.service dbus.socket; do
+  _assert_contains "archup restart: reports deferred $unit" "$unit" "$deferred_line"
+done
+_assert_not_contains "archup restart: restarted unit is not reported as deferred" \
+  "journal-like.service" "$deferred_line"
+
+_archup_mock_reset
+_archup_mock_add_package desktop-login 1 ok
+for unit in gdm.service sddm.service lightdm.service greetd.service ly@.service; do
+  _archup_mock_add_service desktop-login "$unit"
+done
+ARCHUP_ACTIVE_UNITS=(gdm.service sddm.service lightdm.service greetd.service
+  ly@tty2.service)
+result=$(sysup_restart_upgraded_services desktop-login 2>&1)
+_assert_not_contains "archup restart: never restarts display managers" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: reports deferred display managers" \
+  "units not restarted: gdm.service greetd.service lightdm.service ly@tty2.service sddm.service" "$result"
+
+# A display manager missing from the static list is still found through the
+# display-manager.service alias that enables it.
+_archup_mock_reset
+_archup_mock_add_package custom-login 1 ok
+_archup_mock_add_service custom-login custom-greeter.service
+ARCHUP_ACTIVE_UNITS=(custom-greeter.service)
+ARCHUP_DISPLAY_MANAGER_ID=custom-greeter.service
+result=$(sysup_restart_upgraded_services custom-login 2>&1)
+_assert_not_contains "archup restart: never restarts the aliased display manager" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: reports the aliased display manager as deferred" \
+  "units not restarted: custom-greeter.service" "$result"
+
+# Deferral must not mask an unverified capability query for another unit.
+_archup_mock_reset
+_archup_mock_add_package mixed-unverified 1 ok
+_archup_mock_add_service mixed-unverified user@.service
+_archup_mock_add_service mixed-unverified ordinary.service
+ARCHUP_ACTIVE_UNITS=(ordinary.service user@1000.service)
+ARCHUP_SYSTEMCTL_SHOW_STATUS=6
+set +e
+result=$(sysup_restart_upgraded_services mixed-unverified 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: deferral does not hide an unverified unit" "1" "$status"
+_assert_contains "archup restart: unverified run still reports the deferral" \
+  "units not restarted: user@1000.service" "$result"
+_assert_not_contains "archup restart: unverified run restarts nothing" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+
+# Near misses must keep restarting: the policy matches whole unit names.
+_archup_mock_reset
+_archup_mock_add_package near-miss 1 ok
+_archup_mock_add_service near-miss worker@.service
+_archup_mock_add_service near-miss usersync.service
+_archup_mock_add_service near-miss wdmd.service
+ARCHUP_ACTIVE_UNITS=(worker@1000.service usersync.service wdmd.service)
+result=$(sysup_restart_upgraded_services near-miss 2>&1)
+_assert_contains "archup restart: similarly named units still restart" \
+  "try-restart usersync.service wdmd.service worker@1000.service" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_not_contains "archup restart: near misses are not reported as deferred" \
+  "deferred" "$result"
 
 _archup_mock_reset
 _archup_mock_add_package inactive-service 1 ok

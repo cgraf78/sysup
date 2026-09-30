@@ -189,10 +189,51 @@ sysup_upgraded_active_service_units() {
   return "$discovery_status"
 }
 
+# Units whose restart ends a login or graphical session, or takes down a
+# service every session depends on. An upgrade must not kill the operator's
+# session mid-run, so these keep running the old code until a reboot or a
+# deliberate manual restart. The list starts from the session-related defaults
+# in needrestart's override_rc, which only protect debup's needrestart path;
+# the shared package-based path needs the same protection because template
+# expansion maps a shipped user@.service or getty@.service to every running
+# instance. It adds units needrestart never has to consider: oneshots with no
+# process to inspect (user-runtime-dir@) and gettys and display managers
+# missing from its list. Patterns match whole unit names, any unit type.
+#
+# Deliberately not listed: systemd-journald (it keeps client streams in its
+# fd store across restarts), sshd (live connections are separate processes),
+# and needrestart's network and virtualization entries, which risk
+# connectivity or guests rather than the local session.
+sysup_session_critical_unit() {
+  case "$1" in
+    # The per-user manager owns every user service and the graphical
+    # session; user-runtime-dir@ owns XDG_RUNTIME_DIR, and user@ Requires= it,
+    # so stopping it stops the manager too.
+    user@*.service | user-runtime-dir@*.service) return 0 ;;
+    # Restarting a getty kills the login shell on that terminal.
+    getty@* | autovt@* | serial-getty@* | container-getty@* | console-getty.service) return 0 ;;
+    # Display managers are the parent of every graphical session they host.
+    # Prefixes follow needrestart, except wdm, which would also match
+    # sanlock's wdmd. greetd and ly are Arch display managers; any other one
+    # is caught through the display-manager.service alias by the caller.
+    gdm* | kdm* | lightdm* | lxdm* | nodm* | sddm* | slim* | wdm.service | \
+      xdm* | greetd* | ly.service | ly@*) return 0 ;;
+    # logind tracks sessions, seats, and device ACLs (Debian #798097);
+    # seatd fills that role for seatd-based compositors.
+    systemd-logind* | elogind* | seatd.service) return 0 ;;
+    # The system bus; logind, polkit, and desktop sessions depend on it.
+    dbus*) return 0 ;;
+    # These are the operator's shell when active.
+    emergency.service | rescue.service) return 0 ;;
+  esac
+  return 1
+}
+
 sysup_restart_upgraded_services() {
   local -a units=()
   local -a active_units=()
-  local can_stop policy_output policy_status unit unit_listing
+  local -a session_units=()
+  local can_stop display_manager="" policy_output policy_status unit unit_listing
   local deferred_count=0 discovery_status=0
 
   if (($# == 0)); then
@@ -219,6 +260,12 @@ sysup_restart_upgraded_services() {
     # Otherwise an upgrade that introduces a manual-control refusal can pass
     # the old check and then reject the restart after daemon-reload.
     sysup_run_as_root systemctl daemon-reload || return
+    # list-units reports the display manager under its own name, never the
+    # display-manager.service alias, so resolve the alias to cover display
+    # managers the static list does not know. Best effort: the static list
+    # still applies when the alias is unset or the query fails.
+    display_manager="$(systemctl show --property=Id --value -- display-manager.service 2>/dev/null)" ||
+      display_manager=""
   fi
 
   # Active includes boot-time oneshots that remain active after they exit.
@@ -227,6 +274,13 @@ sysup_restart_upgraded_services() {
   # and fails the restart batch. Ask systemd for the effective capability
   # instead of maintaining a release-sensitive list of special unit names.
   for unit in "${active_units[@]}"; do
+    # Session safety is decided before systemd capability: a session unit
+    # is deferred even when systemd would allow restarting it.
+    if sysup_session_critical_unit "$unit" ||
+      [[ -n "$display_manager" && "$unit" == "$display_manager" ]]; then
+      session_units+=("$unit")
+      continue
+    fi
     if ! can_stop="$(systemctl show --property=CanStop --value -- "$unit")"; then
       printf 'warning: could not determine whether %s supports manual restart\n' \
         "$unit" >&2
@@ -256,6 +310,14 @@ sysup_restart_upgraded_services() {
         ;;
     esac
   done
+  # Report deferrals explicitly: silently skipping would leave the operator
+  # believing every upgraded service already runs the new code.
+  if ((${#session_units[@]})); then
+    ((deferred_count += ${#session_units[@]}))
+    printf 'deferred: session-critical units not restarted: %s\n' \
+      "${session_units[*]}" >&2
+    printf 'hint: reboot, or restart them manually from outside the affected sessions, to load the upgraded code\n' >&2
+  fi
   if ((${#units[@]} == 0)); then
     if ((discovery_status != 0)); then
       printf 'error: could not fully determine active services from upgraded packages; service restarts are unverified\n' >&2

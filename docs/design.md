@@ -64,7 +64,9 @@ Optional hooks, with defaults in `common.sh`:
 `sysup_backend_check_service_restart` returns 0 to allow a restart, 1 to defer
 it, or another status to mark service restarts unverified, which fails the run.
 Only the shared upgraded-service restart path consults it; `needrestart`
-restarts and `--restart-failed` do not.
+restarts and `--restart-failed` do not. Session-critical units are deferred by
+the shared path itself, before this hook runs, so a backend cannot re-enable
+them.
 
 Backends set `SYSUP_BACKEND_NAME` for user-facing messages and may append to
 `SYSUP_EXTRA_UPGRADED_PACKAGES` for packages a version diff cannot detect
@@ -84,7 +86,14 @@ require extending the parser contract.
 5. Restart affected services unless `--no-restart-upgraded-services`. The
    shared fallback maps upgraded package files to active units; Debian instead
    prefers `needrestart`'s runtime deleted-file analysis when available, which
-   can include services owned by other packages.
+   can include services owned by other packages. The shared fallback defers
+   session-critical units (`sysup_session_critical_unit`: per-user managers
+   and their runtime directories, gettys, display managers, logind, D-Bus,
+   rescue shells) before consulting systemd or the backend, because template
+   expansion would otherwise restart the running `user@UID` or `getty@tty`
+   instances and end the operator's session. The list starts from the
+   session-related entries in `needrestart`'s default `override_rc`. Deferred
+   units are listed with a reboot hint and do not fail the run.
 6. With `--restart-failed`, restart failed enabled units.
 7. Report failed systemd units.
 
