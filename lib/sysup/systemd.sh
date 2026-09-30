@@ -233,6 +233,174 @@ sysup_session_critical_unit() {
   return 1
 }
 
+# Deferred session-critical restarts outlive the run that deferred them: an
+# unattended host could otherwise keep a D-Bus or logind security fix unloaded
+# indefinitely after one easily missed message. Record them host-wide, root-
+# owned under /var/lib, because sysup may run as the operator (through sudo)
+# or as root, and every later run must see the same record. Overridable for
+# tests.
+SYSUP_STATE_DIR="${SYSUP_STATE_DIR:-/var/lib/sysup}"
+# The kernel regenerates boot_id on every boot, so it decides "rebooted since
+# the deferral" without comparing wall clocks that may have been adjusted.
+SYSUP_BOOT_ID_FILE="${SYSUP_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+
+sysup_deferred_state_file() {
+  printf '%s/deferred-restarts\n' "$SYSUP_STATE_DIR"
+}
+
+sysup_boot_id() {
+  local id=""
+
+  [[ -r "$SYSUP_BOOT_ID_FILE" ]] || return 1
+  IFS= read -r id <"$SYSUP_BOOT_ID_FILE" || true
+  [[ -n "$id" ]] || return 1
+  printf '%s\n' "$id"
+}
+
+# Print when an active unit last entered the active state, on systemd's own
+# monotonic clock. A deferred unit whose value changes was restarted since the
+# deferral. Returns 1 when the unit is not active (stopped or gone, so nothing
+# runs the old code) and 2 when systemd could not be queried.
+sysup_unit_active_since() {
+  local output line state="" since=""
+
+  output="$(systemctl show --property=ActiveState \
+    --property=ActiveEnterTimestampMonotonic -- "$1" 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      ActiveState=*) state="${line#*=}" ;;
+      ActiveEnterTimestampMonotonic=*) since="${line#*=}" ;;
+    esac
+  done <<<"$output"
+  [[ "$state" == active && -n "$since" ]] || return 1
+  printf '%s\n' "$since"
+}
+
+# Print the recorded deferrals that still apply, as "boot<TAB>unit<TAB>since"
+# lines. An entry is spent once the host rebooted, or the unit stopped or was
+# restarted. When the boot or the unit cannot be checked the entry is kept:
+# a redundant reminder is safer than silently dropping one.
+sysup_pending_deferred_restarts() {
+  local state boot="" entry_boot unit since current rc
+
+  state="$(sysup_deferred_state_file)"
+  [[ -e "$state" ]] || return 0
+  if [[ ! -r "$state" ]]; then
+    printf 'warning: could not read %s; deferred service restarts are unverified\n' \
+      "$state" >&2
+    return 1
+  fi
+  boot="$(sysup_boot_id)" || boot=""
+
+  while IFS=$'\t' read -r entry_boot unit since _ || [[ -n "${entry_boot:-}" ]]; do
+    [[ -n "${entry_boot:-}" && "$entry_boot" != \#* ]] || continue
+    [[ -n "${unit:-}" && -n "${since:-}" ]] || continue
+    if [[ -n "$boot" && "$entry_boot" != unknown && "$entry_boot" != "$boot" ]]; then
+      continue
+    fi
+    rc=0
+    current="$(sysup_unit_active_since "$unit")" || rc=$?
+    ((rc != 1)) || continue
+    if ((rc == 0)) && [[ "$since" != - && "$current" != "$since" ]]; then
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$entry_boot" "$unit" "$since"
+  done <"$state"
+}
+
+# Replace the state with the given entries, or remove it when none remain.
+# The new file is installed beside the old one and renamed over it, so a
+# reader never sees a partial record.
+sysup_write_deferred_state() {
+  local state tmp status=0
+
+  state="$(sysup_deferred_state_file)"
+  if (($# == 0)); then
+    [[ -e "$state" ]] || return 0
+    sysup_run_as_root rm -f -- "$state"
+    return
+  fi
+
+  tmp="$(mktemp)" || return
+  {
+    printf '# sysup deferred session-critical restarts: boot id, unit, ActiveEnterTimestampMonotonic\n'
+    printf '%s\n' "$@"
+  } >"$tmp" || status=$?
+  if ((status == 0)); then
+    sysup_run_as_root install -d -m 0755 -- "$SYSUP_STATE_DIR" 2>/dev/null || status=$?
+  fi
+  if ((status == 0)); then
+    sysup_run_as_root install -m 0644 -- "$tmp" "$state.new" 2>/dev/null || status=$?
+  fi
+  if ((status == 0)); then
+    sysup_run_as_root mv -f -- "$state.new" "$state" || status=$?
+  fi
+  rm -f -- "$tmp"
+  return "$status"
+}
+
+# Add the units deferred by this run to the pending record. A unit deferred
+# again is refreshed: this upgrade is the one a restart has to pick up.
+sysup_record_deferred_restarts() {
+  local boot listing entry_boot unit since new
+  local -a entries=()
+
+  boot="$(sysup_boot_id)" || boot=unknown
+  listing="$(sysup_pending_deferred_restarts 2>/dev/null)" || listing=""
+  while IFS=$'\t' read -r entry_boot unit since; do
+    [[ -n "${unit:-}" ]] || continue
+    for new in "$@"; do
+      [[ "$new" != "$unit" ]] || continue 2
+    done
+    entries+=("$entry_boot"$'\t'"$unit"$'\t'"$since")
+  done <<<"$listing"
+  for unit in "$@"; do
+    since="$(sysup_unit_active_since "$unit")" || since=-
+    entries+=("$boot"$'\t'"$unit"$'\t'"$since")
+  done
+
+  if ! sysup_write_deferred_state "${entries[@]}"; then
+    printf 'warning: could not record deferred restarts in %s; later runs will not repeat this reminder\n' \
+      "$SYSUP_STATE_DIR" >&2
+    return 1
+  fi
+}
+
+# Remind on every run while deferred units still run pre-upgrade code. The
+# single "reboot recommended:" line on stderr is a stable marker automation can
+# match. Like debup's reboot-required report it is advisory and never changes
+# the exit status. With $1 = 1 the run also prunes spent entries; --check-only
+# passes 0 and leaves the host untouched.
+sysup_report_deferred_restarts() {
+  local may_prune="${1:-0}" state listing line entry_boot unit total=0
+  local -a pending=() units=()
+
+  command -v systemctl >/dev/null 2>&1 || return 0
+  state="$(sysup_deferred_state_file)"
+  [[ -e "$state" ]] || return 0
+  listing="$(sysup_pending_deferred_restarts)" || return 0
+  if [[ -n "$listing" ]]; then
+    mapfile -t pending <<<"$listing"
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    total=$((total + 1))
+  done <"$state"
+  if ((may_prune && ${#pending[@]} != total)); then
+    sysup_write_deferred_state "${pending[@]+"${pending[@]}"}" ||
+      printf 'warning: could not prune spent entries from %s\n' "$state" >&2
+  fi
+
+  ((${#pending[@]})) || return 0
+  for line in "${pending[@]}"; do
+    IFS=$'\t' read -r entry_boot unit _ <<<"$line"
+    units+=("$unit")
+  done
+  printf 'reboot recommended: session-critical units still run pre-upgrade code: %s; restart them manually or reboot\n' \
+    "${units[*]}" >&2
+}
+
 sysup_restart_upgraded_services() {
   local -a units=()
   local -a active_units=()
@@ -324,6 +492,9 @@ sysup_restart_upgraded_services() {
     # managers themselves, and a manual restart from outside the affected
     # sessions is enough for the rest.
     printf 'hint: restart them manually from outside the affected sessions, or reboot, to load the upgraded code\n' >&2
+    # Advisory: this run already reported the deferral, so a failed record
+    # only costs the reminder on later runs.
+    sysup_record_deferred_restarts "${session_units[@]}" || true
   fi
   if ((${#units[@]} == 0)); then
     if ((discovery_status != 0)); then

@@ -112,7 +112,12 @@ shared fallback never restarts units whose restart would end a login or
 graphical session (`user@`, `user-runtime-dir@`, gettys, display managers,
 `systemd-logind`, D-Bus, rescue shells), starting from `needrestart`'s
 session-related defaults; it
-reports them as deferred until a reboot or manual restart instead. Missing
+reports them as deferred until a reboot or manual restart instead. Deferrals
+are recorded in `/var/lib/sysup/deferred-restarts`, and every later run,
+including `--check-only`, repeats one stable stderr line,
+`reboot recommended: session-critical units still run pre-upgrade code: ...`,
+until the host reboots or each unit is restarted or stopped. The reminder is
+advisory and never changes the exit status. Missing
 systemd is a supported no-op; an unreachable or failed systemd query is an
 error rather than being mistaken for a healthy empty result.
 
@@ -126,7 +131,8 @@ transitions, and the host's normal package tools. The Arch path additionally use
 `file`, `id`, `ldd`, and `sort`; `yay` and `pacdiff` from `pacman-contrib` are
 optional. The Debian path uses `apt-get`,
 `apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
-optional. systemd integration is used when `systemctl` is available.
+optional. systemd integration is used when `systemctl` is available; recording
+deferred restarts also uses `install` and `mktemp`.
 
 The dispatcher and OS detection remain compatible with Bash 3.2 so an
 unsupported macOS host can still run `sysup --help` and receive a clear

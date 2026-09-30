@@ -289,6 +289,10 @@ sysup_main() {
     sysup_restart_failed_units || status=1
   fi
 
+  # Every run repeats pending deferred-restart reminders, including
+  # --check-only, which must not prune the record.
+  sysup_report_deferred_restarts "$((check_only == 0))"
+
   sysup_report_failed_units || status=1
   ((upgrade_status == 0)) || return "$upgrade_status"
   return "$status"

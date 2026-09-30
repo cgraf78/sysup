@@ -96,9 +96,10 @@ require extending the parser contract.
    open-ended prefixes anchored to exact unit names. Deferred units are listed
    with a hint to restart them manually or reboot, and do not fail the run.
 6. With `--restart-failed`, restart failed enabled units.
-7. Report failed systemd units.
+7. Repeat the deferred-restart reminder (below).
+8. Report failed systemd units.
 
-Steps 4 through 7 each contribute to the exit status rather than short-circuiting,
+Steps 4 through 8 each contribute to the exit status rather than short-circuiting,
 so one run surfaces every problem.
 
 Once the package-manager command starts, those follow-up steps also run after a
@@ -106,6 +107,27 @@ failure: an upgrade can install some packages before returning nonzero. The
 driver re-snapshots best-effort, restarts services for anything it can prove
 changed, reports unverified discovery explicitly, and preserves the original
 package-manager status.
+
+### Deferred restarts
+
+A deferral is reported once by the run that upgraded the package, which is
+easy to miss on an unattended host, so the shared path also records it in
+`/var/lib/sysup/deferred-restarts` (`SYSUP_STATE_DIR`). The record is
+host-wide and root-owned (directory `0755`, file `0644`, written through
+`sudo` like the restarts themselves and replaced by an atomic rename), because
+sysup runs both as the operator and as root and each run must see the same
+record. Each line holds the kernel `boot_id`, the unit, and the unit's
+`ActiveEnterTimestampMonotonic` at deferral time.
+
+Every run reads the record, including `--check-only`, and prints one
+`reboot recommended: ...` line on stderr while any entry still applies. An
+entry is spent once `boot_id` changes, the unit is no longer active (stopped
+or removed), or its activation timestamp changes (restarted manually). When
+the boot or the unit cannot be checked the entry is kept, trading a redundant
+reminder for never dropping one silently. Only mutating runs prune spent
+entries or remove the file; `--check-only` never writes. The reminder is
+advisory, matching debup's reboot-required report, and a failure to record it
+is a warning rather than a failed run.
 
 ## Detection
 
