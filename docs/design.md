@@ -92,8 +92,9 @@ require extending the parser contract.
    rescue shells) before consulting systemd or the backend, because template
    expansion would otherwise restart the running `user@UID` or `getty@tty`
    instances and end the operator's session. The list starts from the
-   session-related entries in `needrestart`'s default `override_rc`. Deferred
-   units are listed with a reboot hint and do not fail the run.
+   session-related entries in `needrestart`'s default `override_rc`, with its
+   open-ended prefixes anchored to exact unit names. Deferred units are listed
+   with a hint to restart them manually or reboot, and do not fail the run.
 6. With `--restart-failed`, restart failed enabled units.
 7. Report failed systemd units.
 

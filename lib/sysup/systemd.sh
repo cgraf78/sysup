@@ -198,7 +198,9 @@ sysup_upgraded_active_service_units() {
 # expansion maps a shipped user@.service or getty@.service to every running
 # instance. It adds units needrestart never has to consider: oneshots with no
 # process to inspect (user-runtime-dir@) and gettys and display managers
-# missing from its list. Patterns match whole unit names, any unit type.
+# missing from its list. Patterns match whole unit names. needrestart matches
+# open-ended prefixes (^gdm, ^dbus); these are anchored to the real unit names
+# so an unrelated unit sharing a prefix (sanlock's wdmd, say) still restarts.
 #
 # Deliberately not listed: systemd-journald (it keeps client streams in its
 # fd store across restarts), sshd (live connections are separate processes),
@@ -213,16 +215,18 @@ sysup_session_critical_unit() {
     # Restarting a getty kills the login shell on that terminal.
     getty@* | autovt@* | serial-getty@* | container-getty@* | console-getty.service) return 0 ;;
     # Display managers are the parent of every graphical session they host.
-    # Prefixes follow needrestart, except wdm, which would also match
-    # sanlock's wdmd. greetd and ly are Arch display managers; any other one
-    # is caught through the display-manager.service alias by the caller.
-    gdm* | kdm* | lightdm* | lxdm* | nodm* | sddm* | slim* | wdm.service | \
-      xdm* | greetd* | ly.service | ly@*) return 0 ;;
+    # needrestart's list plus gdm3 (Debian's historical name) and the Arch
+    # display managers greetd and ly; any other one is caught through the
+    # display-manager.service alias by the caller.
+    gdm.service | gdm3.service | kdm.service | lightdm.service | lxdm.service | \
+      nodm.service | sddm.service | slim.service | wdm.service | xdm.service | \
+      greetd.service | ly.service | ly@*.service) return 0 ;;
     # logind tracks sessions, seats, and device ACLs (Debian #798097);
     # seatd fills that role for seatd-based compositors.
-    systemd-logind* | elogind* | seatd.service) return 0 ;;
-    # The system bus; logind, polkit, and desktop sessions depend on it.
-    dbus*) return 0 ;;
+    systemd-logind.service | elogind.service | seatd.service) return 0 ;;
+    # The system bus, in both implementations plus its activation socket;
+    # logind, polkit, and desktop sessions depend on it.
+    dbus.service | dbus.socket | dbus-broker.service) return 0 ;;
     # These are the operator's shell when active.
     emergency.service | rescue.service) return 0 ;;
   esac
@@ -316,7 +320,10 @@ sysup_restart_upgraded_services() {
     ((deferred_count += ${#session_units[@]}))
     printf 'deferred: session-critical units not restarted: %s\n' \
       "${session_units[*]}" >&2
-    printf 'hint: reboot, or restart them manually from outside the affected sessions, to load the upgraded code\n' >&2
+    # Not reboot-only: some distributions' package scripts re-exec user
+    # managers themselves, and a manual restart from outside the affected
+    # sessions is enough for the rest.
+    printf 'hint: restart them manually from outside the affected sessions, or reboot, to load the upgraded code\n' >&2
   fi
   if ((${#units[@]} == 0)); then
     if ((discovery_status != 0)); then

@@ -38,6 +38,7 @@ _archup_mock_reset() {
   ARCHUP_SYSTEMCTL_SHOW_STATUS=0
   ARCHUP_SYSTEMCTL_SHOW_MALFORMED=0
   ARCHUP_DISPLAY_MANAGER_ID="display-manager.service"
+  ARCHUP_DISPLAY_MANAGER_ID_STATUS=0
   ARCHUP_FAILED_UNITS=""
   ARCHUP_DISABLED_UNITS=""
   ARCHUP_SYSTEMCTL_QUERY_STATUS=0
@@ -287,6 +288,10 @@ systemctl() {
       local unit="${!#}"
       # An unset display-manager.service alias reports its own name.
       if [[ "$2" == --property=Id && "$unit" == display-manager.service ]]; then
+        if ((ARCHUP_DISPLAY_MANAGER_ID_STATUS != 0)); then
+          printf 'Failed to get properties: Access denied\n' >&2
+          return "$ARCHUP_DISPLAY_MANAGER_ID_STATUS"
+        fi
         printf '%s\n' "$ARCHUP_DISPLAY_MANAGER_ID"
         return 0
       fi
@@ -890,6 +895,92 @@ _assert_contains "archup restart: unverified run still reports the deferral" \
   "units not restarted: user@1000.service" "$result"
 _assert_not_contains "archup restart: unverified run restarts nothing" \
   "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+
+# Every session-critical name the policy knows, checked directly so each one
+# is pinned by a test, plus near misses that share a prefix.
+for unit in user@0.service user-runtime-dir@1000.service getty@tty3.service \
+  autovt@tty2.service serial-getty@ttyS0.service container-getty@1.service \
+  console-getty.service gdm.service gdm3.service kdm.service lightdm.service \
+  lxdm.service nodm.service sddm.service slim.service wdm.service xdm.service \
+  greetd.service ly.service ly@tty2.service systemd-logind.service \
+  elogind.service seatd.service dbus.service dbus.socket dbus-broker.service \
+  emergency.service rescue.service; do
+  if sysup_session_critical_unit "$unit"; then
+    _pass "archup session policy: defers $unit"
+  else
+    _fail "archup session policy: defers $unit"
+  fi
+done
+for unit in wdmd.service gdm-helper.service slimbook.service xdmcp.service \
+  kdm-sync.service dbus-monitor.service systemd-logind-helper.service \
+  superuser@1000.service getty.target; do
+  if sysup_session_critical_unit "$unit"; then
+    _fail "archup session policy: restarts near miss $unit"
+  else
+    _pass "archup session policy: restarts near miss $unit"
+  fi
+done
+
+# A failed alias lookup is best effort: the static list still applies and
+# ordinary units still restart.
+_archup_mock_reset
+_archup_mock_add_package dm-lookup 1 ok
+_archup_mock_add_service dm-lookup gdm.service
+_archup_mock_add_service dm-lookup ordinary.service
+ARCHUP_ACTIVE_UNITS=(gdm.service ordinary.service)
+ARCHUP_DISPLAY_MANAGER_ID_STATUS=1
+set +e
+result=$(sysup_restart_upgraded_services dm-lookup 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: failed display-manager lookup is not a failure" "0" "$status"
+_assert_eq "archup restart: failed display-manager lookup keeps the static list" \
+  $'daemon-reload\ntry-restart ordinary.service' "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: failed lookup still reports the static deferral" \
+  "units not restarted: gdm.service" "$result"
+
+# Deferral alongside ordinary restarts is still a successful run.
+_archup_mock_reset
+_archup_mock_add_package defer-and-restart 1 ok
+_archup_mock_add_service defer-and-restart dbus.service
+_archup_mock_add_service defer-and-restart ordinary.service
+ARCHUP_ACTIVE_UNITS=(dbus.service ordinary.service)
+set +e
+result=$(sysup_restart_upgraded_services defer-and-restart 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: deferral with other restarts returns success" "0" "$status"
+_assert_contains "archup restart: deferral with other restarts still restarts the rest" \
+  "try-restart ordinary.service" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: deferral with other restarts reports the deferral" \
+  "units not restarted: dbus.service" "$result"
+_assert_contains "archup restart: hint offers a manual restart before a reboot" \
+  "restart them manually from outside the affected sessions, or reboot" "$result"
+
+# The backend's NVIDIA deferral and the session deferral combine: both are
+# reported, neither restarts, and the run succeeds.
+_archup_mock_reset
+_archup_mock_add_package nvidia-and-session 0 ok
+_archup_mock_add_service nvidia-and-session nvidia-persistenced.service
+_archup_mock_add_service nvidia-and-session user@.service
+ARCHUP_ACTIVE_UNITS=(nvidia-persistenced.service user@1000.service)
+printf '%s\n' \
+  'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.57.04  Release Build' \
+  >"$ARCHUP_NVIDIA_VERSION_FILE"
+ARCHUP_NVIDIA_INSTALLED_VERSION=615.71.09
+set +e
+result=$(sysup_backend_restart_services nvidia-and-session 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: NVIDIA and session deferrals together succeed" "0" "$status"
+_assert_not_contains "archup restart: NVIDIA and session deferrals restart nothing" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: NVIDIA deferral is reported with the session one" \
+  "loaded NVIDIA driver 610.57.04 differs from installed 615.71.09" "$result"
+_assert_contains "archup restart: session deferral is reported with the NVIDIA one" \
+  "units not restarted: user@1000.service" "$result"
+_assert_contains "archup restart: combined deferral is reported distinctly" \
+  "no active services eligible for immediate restart" "$result"
 
 # Near misses must keep restarting: the policy matches whole unit names.
 _archup_mock_reset
