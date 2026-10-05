@@ -361,37 +361,40 @@ _assert_contains "debup upgrade: package-cache cleanup failure is visible" \
   "package cache was not reclaimed" "$result"
 
 echo ""
-echo "=== debup: autoremove is opt-in ==="
-
-_debup_reset
-DEBUP_MOCK_AUTOREMOVE=$'stale-lib\nold-kernel'
-result=$(sysup_backend_upgrade 2>&1)
-apt_log=$(cat "$DEBUP_APT_LOG")
-_assert_contains "debup autoremove: reports removable packages by default" \
-  "stale-lib" "$result"
-_assert_contains "debup autoremove: points at the opt-in flag" \
-  "sysup --autoremove" "$result"
-_assert_not_contains "debup autoremove: does not purge without the flag" \
-  "--purge autoremove" "$apt_log"
+echo "=== debup: autoremove ==="
 
 _debup_reset
 DEBUP_MOCK_AUTOREMOVE="stale-lib"
-sysup_backend_parse_arg --autoremove
 sysup_backend_upgrade >/dev/null 2>&1
+_assert_not_contains "debup autoremove: the upgrade hook itself never removes packages" \
+  "autoremove" "$(cat "$DEBUP_APT_LOG")"
+
+_debup_reset
+DEBUP_MOCK_AUTOREMOVE=$'stale-lib\nold-kernel'
+result=$(sysup_backend_autoremove report 2>&1)
 apt_log=$(cat "$DEBUP_APT_LOG")
-_assert_contains "debup autoremove: --autoremove purges removable packages" \
+_assert_contains "debup autoremove: report mode lists removable packages" \
+  "old-kernel" "$result"
+_assert_contains "debup autoremove: report mode points at the opt-out flag" \
+  "without --no-autoremove" "$result"
+_assert_not_contains "debup autoremove: report mode does not purge" \
+  "--purge autoremove" "$apt_log"
+
+_debup_reset
+sysup_backend_autoremove apply >/dev/null 2>&1
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_contains "debup autoremove: apply mode purges removable packages" \
   "--purge autoremove -y" "$apt_log"
-_assert_not_contains "debup autoremove: --autoremove skips the simulated report" \
+_assert_not_contains "debup autoremove: apply mode skips the simulated report" \
   "--simulate" "$apt_log"
 
 _debup_reset
 DEBUP_MOCK_AUTOREMOVE_STATUS=6
-sysup_backend_parse_arg --autoremove
 set +e
-sysup_backend_upgrade >/dev/null 2>&1
+sysup_backend_autoremove apply >/dev/null 2>&1
 status=$?
 set -e
-_assert_eq "debup autoremove: an opted-in purge failure remains fatal" "6" "$status"
+_assert_eq "debup autoremove: a purge failure is returned" "6" "$status"
 
 echo ""
 echo "=== debup: post-upgrade checks ==="
@@ -747,11 +750,67 @@ _assert_not_contains "debup main: held-package query failure never reports none 
 # hook is called directly.
 _debup_reset
 DEBUP_MOCK_INSTALLED="ii base 1.0"
-DEBUP_MOCK_AUTOREMOVE="stale-lib"
-_debup_main --autoremove
+_debup_main
 apt_log=$(cat "$DEBUP_APT_LOG")
-_assert_contains "debup main: --autoremove reaches the backend through the driver" \
+_assert_contains "debup main: purges unused packages by default" \
   "--purge autoremove -y" "$apt_log"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_AUTOREMOVE="stale-lib"
+_debup_main --no-autoremove
+apt_log=$(cat "$DEBUP_APT_LOG")
+_assert_not_contains "debup main: --no-autoremove does not purge" \
+  "--purge autoremove" "$apt_log"
+_assert_contains "debup main: --no-autoremove still reports removable packages" \
+  "stale-lib" "$DEBUP_RESULT"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_main --autoremove
+_assert_eq "debup main: the legacy --autoremove flag is still accepted" \
+  "0" "$DEBUP_STATUS"
+_assert_not_contains "debup main: --autoremove never reaches apt-get upgrade" \
+  "upgrade -y --autoremove" "$(cat "$DEBUP_APT_LOG")"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+_debup_main --check-only
+_assert_not_contains "debup main: --check-only never purges" \
+  "autoremove" "$(cat "$DEBUP_APT_LOG")"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_AUTOREMOVE_STATUS=6
+_debup_main
+_assert_eq "debup main: a purge failure fails the run" "1" "$DEBUP_STATUS"
+_assert_contains "debup main: a purge failure still runs the integrity checks" \
+  "checking dpkg and apt integrity" "$DEBUP_RESULT"
+
+_debup_reset
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_UPGRADE_STATUS=100
+_debup_main
+_assert_eq "debup main: a failed upgrade keeps its own status" "100" "$DEBUP_STATUS"
+_assert_not_contains "debup main: never purges after a failed upgrade" \
+  "autoremove" "$(cat "$DEBUP_APT_LOG")"
+
+# Both direct modes and apt configuration overrides affect only the upgrade
+# argv, so default-host cleanup must not run with custom package-manager args.
+for custom_arg in --simulate --download-only --assume-no; do
+  _debup_reset
+  DEBUP_MOCK_INSTALLED="ii base 1.0"
+  _debup_main -- "$custom_arg"
+  _assert_not_contains "debup autoremove: skips removal for $custom_arg" \
+    "--purge autoremove" "$(cat "$DEBUP_APT_LOG")"
+done
+for custom_option in APT::Get::Simulate=true Dir=/synthetic-root; do
+  _debup_reset
+  DEBUP_MOCK_INSTALLED="ii base 1.0"
+  _debup_main -- -o "$custom_option"
+  _assert_not_contains "debup autoremove: skips removal for $custom_option" \
+    "--purge autoremove" "$(cat "$DEBUP_APT_LOG")"
+done
 
 _debup_reset
 DEBUP_MOCK_INSTALLED="ii base 1.0"

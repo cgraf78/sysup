@@ -24,7 +24,6 @@ _debup_lib_dir() {
 # renamed packages land, but never removes an installed package. `--full-upgrade`
 # opts into removals when a dependency change requires them.
 DEBUP_UPGRADE_VERB=upgrade
-DEBUP_AUTOREMOVE=0
 
 # Seconds apt waits for the dpkg lock. These hosts run unattended-upgrades, so a
 # collision is expected rather than exceptional and should be waited out.
@@ -54,7 +53,7 @@ DEBUP_CONFFILE_ROOT="${DEBUP_CONFFILE_ROOT:-/etc}"
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: sysup [--full-upgrade] [--autoremove] [--check-only]
+Usage: sysup [--full-upgrade] [--no-autoremove] [--check-only]
              [--no-restart-upgraded-services] [--restart-failed] [--]
              [extra apt-get args...]
 
@@ -65,7 +64,7 @@ Default flow:
   1. report held packages
   2. warm sudo credentials
   3. update package lists and upgrade packages noninteractively
-  4. optionally autoremove unused packages, then autoclean the package cache
+  4. autoclean the package cache, then purge packages no longer required
   5. run dpkg/apt, pending-config, and reboot-required checks
   6. restart services affected by upgraded packages, preferring needrestart
   7. optionally restart failed enabled units with --restart-failed
@@ -75,8 +74,6 @@ Options:
   --full-upgrade                  use apt-get full-upgrade, allowing packages to
                                   be removed to resolve dependencies. Stays
                                   within the installed release.
-  --autoremove                    purge packages no longer required, instead of
-                                  only reporting them
 EOF
   sysup_usage_common_options
   cat <<'EOF'
@@ -317,7 +314,7 @@ report_autoremovable() {
 
   sysup_log "packages no longer required"
   printf '%s\n' "$output"
-  printf '\nhint: run: sysup --autoremove\n'
+  printf '\nhint: run sysup without --no-autoremove to purge them\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -376,9 +373,6 @@ sysup_backend_parse_arg() {
     --full-upgrade)
       DEBUP_UPGRADE_VERB=full-upgrade
       ;;
-    --autoremove)
-      DEBUP_AUTOREMOVE=1
-      ;;
     *)
       return 1
       ;;
@@ -393,6 +387,19 @@ sysup_backend_checks() {
   # successful upgrade, not a failure, so it never changes the exit status.
   report_pending_state
   return "$status"
+}
+
+# Purge rather than remove: these are dependencies nothing asked for directly,
+# so their leftover config has no owner. APT's own kernel protection
+# (APT::NeverAutoRemove) keeps the running and newest kernels.
+sysup_backend_autoremove() {
+  if [[ "$1" == report ]]; then
+    report_autoremovable
+    return
+  fi
+
+  sysup_log "purging packages no longer required"
+  debup_apt_get --purge autoremove -y
 }
 
 # needrestart is the canonical Debian answer here: it inspects running processes
@@ -419,13 +426,6 @@ sysup_backend_upgrade() {
     debup_apt_get --with-new-pkgs upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
   else
     debup_apt_get full-upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
-  fi
-
-  if ((DEBUP_AUTOREMOVE)); then
-    sysup_log "purging packages no longer required"
-    debup_apt_get --purge autoremove -y || return
-  else
-    report_autoremovable
   fi
 
   # Reclaiming the package cache is cosmetic. Its status must not become this

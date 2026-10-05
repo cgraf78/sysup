@@ -79,6 +79,26 @@ sysup_changed_packages() {
   done <"$after"
 }
 
+# Print the packages among "$2..." that the snapshot file "$1" still lists.
+#
+# Backend-reported extras (archup's same-version AUR rebuilds) bypass the
+# version diff, so a rebuilt package that autoremove then removed would
+# otherwise reach the restart step, which can no longer list its files.
+sysup_snapshot_members() {
+  local snapshot="$1" pkg
+  shift
+  declare -A present=()
+
+  while read -r pkg _; do
+    [[ -n "${pkg:-}" ]] && present["$pkg"]=1
+  done <"$snapshot"
+
+  for pkg in "$@"; do
+    [[ -n "${present[$pkg]+set}" ]] && printf '%s\n' "$pkg"
+  done
+  return 0
+}
+
 # Print the unique, non-empty package names among the arguments.
 #
 # An empty result is a success, not a failure: "nothing was upgraded" is the
@@ -130,6 +150,20 @@ sysup_backend_check_service_restart() {
   return 0
 }
 
+# Extra package-manager arguments can select a simulation or another package
+# database. Cleanup does not inherit them, so only default-context upgrades
+# permit automatic removal. Backends may allow arguments they know are safe.
+sysup_backend_autoremove_safe() {
+  (($# == 0))
+}
+
+# Remove packages that nothing installed still requires. "$1" is `apply` to
+# remove them or `report` to only list them (--no-autoremove). Non-zero fails
+# the run but never skips the checks that follow.
+sysup_backend_autoremove() {
+  return 0
+}
+
 # Restart services shipped by the packages named in "$@".
 sysup_backend_restart_services() {
   sysup_restart_upgraded_services "$@"
@@ -138,6 +172,8 @@ sysup_backend_restart_services() {
 sysup_usage_common_options() {
   cat <<'EOF'
   --check-only                    skip the upgrade; only run post-upgrade checks
+  --no-autoremove                 only report packages no longer required,
+                                  instead of removing them after the upgrade
   --no-restart-upgraded-services  skip automatic restart of active services
                                   shipped by upgraded packages
   --restart-failed                restart currently failed enabled systemd units
@@ -151,11 +187,12 @@ EOF
 # ---------------------------------------------------------------------------
 
 sysup_main() {
-  local check_only=0 restart_failed=0 restart_upgraded=1
+  local check_only=0 restart_failed=0 restart_upgraded=1 autoremove=1
   local -a upgrade_args=()
   local -a upgraded_packages=()
   local before_packages="" after_packages="" stage=""
-  local changed_listing="" unique_listing=""
+  local changed_listing="" unique_listing="" extra_listing=""
+  local -a extra_packages=()
   local upgrade_status=0 status=0
   local followup_status=0 upgrade_attempted=0 package_diff_known=0
 
@@ -163,6 +200,14 @@ sysup_main() {
     case "$1" in
       --check-only)
         check_only=1
+        ;;
+      # --autoremove predates removal becoming the default; it stays accepted
+      # so existing invocations keep working, and the last flag wins.
+      --autoremove)
+        autoremove=1
+        ;;
+      --no-autoremove)
+        autoremove=0
         ;;
       --no-restart-upgraded-services)
         restart_upgraded=0
@@ -217,6 +262,29 @@ sysup_main() {
       sysup_backend_upgrade "${upgrade_args[@]+"${upgrade_args[@]}"}" || upgrade_status=$?
     fi
 
+    # Remove unused packages only after a clean upgrade. After a partial
+    # failure the dependency graph may be mid-transition, and removing what
+    # merely looks orphaned could take out a package a retried upgrade still
+    # needs. It precedes the second snapshot so a package upgraded and then
+    # removed drops out of the diff instead of reaching the restart step,
+    # which could no longer list its files. Its failure is not an upgrade
+    # failure: it fails the run without skipping any later step.
+    if ((upgrade_attempted)); then
+      if ((upgrade_status != 0)); then
+        ((autoremove == 0)) ||
+          printf 'note: skipped removing packages no longer required because the upgrade failed\n' >&2
+      elif ! sysup_backend_autoremove_safe "${upgrade_args[@]+"${upgrade_args[@]}"}"; then
+        printf 'note: skipped automatic cleanup because custom package-manager arguments were supplied\n' >&2
+      elif ((autoremove)); then
+        sysup_backend_autoremove apply || {
+          printf '\nerror: removing packages no longer required failed\n' >&2
+          status=1
+        }
+      else
+        sysup_backend_autoremove report || status=1
+      fi
+    fi
+
     # Package managers can install some packages and still return non-zero.
     # Once the upgrade command has started, always take the second snapshot so
     # checks and service restarts can cover whatever actually changed.
@@ -228,13 +296,22 @@ sysup_main() {
           followup_status=$?
       fi
       if ((followup_status == 0)); then
+        extra_listing="$(sysup_snapshot_members "$after_packages" \
+          "${SYSUP_EXTRA_UPGRADED_PACKAGES[@]+"${SYSUP_EXTRA_UPGRADED_PACKAGES[@]}"}")" ||
+          followup_status=$?
+      fi
+      if ((followup_status == 0)); then
         upgraded_packages=()
         if [[ -n "$changed_listing" ]]; then
           mapfile -t upgraded_packages <<<"$changed_listing"
         fi
+        extra_packages=()
+        if [[ -n "$extra_listing" ]]; then
+          mapfile -t extra_packages <<<"$extra_listing"
+        fi
         unique_listing="$(sysup_unique_packages \
           "${upgraded_packages[@]+"${upgraded_packages[@]}"}" \
-          "${SYSUP_EXTRA_UPGRADED_PACKAGES[@]+"${SYSUP_EXTRA_UPGRADED_PACKAGES[@]}"}")" ||
+          "${extra_packages[@]+"${extra_packages[@]}"}")" ||
           followup_status=$?
       fi
       if ((followup_status == 0)); then

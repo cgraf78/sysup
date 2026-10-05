@@ -9,9 +9,9 @@ functions and shell state from reaching another.
   error behavior, Bash 3.2 constraints, shdeps-style relative and absolute
   symlinks, and the manual installation layout.
 - `archup-test` covers package-manager argument policy, AUR membership and
-  rebuild decisions, missing-library failures, package snapshots, service
-  restarts, persistent deferred-restart reminders, partial failures, caller
-  trap preservation, and failed units.
+  rebuild decisions, orphan removal, missing-library failures, package
+  snapshots, service restarts, persistent deferred-restart reminders, partial
+  failures, caller trap preservation, and failed units.
 - `debup-test` covers apt/dpkg policy, retries, autoremove, integrity and
   advisory checks, multiarch snapshots, needrestart, check-only behavior,
   partial upgrades, family refusal, service restarts, and failed units.

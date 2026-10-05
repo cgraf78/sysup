@@ -62,6 +62,13 @@ _archup_mock_reset() {
   SUDO_USER=""
   ARCHUP_PACMAN_FOREIGN_STATUS=0
   ARCHUP_PACMAN_FILES_STATUS=0
+  ARCHUP_ORPHANS=()
+  ARCHUP_ORPHANS_NEXT=()
+  ARCHUP_ORPHAN_QUERY_WARNING=""
+  ARCHUP_ORPHAN_QUERY_STATUS=0
+  ARCHUP_REMOVE_STATUS=0
+  # shellcheck disable=SC2034 # Read by the sourced backend removal hook.
+  ARCHUP_CONFIRMATION_ARG=--noconfirm
   ARCHUP_FILE_STATUS=0
   ARCHUP_LDD_STATUS=0
   ARCHUP_SYSTEMCTL_LOG="$ARCHUP_MOCK_ROOT/systemctl-commands.log"
@@ -139,10 +146,41 @@ pacman() {
         printf 'mock pacman file listing failed for %s\n' "$2" >&2
         return "$ARCHUP_PACMAN_FILES_STATUS"
       fi
+      if [[ " ${ARCHUP_PACKAGES[*]} " != *" $2 "* ]]; then
+        printf "error: package '%s' was not found\n" "$2" >&2
+        return 1
+      fi
       printf '%s\n' "${ARCHUP_PACKAGE_FILES[$2]:-}"
       ;;
     -Syu)
       printf '%s\n' "$*" >>"$ARCHUP_PACMAN_COMMAND_LOG"
+      ;;
+    -Qdtq)
+      # Real pacman exits 1 with no output when there are no orphans, and
+      # also exits 1 on errors, but with a diagnostic. Warnings can appear on
+      # either path.
+      [[ -z "$ARCHUP_ORPHAN_QUERY_WARNING" ]] ||
+        printf '%s\n' "$ARCHUP_ORPHAN_QUERY_WARNING" >&2
+      if ((ARCHUP_ORPHAN_QUERY_STATUS != 0)); then
+        printf 'error: mock orphan query failed\n' >&2
+        return "$ARCHUP_ORPHAN_QUERY_STATUS"
+      fi
+      ((${#ARCHUP_ORPHANS[@]})) || return 1
+      printf '%s\n' "${ARCHUP_ORPHANS[@]}"
+      ;;
+    -Rn)
+      printf '%s\n' "$*" >>"$ARCHUP_PACMAN_COMMAND_LOG"
+      ((ARCHUP_REMOVE_STATUS == 0)) || return "$ARCHUP_REMOVE_STATUS"
+      # Removing a layer of orphans can expose the dependencies only they
+      # required, which become the next layer.
+      local removed kept=() pkg
+      removed=" ${*:4} "
+      for pkg in "${ARCHUP_PACKAGES[@]}"; do
+        [[ "$removed" == *" $pkg "* ]] || kept+=("$pkg")
+      done
+      ARCHUP_PACKAGES=("${kept[@]}")
+      ARCHUP_ORPHANS=("${ARCHUP_ORPHANS_NEXT[@]+"${ARCHUP_ORPHANS_NEXT[@]}"}")
+      ARCHUP_ORPHANS_NEXT=()
       ;;
     *)
       echo "unexpected pacman args: $*" >&2
@@ -1490,6 +1528,237 @@ _assert_contains "archup debug info: a real ldd failure is reported as unverifie
   "unverified" "$result"
 
 echo ""
+echo "=== archup: orphan removal ==="
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep stale-makedep)
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: removing orphans succeeds" "0" "$status"
+_assert_contains "archup autoremove: removes orphans by default" \
+  "-Rn --noconfirm -- old-dep stale-makedep" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+# Container CI runs as root; local non-root runs elevate through sudo.
+if ((EUID == 0)); then
+  _assert_not_contains "archup autoremove: root removal needs no sudo" \
+    "pacman -Rn " "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+else
+  _assert_contains "archup autoremove: non-root removal uses sudo" \
+    "pacman -Rn " "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+fi
+_assert_contains "archup autoremove: names the removed packages" \
+  "old-dep" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: no orphans is a success" "0" "$status"
+_assert_contains "archup autoremove: no orphans is reported" \
+  "no orphaned packages to remove" "$result"
+_assert_not_contains "archup autoremove: no orphans removes nothing" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+set +e
+result=$(sysup_main --no-autoremove 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: --no-autoremove succeeds" "0" "$status"
+_assert_not_contains "archup autoremove: --no-autoremove removes nothing" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+_assert_contains "archup autoremove: --no-autoremove still lists orphans" \
+  "  old-dep" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+sysup_main --no-autoremove --autoremove >/dev/null 2>&1
+_assert_contains "archup autoremove: the last autoremove flag wins" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+sysup_main -- --confirm >/dev/null 2>&1
+_assert_contains "archup autoremove: honors --confirm like the upgrade" \
+  "-Rn --confirm -- old-dep" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+ARCHUP_ORPHAN_QUERY_STATUS=1
+set +e
+result=$(sysup_main --no-autoremove 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: a failed orphan listing is advisory under --no-autoremove" \
+  "0" "$status"
+_assert_contains "archup autoremove: a failed orphan listing is still visible" \
+  "warning: could not list orphaned packages" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+sysup_main --check-only >/dev/null 2>&1
+_assert_not_contains "archup autoremove: --check-only removes nothing" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+ARCHUP_ORPHAN_QUERY_STATUS=1
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: a failed orphan query fails the run" "1" "$status"
+_assert_contains "archup autoremove: a failed orphan query is not mistaken for none" \
+  "could not list orphaned packages" "$result"
+_assert_not_contains "archup autoremove: a failed orphan query removes nothing" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+_assert_contains "archup autoremove: a failed orphan query still runs checks" \
+  "checking foreign packages for missing shared libraries" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+ARCHUP_REMOVE_STATUS=1
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: a failed removal fails the run" "1" "$status"
+_assert_contains "archup autoremove: a failed removal is reported" \
+  "removing packages no longer required failed" "$result"
+_assert_contains "archup autoremove: a failed removal still runs checks" \
+  "checking foreign packages for missing shared libraries" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+ARCHUP_YAY_FAIL_UPGRADE=3
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: a failed upgrade keeps its own status" "3" "$status"
+_assert_not_contains "archup autoremove: never removes orphans after a failed upgrade" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+_assert_contains "archup autoremove: says why removal was skipped" \
+  "skipped removing packages no longer required" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-app)
+ARCHUP_ORPHANS_NEXT=(old-lib)
+sysup_main >/dev/null 2>&1
+pacman_log=$(cat "$ARCHUP_PACMAN_COMMAND_LOG")
+_assert_contains "archup autoremove: removes the first orphan layer" \
+  "-Rn --noconfirm -- old-app" "$pacman_log"
+_assert_contains "archup autoremove: re-queries and removes newly exposed orphans" \
+  "-Rn --noconfirm -- old-lib" "$pacman_log"
+_assert_not_contains "archup autoremove: never removes recursively past -Qdt" \
+  "-Rns" "$pacman_log"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(stuck-dep)
+ARCHUP_ORPHANS_NEXT=(stuck-dep)
+ARCHUP_ORPHAN_PASSES=1
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+# shellcheck disable=SC2034 # Restore the sourced backend's removal bound.
+ARCHUP_ORPHAN_PASSES=10
+_assert_eq "archup autoremove: orphans that never clear fail the run" "1" "$status"
+_assert_contains "archup autoremove: names the pass limit" \
+  "remain after 1 removal passes" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHAN_QUERY_WARNING="warning: config file /etc/pacman.conf, line 9: directive 'Foo' in section 'options' not recognized."
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: a pacman warning with no orphans is a success" "0" "$status"
+_assert_contains "archup autoremove: a pacman warning is still shown" \
+  "directive 'Foo'" "$result"
+_assert_contains "archup autoremove: a pacman warning is not mistaken for an error" \
+  "no orphaned packages to remove" "$result"
+
+# An orphan still gets upgraded by -Syu. Once removed, its files can no longer
+# be listed, so it must not reach the restart step as an upgraded package.
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+_archup_mock_add_package old-dep 1 ok 1.0
+_archup_mock_add_service old-dep old-dep.service
+ARCHUP_PACKAGE_UPGRADE_VERSIONS[old-dep]=2.0
+ARCHUP_ACTIVE_UNITS=(old-dep.service)
+ARCHUP_ORPHANS=(old-dep)
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup autoremove: an upgraded-then-removed orphan does not fail the run" \
+  "0" "$status"
+_assert_not_contains "archup autoremove: never lists files of a removed package" \
+  "could not list files owned by old-dep" "$result"
+
+# A same-version AUR rebuild reaches the restart set through the backend's
+# extras rather than the version diff, so it needs the same protection when
+# the rebuilt package was an orphan and has since been removed.
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+_archup_mock_add_package orphan-aur 1 broken 1.0
+_archup_mock_add_service orphan-aur orphan-aur.service
+ARCHUP_ACTIVE_UNITS=(orphan-aur.service)
+ARCHUP_ORPHANS=(orphan-aur)
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_contains "archup autoremove: the broken orphan was rebuilt first" \
+  "--rebuild" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+_assert_not_contains "archup autoremove: never lists files of a rebuilt-then-removed package" \
+  "could not list files owned by orphan-aur" "$result"
+_assert_not_contains "archup autoremove: never restarts a rebuilt-then-removed package's unit" \
+  "restart orphan-aur.service" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+
+echo ""
+# Custom arguments can change execution mode or package database. Removal
+# must not target the default host when only the upgrade sees those arguments.
+for custom_arg in --downloadonly -Sw --print --root --config; do
+  _archup_mock_reset
+  _archup_mock_add_package steady-pkg 1 ok 1.0
+  ARCHUP_ORPHANS=(old-dep)
+  sysup_main -- "$custom_arg" >/dev/null 2>&1
+  _assert_not_contains "archup autoremove: skips removal for $custom_arg" \
+    "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+done
+
+# A crashed query can produce neither package names nor an error diagnostic.
+_archup_mock_reset
+set +e
+result=$(
+  # shellcheck disable=SC2329 # Called indirectly by the removal hook.
+  pacman() { return 139; }
+  sysup_backend_autoremove apply
+)
+status=$?
+set -e
+_assert_eq "archup autoremove: a silent query crash fails" "1" "$status"
+_assert_not_contains "archup autoremove: a silent query crash never reports no orphans" \
+  "no orphaned packages" "$result"
+
 echo "=== archup: empty upgrade set ==="
 
 # Regression: with nothing to upgrade both package sets are empty, and
