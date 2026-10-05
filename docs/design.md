@@ -55,8 +55,10 @@ Optional hooks, with defaults in `common.sh`:
 
 | Hook | Default | Override |
 | --- | --- | --- |
-| `sysup_backend_parse_arg <arg>` | unhandled (arg falls through to the package manager) | `debup` adds `--autoremove`, `--full-upgrade` |
+| `sysup_backend_parse_arg <arg>` | unhandled (arg falls through to the package manager) | `debup` adds `--full-upgrade` |
 | `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages |
+| `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
+| `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove` |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
 | `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one, and reports it unverified when either version cannot be read |
 | `sysup_backend_restart_services <pkg...>` | shared systemd restart | `debup` prefers `needrestart` |
@@ -80,8 +82,17 @@ require extending the parser contract.
 1. Parse shared flags; unrecognized arguments pass through to the package
    manager.
 2. `sysup_backend_require`, then `sysup_backend_preamble`.
-3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, snapshot
-   again, and diff to get the upgraded set.
+3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, remove
+   unused packages, snapshot again, and diff to get the upgraded set.
+   `sysup_backend_autoremove apply` runs only after a clean upgrade: after a
+   partial failure the dependency graph may be mid-transition, so removal is
+   skipped with a note. `--no-autoremove` calls it with `report` instead. It
+   precedes the second snapshot so a package upgraded and then removed drops
+   out of the diff rather than reaching the restart step, which could no
+   longer list its files. Its failure fails the run without skipping later
+   steps. Custom package-manager arguments skip cleanup because they can
+   select non-install modes or another package database; only Arch confirmation
+   flags are safe to share with removal.
 4. `sysup_backend_checks`.
 5. Restart affected services unless `--no-restart-upgraded-services`. The
    shared fallback maps upgraded package files to active units; Debian instead
@@ -158,7 +169,8 @@ Upgrade, as root, with `DEBIAN_FRONTEND=noninteractive`:
   an OS release.
 - `apt-get autoclean -y`, advisory — a failure to reclaim the cache must not
   cancel the checks and restarts that make the upgrade safe.
-- `autoremove` reports candidates only; `--autoremove` performs it with `--purge`.
+- `apt-get --purge autoremove -y`, through the shared autoremove step above;
+  `--no-autoremove` reports the `--simulate` candidates instead.
 
 Conffiles use `--force-confdef --force-confold`, so a package never silently
 replaces a locally modified config file. `NEEDRESTART_MODE=l` keeps
@@ -188,10 +200,12 @@ Checks:
 
 ## Testing
 
-- `archup-test` covers the extracted shared hooks, AUR decisions, library
-  scanning, package diffs, service restarts, and partial failures.
+- `archup-test` covers the extracted shared hooks, AUR decisions, orphan
+  removal, library scanning, package diffs, service restarts, and partial
+  failures.
 - `debup-test` mocks `apt-get`, `dpkg`, `dpkg-query`, and `systemctl` to cover
-  the upgrade verb, autoremove opt-in, each check, and `needrestart` preference.
+  the upgrade verb, default autoremove and its opt-out, each check, and
+  `needrestart` preference.
 - `sysup-test` covers family detection from fixture `os-release` files,
   symlink-aware dispatch to the private backend, exact argument forwarding,
   portability constraints, and the installation layout.

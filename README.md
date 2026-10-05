@@ -60,6 +60,7 @@ Common options:
 
 - `--check-only` skips package changes and service restarts while running the
   verification checks;
+- `--no-autoremove` lists packages no longer required instead of removing them;
 - `--no-restart-upgraded-services` leaves affected active services running;
 - `--restart-failed` restarts failed enabled systemd units after checks;
 - `-h` or `--help` prints the options for the detected host; and
@@ -69,13 +70,18 @@ Common options:
 
 The Arch backend reports foreign packages, upgrades with `yay -Syu --devel`
 when available or `pacman -Syu` otherwise, and scans foreign-package ELF files
-for missing shared libraries. It also reports `.pacnew` and `.pacsave` files
-that await manual review when `pacdiff` is available. Broken AUR packages are
-rebuilt and their active services are restarted even when the rebuilt package
-version is unchanged.
+for missing shared libraries. After a successful upgrade it removes orphaned
+dependencies (`pacman -Qdtq`) with `pacman -Rn`, one layer at a time, so
+optional dependencies still count as required. It also reports `.pacnew` and
+`.pacsave` files that await manual review when `pacdiff` is available. Broken
+AUR packages are rebuilt and their active services are restarted even when the
+rebuilt package version is unchanged.
 
 Package operations are noninteractive by default. Pass `--confirm` after `--`
-to restore package-manager prompts.
+to restore package-manager prompts. Other custom package-manager arguments
+skip automatic cleanup: they can select a simulation or another package
+database, while cleanup operates on the default host database. Run plain
+`sysup` to upgrade and clean up the default host.
 
 When `sysup` is started from an interactive root shell, it never runs `yay` as
 root. It uses the non-root account in `SYSUP_ARCH_USER`, falling back to
@@ -89,8 +95,9 @@ closed unless the account already has noninteractive sudo authorization;
 The Debian backend runs `apt-get update`, then
 `apt-get --with-new-pkgs upgrade -y`. This permits new dependencies without
 removing installed packages. `--full-upgrade` permits dependency-driven
-removals, while `--autoremove` opts into purging packages no longer required.
-Neither option performs a release upgrade or edits APT sources.
+removals. After a successful upgrade, `apt-get --purge autoremove` removes
+packages no longer required. Neither step performs a release upgrade or edits
+APT sources.
 
 It keeps locally modified conffiles, retries transient package-index failures,
 checks dpkg and apt integrity, reports pending conffile merges and reboot state,
@@ -98,7 +105,9 @@ and prefers `needrestart` when it is installed.
 
 ## Failure and restart policy
 
-`sysup` snapshots package versions before and after mutation. Once a package
+`sysup` snapshots package versions before and after mutation. Unused packages
+are removed only after a clean upgrade, never after a failed or partial one,
+because the dependency graph may still be mid-transition. Once a package
 manager starts, later checks still run after a failure because a partially
 applied upgrade may already require service restarts. The original package
 manager status retains precedence, while independent check and restart

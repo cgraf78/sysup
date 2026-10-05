@@ -17,6 +17,13 @@ _archup_lib_dir() {
 # shellcheck source=common.sh
 . "$(_archup_lib_dir)/common.sh"
 
+# The confirmation flag the operator chose for this run. The upgrade hook
+# records it so orphan removal prompts exactly when the upgrade did.
+ARCHUP_CONFIRMATION_ARG=--noconfirm
+
+# Upper bound on orphan-removal passes; real dependency chains are shallow.
+ARCHUP_ORPHAN_PASSES="${ARCHUP_ORPHAN_PASSES:-10}"
+
 archup_is_root() {
   ((EUID == 0))
 }
@@ -112,8 +119,9 @@ sysup_backend_check_service_restart() {
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: sysup [--check-only] [--no-restart-upgraded-services]
-             [--restart-failed] [--] [extra yay/pacman args...]
+Usage: sysup [--no-autoremove] [--check-only]
+             [--no-restart-upgraded-services] [--restart-failed] [--]
+             [extra yay/pacman args...]
 
 Upgrade an Arch host, rebuilding broken AUR packages when yay is available,
 then verify the failure modes most likely to leave services broken after the
@@ -124,10 +132,12 @@ Default flow:
   2. warm sudo credentials
   3. upgrade packages noninteractively with yay, or pacman when yay is absent
   4. rebuild installed AUR packages whose ELF files have missing libraries
-  5. report pending .pacnew/.pacsave merges and check shared libraries
-  6. restart active services shipped by packages upgraded or rebuilt in this run
-  7. optionally restart failed enabled units with --restart-failed
-  8. report failed systemd units when systemd is available
+  5. remove orphaned dependencies no installed package still requires,
+     counting optional dependencies as required
+  6. report pending .pacnew/.pacsave merges and check shared libraries
+  7. restart active services shipped by packages upgraded or rebuilt in this run
+  8. optionally restart failed enabled units with --restart-failed
+  9. report failed systemd units when systemd is available
 
 Options:
 EOF
@@ -356,6 +366,28 @@ scan_missing_libs() {
   esac
 }
 
+# Print orphans: packages installed as dependencies that nothing requires.
+#
+# A single -t still counts optional dependencies as required, so an optdepend
+# the operator relies on is never treated as unused. pacman exits 1 both when
+# there are no orphans and on a real error, and prints harmless warnings (an
+# unrecognized pacman.conf directive, say) on any run, so only an `error:`
+# line under the C locale marks the query as failed.
+orphan_packages() {
+  local errors error_text output status=0
+
+  errors=$(mktemp) || return 2
+  output=$(LC_ALL=C pacman -Qdtq 2>"$errors") || status=$?
+  error_text=$(<"$errors")
+  rm -f "$errors"
+  [[ -z "$error_text" ]] || printf '%s\n' "$error_text" >&2
+  if ((status > 1)) || { ((status == 1)) &&
+    { [[ -n "$output" ]] || [[ $'\n'"$error_text" == *$'\n'error:* ]]; }; }; then
+    return 2
+  fi
+  [[ -z "$output" ]] || printf '%s\n' "$output"
+}
+
 report_pending_pacman_configs() {
   local listing
   local -a configs=()
@@ -422,6 +454,72 @@ sysup_backend_checks() {
   return "$status"
 }
 
+sysup_backend_autoremove_safe() {
+  local arg
+  for arg in "$@"; do
+    # These affect prompting only, and removal inherits the normalized choice.
+    case "$arg" in
+      --confirm | --noconfirm) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+sysup_backend_autoremove() {
+  local mode="$1" listing
+  local -a orphans=()
+
+  if ! listing=$(orphan_packages); then
+    # Only a removal that cannot run fails the run; a listing is advisory,
+    # matching debup's report.
+    if [[ "$mode" == report ]]; then
+      printf 'warning: could not list orphaned packages\n' >&2
+      return 0
+    fi
+    printf 'error: could not list orphaned packages\n' >&2
+    return 1
+  fi
+  if [[ -z "$listing" ]]; then
+    printf 'ok: no orphaned packages to remove\n'
+    return 0
+  fi
+  mapfile -t orphans <<<"$listing"
+
+  if [[ "$mode" == report ]]; then
+    sysup_log "orphaned packages (${#orphans[@]})"
+    printf '  %s\n' "${orphans[@]}"
+    printf '\nhint: run sysup without --no-autoremove to remove them\n'
+    return 0
+  fi
+
+  # Removal runs through pacman as root even when yay is installed: orphans
+  # need no build step, so there is no reason to involve the AUR user. -n drops
+  # config backups, matching debup's purge.
+  #
+  # Not -s: its recursive removal follows hard dependencies only, so it would
+  # take a dependency that another package still lists as optional. Removing
+  # one layer and re-querying keeps -Qdt's optional-dependency protection. Each
+  # pass removes at least one package, so the bound only guards a pacman that
+  # keeps reporting orphans it does not remove.
+  local pass
+  for ((pass = 1; pass <= ARCHUP_ORPHAN_PASSES; pass++)); do
+    sysup_log "removing orphaned packages (${#orphans[@]})"
+    printf '  %s\n' "${orphans[@]}"
+    sysup_run_as_root pacman -Rn "$ARCHUP_CONFIRMATION_ARG" -- "${orphans[@]}" || return
+
+    if ! listing=$(orphan_packages); then
+      printf 'error: could not list orphaned packages after removal\n' >&2
+      return 1
+    fi
+    [[ -n "$listing" ]] || return 0
+    mapfile -t orphans <<<"$listing"
+  done
+
+  printf 'error: orphaned packages remain after %s removal passes\n' "$ARCHUP_ORPHAN_PASSES" >&2
+  return 1
+}
+
 sysup_backend_upgrade() {
   local confirmation_arg=--noconfirm arg
   local -a upgrade_args=()
@@ -440,6 +538,7 @@ sysup_backend_upgrade() {
     esac
   done
   upgrade_args=("$confirmation_arg" "${upgrade_args[@]}")
+  ARCHUP_CONFIRMATION_ARG="$confirmation_arg"
 
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
 
