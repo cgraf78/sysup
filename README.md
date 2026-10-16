@@ -3,12 +3,19 @@
 ![Tests](https://github.com/cgraf78/sysup/actions/workflows/test.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
 
 `sysup` is one command for upgrading Arch, Debian, and Ubuntu systems. It
 detects the host family, applies conservative package-manager policy, restarts
 services affected by the upgrade, and reports broken package or systemd state
 before returning.
+
+Tools like topgrade update everything on a machine (Homebrew, cargo, editor
+plugins). `sysup` does one thing, the OS package manager, plus the
+post-upgrade work that is easy to forget: it restarts services still running
+old code, refuses to autoremove after a failed or partial upgrade, rebuilds
+AUR packages left with missing libraries, and still checks dpkg, apt, and
+systemd state when the upgrade itself fails.
 
 ```console
 $ sysup --check-only
@@ -40,7 +47,8 @@ cd sysup
 `PREFIX` defaults to `$HOME/.local`; `BIN_DIR` can override its `bin` child.
 Dependency managers can instead expose `bin/sysup` from the checkout directly.
 In either case, the launcher follows its own symlink back to the matching
-provider-private `lib/sysup` tree. For example, a shdeps entry is:
+provider-private `lib/sysup` tree. For example, a
+[shdeps](https://github.com/cgraf78/shdeps) manifest entry is:
 
 ```text
 cgraf78/sysup  github
