@@ -35,7 +35,8 @@ real package managers as root, so tests must never reach one.
 - CI: `SYSUP_SKIP_SHELLCHECK=1 test/run` on the shared shell matrix (profile
   `base`), a separate ShellCheck job, and a `Stock macOS Bash 3.2` job that
   runs `PREFIX=$tmp /bin/bash install.sh` and then
-  `/bin/bash $tmp/bin/sysup --help`. A `Required` job gates both.
+  `/bin/bash $tmp/bin/sysup --help`. A `Required` job gates the shell
+  matrix (including ShellCheck) and the Bash 3.2 job.
 - The Bash 3.2 job covers only install and `--help`; it does not prove other
   dispatcher paths.
 
