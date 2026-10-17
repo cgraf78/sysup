@@ -1,9 +1,9 @@
 # sysup
 
-![Tests](https://github.com/cgraf78/sysup/actions/workflows/test.yml/badge.svg?branch=main)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
+[![Tests](https://github.com/cgraf78/sysup/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/sysup/actions/workflows/test.yml?query=branch%3Amain)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Bash](https://img.shields.io/badge/bash-%3E%3D4.0-blue)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Arch%20%7C%20Debian%20%7C%20Ubuntu-lightgrey)](#requirements)
 
 `sysup` is one command for upgrading Arch, Debian, and Ubuntu systems. It
 detects the host family, applies conservative package-manager policy, restarts
