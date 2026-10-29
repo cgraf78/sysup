@@ -30,8 +30,8 @@ DNFUP_OSTREE_BOOTED_FILE="${DNFUP_OSTREE_BOOTED_FILE:-/run/ostree-booted}"
 sysup_backend_usage() {
   cat <<'EOF'
 Usage: sysup [--no-autoremove] [--check-only]
-             [--no-restart-upgraded-services] [--restart-failed] [--]
-             [extra dnf args...]
+             [--no-restart-upgraded-services] [--restart-failed]
+             [-- dnf args...]
 
 Upgrade a Fedora or RHEL-family host within its installed release, then verify
 the failure modes most likely to leave services broken after the upgrade.
@@ -50,7 +50,7 @@ EOF
   sysup_usage_common_options
   cat <<'EOF'
 
-Extra arguments are passed through to the dnf upgrade invocation. Package
+Arguments after -- are passed through to the dnf upgrade invocation. Package
 installation is noninteractive by default.
 
 dnfup never performs a release upgrade; use `dnf system-upgrade` or the

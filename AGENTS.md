@@ -15,8 +15,8 @@ It runs real package managers as root, so tests must never reach one.
   upgrade, check, and restart ordering; `detect.sh` the family vocabulary;
   `systemd.sh` affected units, failed units, and deferred restarts.
 - `docs/design.md`: the backend hook contract and run ordering.
-- `test/run` runs `sysup-test`, `archup-test`, `debup-test`, and
-  `dnfup-test`, each in its own Bash process; `test/lib/test.sh` holds the
+- `test/run` runs `sysup-test`, `common-test`, `archup-test`, `debup-test`,
+  and `dnfup-test`, each in its own Bash process; `test/lib/test.sh` holds the
   assertions.
 - `support/install-checkout.sh`: the repo-owned install delegate.
 

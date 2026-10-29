@@ -1,0 +1,380 @@
+#!/usr/bin/env bash
+# common-test - unit tests for the shared sysup driver in lib/sysup/common.sh:
+# argument parsing, the sudo credential keeper, and package-manager lock waits.
+#
+# A minimal fake backend supplies the hooks, so these cases exercise the
+# driver itself rather than any package manager.
+
+set -euo pipefail
+export NO_COLOR=1
+
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
+# shellcheck source=lib/test.sh
+. "$TEST_DIR/lib/test.sh"
+
+COMMON_MOCK_BIN=$(_mock_bin)
+export PATH="$COMMON_MOCK_BIN:$PATH"
+
+COMMON_SUDO_LOG="$(_tmpdir)/sudo.log"
+COMMON_UPGRADE_LOG="$(_tmpdir)/upgrade.log"
+export COMMON_SUDO_LOG COMMON_UPGRADE_LOG
+export COMMON_SUDO_REFRESH_STATUS=0
+
+# sudo is a real executable so the keeper's background subshell, which has no
+# access to later function redefinitions, still reaches the mock.
+cat >"$COMMON_MOCK_BIN/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$COMMON_SUDO_LOG"
+case "$*" in
+  -v) exit 0 ;;
+  "-n -v") exit "$COMMON_SUDO_REFRESH_STATUS" ;;
+esac
+[[ "$1" != -n ]] || shift
+exec "$@"
+EOF
+chmod +x "$COMMON_MOCK_BIN/sudo"
+
+# Never read or write the host's deferred-restart state or boot identity.
+SYSUP_STATE_DIR="$(_tmpdir)/state"
+SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
+printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
+export SYSUP_STATE_DIR SYSUP_BOOT_ID_FILE
+
+# shellcheck source=../lib/sysup/common.sh
+. "$REPO_ROOT/lib/sysup/common.sh"
+
+# The fake backend. Its upgrade can be slowed so the keeper has time to run.
+COMMON_UPGRADE_SECONDS=0
+COMMON_UPGRADE_STATUS=0
+# shellcheck disable=SC2329 # hooks are invoked indirectly by sysup_main.
+sysup_backend_require() { return 0; }
+# shellcheck disable=SC2329
+sysup_backend_usage() { printf 'Usage: sysup [-- fake args...]\n'; }
+# shellcheck disable=SC2329
+sysup_backend_snapshot() { printf 'base 1.0\n'; }
+# shellcheck disable=SC2329
+sysup_backend_package_files() { return 0; }
+# shellcheck disable=SC2329
+sysup_backend_upgrade() {
+  printf '%s\n' "$*" >>"$COMMON_UPGRADE_LOG"
+  sleep "$COMMON_UPGRADE_SECONDS"
+  return "$COMMON_UPGRADE_STATUS"
+}
+# shellcheck disable=SC2329
+sysup_backend_parse_arg() {
+  [[ "$1" == --fake-flag ]]
+}
+# No systemd is involved in these cases.
+# shellcheck disable=SC2329
+sysup_report_failed_units() { return 0; }
+
+_common_reset() {
+  : >"$COMMON_SUDO_LOG"
+  : >"$COMMON_UPGRADE_LOG"
+  COMMON_UPGRADE_SECONDS=0
+  COMMON_UPGRADE_STATUS=0
+  COMMON_SUDO_REFRESH_STATUS=0
+  SYSUP_SUDO_REFRESH=60
+}
+
+_common_main() {
+  set +e
+  COMMON_RESULT=$(sysup_main "$@" 2>&1)
+  COMMON_STATUS=$?
+  set -e
+}
+
+# Poll `condition` (a command string) until it succeeds or `seconds` pass.
+_common_poll() {
+  local condition="$1" seconds="$2" i
+
+  for ((i = 0; i < seconds * 10; i++)); do
+    eval "$condition" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+_common_refresh_count() {
+  grep -cx -- '-n -v' "$COMMON_SUDO_LOG" || true
+}
+
+_common_alive() {
+  kill -0 "$1" 2>/dev/null
+}
+
+echo "=== common: argument parsing ==="
+
+_common_reset
+_common_main --frobnicate
+_assert_eq "common args: an unknown option is a usage error" "2" "$COMMON_STATUS"
+_assert_contains "common args: names the unknown option" \
+  "unknown argument: --frobnicate" "$COMMON_RESULT"
+_assert_contains "common args: says how to pass package-manager arguments" \
+  "sysup -- --frobnicate" "$COMMON_RESULT"
+_assert_eq "common args: an unknown option runs nothing" \
+  "" "$(cat "$COMMON_UPGRADE_LOG")$(cat "$COMMON_SUDO_LOG")"
+
+_common_reset
+_common_main some-package
+_assert_eq "common args: a bare word before -- is rejected" "2" "$COMMON_STATUS"
+
+_common_reset
+_common_main --fake-flag -- --pm-flag 'two words'
+_assert_eq "common args: backend flags and -- arguments are accepted (output: $COMMON_RESULT)" \
+  "0" "$COMMON_STATUS"
+_assert_eq "common args: arguments after -- reach the upgrade unchanged" \
+  "--pm-flag two words" "$(cat "$COMMON_UPGRADE_LOG")"
+
+_common_reset
+_common_main -- --frobnicate
+_assert_eq "common args: anything after -- is passed through, even option-like words" \
+  "--frobnicate" "$(cat "$COMMON_UPGRADE_LOG")"
+
+_common_reset
+_common_main --help --frobnicate
+_assert_eq "common args: --help before an unknown option still prints help" \
+  "0" "$COMMON_STATUS"
+
+echo ""
+echo "=== common: sudo keeper ==="
+
+if ((EUID == 0)); then
+  # The keeper deliberately never starts as root, so these cases do not apply.
+  _pass "common keeper: skipped when the suite runs as root"
+else
+  # Refreshes while a long upgrade runs, then stops when the run returns.
+  _common_reset
+  SYSUP_SUDO_REFRESH=0.2
+  COMMON_UPGRADE_SECONDS=1
+  _common_main
+  _assert_eq "common keeper: the run succeeds (output: $COMMON_RESULT)" "0" "$COMMON_STATUS"
+  refreshes=$(_common_refresh_count)
+  if ((refreshes >= 2)); then
+    _pass "common keeper: refreshes sudo during a long upgrade ($refreshes refreshes)"
+  else
+    _fail "common keeper: refreshes sudo during a long upgrade ($refreshes refreshes)"
+  fi
+  sleep 0.6
+  _assert_eq "common keeper: no refresh after the run returns" \
+    "$refreshes" "$(_common_refresh_count)"
+
+  # Run the driver in this shell, not a command substitution: a subshell's
+  # exit would end the keeper by itself and hide a missing stop.
+  _common_reset
+  SYSUP_SUDO_REFRESH=0.2
+  COMMON_UPGRADE_SECONDS=0.5
+  set +e
+  sysup_main >/dev/null 2>&1
+  status=$?
+  set -e
+  _assert_eq "common keeper: an in-shell run succeeds" "0" "$status"
+  _assert_eq "common keeper: the run clears the keeper pid" "" "$_SYSUP_SUDO_KEEPER_PID"
+  refreshes=$(_common_refresh_count)
+  sleep 0.6
+  _assert_eq "common keeper: an in-shell run leaves no keeper refreshing" \
+    "$refreshes" "$(_common_refresh_count)"
+
+  # The keeper must be gone on a failing upgrade's return path too.
+  _common_reset
+  SYSUP_SUDO_REFRESH=0.2
+  COMMON_UPGRADE_SECONDS=0.5
+  COMMON_UPGRADE_STATUS=7
+  _common_main
+  _assert_eq "common keeper: the upgrade status is kept" "7" "$COMMON_STATUS"
+  refreshes=$(_common_refresh_count)
+  sleep 0.6
+  _assert_eq "common keeper: no refresh after a failed run returns" \
+    "$refreshes" "$(_common_refresh_count)"
+
+  # Stop terminates the keeper and its sleep child, and is idempotent.
+  _common_reset
+  SYSUP_SUDO_REFRESH=30
+  sysup_start_sudo_keeper
+  keeper="$_SYSUP_SUDO_KEEPER_PID"
+  _common_poll "pgrep -P $keeper >/dev/null" 5 || true
+  sleeper=$(pgrep -P "$keeper" || true)
+  if [[ -n "$sleeper" ]]; then
+    _pass "common keeper: sleeps in an owned child"
+  else
+    _fail "common keeper: sleeps in an owned child"
+  fi
+  sysup_stop_sudo_keeper
+  if ! _common_alive "$keeper"; then
+    _pass "common keeper: stop terminates the keeper"
+  else
+    _fail "common keeper: stop terminates the keeper"
+  fi
+  if [[ -n "$sleeper" ]] && _common_poll "! kill -0 $sleeper 2>/dev/null" 5; then
+    _pass "common keeper: stop leaves no sleep process behind"
+  else
+    _fail "common keeper: stop leaves no sleep process behind"
+  fi
+  _assert_eq "common keeper: stop clears the recorded pid" "" "$_SYSUP_SUDO_KEEPER_PID"
+  set +e
+  sysup_stop_sudo_keeper
+  status=$?
+  set -e
+  _assert_eq "common keeper: a second stop is a no-op" "0" "$status"
+
+  # Only one keeper per run.
+  _common_reset
+  SYSUP_SUDO_REFRESH=30
+  sysup_start_sudo_keeper
+  first="$_SYSUP_SUDO_KEEPER_PID"
+  sysup_start_sudo_keeper
+  _assert_eq "common keeper: starting twice keeps one keeper" \
+    "$first" "$_SYSUP_SUDO_KEEPER_PID"
+  sysup_stop_sudo_keeper
+
+  # A refused noninteractive refresh (credentials revoked) ends the keeper.
+  _common_reset
+  # shellcheck disable=SC2034 # read by the sourced common.sh under test.
+  SYSUP_SUDO_REFRESH=0.1
+  COMMON_SUDO_REFRESH_STATUS=1
+  export COMMON_SUDO_REFRESH_STATUS
+  sysup_start_sudo_keeper
+  keeper="$_SYSUP_SUDO_KEEPER_PID"
+  if _common_poll "! kill -0 $keeper 2>/dev/null" 5; then
+    _pass "common keeper: exits when sudo refuses a refresh"
+  else
+    _fail "common keeper: exits when sudo refuses a refresh"
+  fi
+  sysup_stop_sudo_keeper
+  COMMON_SUDO_REFRESH_STATUS=0
+
+  # A parent that dies without cleanup must not leave the keeper looping.
+  orphan_pid_file="$(_tmpdir)/keeper.pid"
+  SYSUP_SUDO_REFRESH=0.1 bash -c '
+    . "$1/lib/sysup/common.sh"
+    sysup_start_sudo_keeper
+    printf "%s\n" "$_SYSUP_SUDO_KEEPER_PID" >"$2"
+  ' _ "$REPO_ROOT" "$orphan_pid_file"
+  orphan=$(cat "$orphan_pid_file")
+  if [[ -n "$orphan" ]] && _common_poll "! kill -0 $orphan 2>/dev/null" 5; then
+    _pass "common keeper: exits on its own when the run dies without cleanup"
+  else
+    _fail "common keeper: exits on its own when the run dies without cleanup"
+    kill "$orphan" 2>/dev/null || true
+  fi
+
+  _common_reset
+  SYSUP_SUDO_REFRESH=0
+  sysup_start_sudo_keeper
+  _assert_eq "common keeper: an interval of 0 disables it" "" "$_SYSUP_SUDO_KEEPER_PID"
+  SYSUP_SUDO_REFRESH=soon
+  sysup_start_sudo_keeper
+  _assert_eq "common keeper: an invalid interval disables it" "" "$_SYSUP_SUDO_KEEPER_PID"
+
+  _common_reset
+  # shellcheck disable=SC2034 # read by the sourced common.sh under test.
+  SYSUP_SUDO_REFRESH=0.1
+  _common_main --check-only
+  sleep 0.3
+  _assert_eq "common keeper: --check-only never starts it" \
+    "0" "$(_common_refresh_count)"
+fi
+
+echo ""
+echo "=== common: lock waits ==="
+
+# A fixture process table: pid 101 holds the lock file open, pid 202 does not.
+SYSUP_PROC_ROOT=$(_tmpdir)
+lock_file="$(_tmpdir)/lists.lock"
+: >"$lock_file"
+mkdir -p "$SYSUP_PROC_ROOT/101/fd" "$SYSUP_PROC_ROOT/202/fd" "$SYSUP_PROC_ROOT/self"
+ln -s /dev/null "$SYSUP_PROC_ROOT/101/fd/0"
+ln -s "$lock_file" "$SYSUP_PROC_ROOT/101/fd/7"
+ln -s /dev/null "$SYSUP_PROC_ROOT/202/fd/0"
+
+# Holder detection needs a find with -lname. Every supported family ships GNU
+# findutils, but the shared CI matrix also runs BusyBox (Alpine), whose find
+# lacks it; there the documented fallback, reporting the file free, is what
+# must hold instead.
+COMMON_FIND_LNAME=0
+if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
+  COMMON_FIND_LNAME=1
+fi
+
+if ((COMMON_FIND_LNAME)); then
+  if sysup_path_in_use "$lock_file"; then
+    _pass "common lock: a process with the file open holds it"
+  else
+    _fail "common lock: a process with the file open holds it"
+  fi
+elif ! sysup_path_in_use "$lock_file"; then
+  _pass "common lock: without find -lname the scan reports free"
+else
+  _fail "common lock: without find -lname the scan reports free"
+fi
+if ! sysup_path_in_use "$(_tmpdir)/other.lock"; then
+  _pass "common lock: a file no process has open is free"
+else
+  _fail "common lock: a file no process has open is free"
+fi
+
+# Only <pid>/fd counts: a link under a non-numeric entry or deeper in a pid's
+# tree (thread directories, say) is not a holder the scan should report.
+stray_proc=$(_tmpdir)
+mkdir -p "$stray_proc/self/fd" "$stray_proc/303/task/303/fd"
+ln -s "$lock_file" "$stray_proc/self/fd/7"
+ln -s "$lock_file" "$stray_proc/303/task/303/fd/7"
+if ! SYSUP_PROC_ROOT="$stray_proc" sysup_path_in_use "$lock_file"; then
+  _pass "common lock: links outside <pid>/fd are ignored"
+else
+  _fail "common lock: links outside <pid>/fd are ignored"
+fi
+
+if ((EUID != 0)); then
+  : >"$COMMON_SUDO_LOG"
+  sysup_path_in_use "$lock_file" || true
+  _assert_contains "common lock: the scan runs as root without prompting" \
+    "-n find $SYSUP_PROC_ROOT" "$(cat "$COMMON_SUDO_LOG")"
+fi
+
+empty_proc=$(_tmpdir)
+saved_proc="$SYSUP_PROC_ROOT"
+SYSUP_PROC_ROOT="$empty_proc"
+if ! sysup_path_in_use "$lock_file"; then
+  _pass "common lock: an empty process table means free"
+else
+  _fail "common lock: an empty process table means free"
+fi
+SYSUP_PROC_ROOT="$saved_proc"
+
+# shellcheck disable=SC2034 # read by the sourced common.sh under test.
+SYSUP_LOCK_POLL=0.1
+set +e
+result=$(sysup_wait_path_free "$(_tmpdir)/other.lock" 1 "the test lock" 2>&1)
+status=$?
+set -e
+_assert_eq "common lock: a free lock needs no wait" "0" "$status"
+_assert_eq "common lock: a free lock prints nothing" "" "$result"
+
+if ((COMMON_FIND_LNAME)); then
+  set +e
+  result=$(sysup_wait_path_free "$lock_file" 1 "the test lock" 2>&1)
+  status=$?
+  set -e
+  _assert_eq "common lock: a lock held past the deadline fails" "1" "$status"
+  _assert_contains "common lock: says what it waited for" \
+    "waiting up to 1s for the test lock" "$result"
+  _assert_contains "common lock: says the deadline passed" \
+    "the test lock is still held" "$result"
+fi
+
+# The holder lets go partway through the wait.
+(
+  sleep 0.3
+  rm -f "$SYSUP_PROC_ROOT/101/fd/7"
+) &
+releaser=$!
+set +e
+result=$(sysup_wait_path_free "$lock_file" 5 "the test lock" 2>&1)
+status=$?
+set -e
+wait "$releaser"
+_assert_eq "common lock: returns once the holder releases the lock" "0" "$status"
+
+_test_summary

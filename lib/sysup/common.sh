@@ -58,6 +58,115 @@ sysup_warm_sudo() {
   sudo -v
 }
 
+# Seconds between sudo credential refreshes while a run is in progress; 0
+# disables them. Warming sudo once is not enough: a long upgrade or AUR build
+# can outlast sudo's timestamp_timeout, and the cleanup and restart steps that
+# follow would then stop at a password prompt halfway through the run.
+SYSUP_SUDO_REFRESH="${SYSUP_SUDO_REFRESH:-60}"
+_SYSUP_SUDO_KEEPER_PID=""
+
+# Start a background loop that refreshes the cached sudo credential until
+# sysup_stop_sudo_keeper runs or this shell exits.
+#
+# The keeper owns exactly one child, its current sleep, and kills it when it
+# is told to stop, so stopping leaves no process behind. It also exits on its
+# own once the parent shell is gone (checked every interval) or sudo refuses a
+# noninteractive refresh, so a run killed without cleanup cannot leave it
+# looping. No trap is installed in the caller: backends are sourceable, and
+# clobbering a caller's trap is worse than that bounded lag.
+sysup_start_sudo_keeper() {
+  local parent="$BASHPID"
+
+  ((EUID != 0)) || return 0
+  [[ "$SYSUP_SUDO_REFRESH" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+  [[ ! "$SYSUP_SUDO_REFRESH" =~ ^0+([.]0+)?$ ]] || return 0
+  [[ -z "$_SYSUP_SUDO_KEEPER_PID" ]] || return 0
+
+  (
+    sleeper=""
+    trap 'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit 0' TERM
+    while :; do
+      sleep "$SYSUP_SUDO_REFRESH" &
+      sleeper=$!
+      wait "$sleeper" || true
+      kill -0 "$parent" 2>/dev/null || exit 0
+      sudo -n -v 2>/dev/null || exit 0
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  _SYSUP_SUDO_KEEPER_PID=$!
+}
+
+# Stop the keeper and reap it. Idempotent, and safe when none was started.
+sysup_stop_sudo_keeper() {
+  local pid="$_SYSUP_SUDO_KEEPER_PID" tries
+
+  [[ -n "$pid" ]] || return 0
+  _SYSUP_SUDO_KEEPER_PID=""
+  kill -TERM "$pid" 2>/dev/null || true
+  # The keeper runs its TERM trap only between commands, so a refresh stuck
+  # in sudo (a slow PAM or directory lookup) would hold it there. Give it
+  # about five seconds, then kill it, rather than hang the end of the run.
+  for ((tries = 0; tries < 50; tries++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# Root of the process table that lock detection reads. Overridable so tests can
+# use a fixture tree instead of the live system.
+SYSUP_PROC_ROOT="${SYSUP_PROC_ROOT:-/proc}"
+
+# Return 0 when some process has `path` open, 1 otherwise.
+#
+# Package-manager lock files are opened only to take the lock, so an open
+# descriptor is the holder. This reads /proc/<pid>/fd links rather than
+# /proc/locks because those compare paths: /proc/locks names files by
+# device and inode, and on btrfs (the Fedora and openSUSE default) stat()
+# reports a per-subvolume device that never matches it. Other processes'
+# descriptors need root to read, and so does listing them where /proc is
+# mounted hidepid, so root does the whole walk. When the scan cannot run, this
+# reports the file free, and the package manager's own lock error is what the
+# operator sees.
+sysup_path_in_use() {
+  local path="$1" root="$SYSUP_PROC_ROOT" match=""
+  local -a runner=()
+
+  # Never prompt: this polls, and a password prompt in the middle of a lock
+  # wait would stall it. Without cached credentials the scan simply fails.
+  ((EUID == 0)) || runner=(sudo -n)
+  # Descend only into <pid>/fd; prune every other second-level directory
+  # (task, net, ...) so the walk stays proportional to the process count.
+  match=$(${runner[@]+"${runner[@]}"} find "$root" -mindepth 1 -maxdepth 3 \
+    \( -path "$root/*/*" ! -path "$root/[0-9]*/fd" \
+    ! -path "$root/[0-9]*/fd/*" -prune \) \
+    -o -path "$root/[0-9]*/fd/*" -lname "$path" -print -quit \
+    2>/dev/null) || true
+  [[ -n "$match" ]]
+}
+
+# Seconds between checks while waiting for a lock. Overridable for tests.
+SYSUP_LOCK_POLL="${SYSUP_LOCK_POLL:-5}"
+
+# Wait up to `timeout` whole seconds for no process to hold `path`. `what`
+# names the lock in the one message printed when a wait begins. Returns 0 once
+# it is free and 1 if it is still held at the deadline. The deadline uses
+# bash's SECONDS clock so the poll interval may be fractional.
+sysup_wait_path_free() {
+  local path="$1" timeout="$2" what="$3" deadline
+
+  sysup_path_in_use "$path" || return 0
+  printf 'waiting up to %ss for %s, held by another process\n' "$timeout" "$what" >&2
+  deadline=$((SECONDS + timeout))
+  while ((SECONDS < deadline)); do
+    sleep "$SYSUP_LOCK_POLL"
+    sysup_path_in_use "$path" || return 0
+  done
+  printf 'error: %s is still held after %ss\n' "$what" "$timeout" >&2
+  return 1
+}
+
 # Print packages present in both snapshots whose version changed. Packages that
 # only appear in the newer snapshot are new installs, not upgrades, and have no
 # previously running service to restart.
@@ -126,8 +235,8 @@ sysup_unique_packages() {
 # calling sysup_main.
 # ---------------------------------------------------------------------------
 
-# Handle one backend-specific flag. Return 0 when consumed, 1 to let the
-# argument fall through to the package manager. Single-token flags only.
+# Handle one backend-specific flag. Return 0 when consumed, 1 to reject it
+# (sysup then exits 2). Single-token flags only.
 sysup_backend_parse_arg() {
   return 1
 }
@@ -186,7 +295,21 @@ EOF
 # Run driver
 # ---------------------------------------------------------------------------
 
+# Run one sysup invocation. The sudo keeper is stopped here, after the run,
+# so every return path of the run itself releases it.
+#
+# Calling _sysup_run on the left of || turns errexit off for everything it
+# runs, at any depth. Every step in it must therefore check its own status
+# rather than rely on set -e to stop the run.
 sysup_main() {
+  local status=0
+
+  _sysup_run "$@" || status=$?
+  sysup_stop_sudo_keeper
+  return "$status"
+}
+
+_sysup_run() {
   local check_only=0 restart_failed=0 restart_upgraded=1 autoremove=1
   local -a upgrade_args=()
   local -a upgraded_packages=()
@@ -225,7 +348,16 @@ sysup_main() {
         break
         ;;
       *)
-        sysup_backend_parse_arg "$1" || upgrade_args+=("$1")
+        # Package-manager arguments must follow `--`. Passing unknown words
+        # through silently turned a mistyped flag into an apt or yay
+        # argument that failed only after sudo and `apt-get update`
+        # had already run, or into a real upgrade.
+        if ! sysup_backend_parse_arg "$1"; then
+          printf 'error: unknown argument: %s\n' "$1" >&2
+          printf 'hint: pass package-manager arguments after --, as in: sysup -- %s\n' "$1" >&2
+          printf 'run sysup --help for the supported options\n' >&2
+          return 2
+        fi
         ;;
     esac
     shift
@@ -253,6 +385,7 @@ sysup_main() {
       sysup_log "warming sudo credentials"
       stage="acquiring sudo credentials"
       sysup_warm_sudo || upgrade_status=$?
+      ((upgrade_status != 0)) || sysup_start_sudo_keeper
     fi
 
     if ((upgrade_status == 0)); then
