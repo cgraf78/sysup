@@ -19,12 +19,12 @@ _dnfup_lib_dir() {
 
 # shellcheck source=common.sh
 . "$(_dnfup_lib_dir)/common.sh"
+# shellcheck source=rpm.sh
+. "$(_dnfup_lib_dir)/rpm.sh"
 
-# System paths dnfup reads. Overridable so tests can point them at a fixture
-# tree instead of the live system.
-DNFUP_CONFFILE_ROOT="${DNFUP_CONFFILE_ROOT:-/etc}"
 # Present on hosts booted from an rpm-ostree or bootc image (Fedora Atomic
-# desktops, CoreOS, image-mode RHEL).
+# desktops, CoreOS, image-mode RHEL). Overridable so tests can point it at a
+# fixture instead of the live system.
 DNFUP_OSTREE_BOOTED_FILE="${DNFUP_OSTREE_BOOTED_FILE:-/run/ostree-booted}"
 
 sysup_backend_usage() {
@@ -70,16 +70,6 @@ dnfup_dnf_local() {
   dnfup_dnf --disablerepo='*' "$@"
 }
 
-# Config files an upgrade wrote beside a locally modified copy (.rpmnew), or
-# saved when it replaced one (.rpmsave, .rpmorig). Either way the operator has
-# a merge to review. Runs unprivileged, so a root-only directory can make it incomplete;
-# the caller reports that rather than escalating to list filenames.
-dnfup_pending_conffiles() {
-  find "$DNFUP_CONFFILE_ROOT" \
-    \( -name '*.rpmnew' -o -name '*.rpmsave' -o -name '*.rpmorig' \) \
-    -type f -print 2>/dev/null | sort
-}
-
 # Return 0 when a reboot is required, 1 when not, 2 when it cannot be told.
 #
 # `needs-restarting` ships in dnf-plugins-core (dnf4) and dnf5-plugins. It
@@ -122,8 +112,7 @@ check_package_integrity() {
 
 # Advisory: the upgrade succeeded, but its result is not fully live yet.
 report_pending_state() {
-  local -a conffiles=()
-  local conffile_listing="" reboot_status=0 conffile_status=0
+  local reboot_status=0
 
   sysup_log "checking for pending post-upgrade work"
 
@@ -138,19 +127,7 @@ report_pending_state() {
     fi
   fi
 
-  conffile_listing="$(dnfup_pending_conffiles)" || conffile_status=$?
-  if [[ -n "$conffile_listing" ]]; then
-    mapfile -t conffiles <<<"$conffile_listing"
-  fi
-  if ((${#conffiles[@]})); then
-    printf '\nconfig files awaiting a manual merge:\n'
-    printf '  %s\n' "${conffiles[@]}"
-  fi
-  if ((conffile_status != 0)); then
-    printf 'warning: could not completely scan for config files awaiting a manual merge\n' >&2
-  elif ((${#conffiles[@]} == 0)); then
-    printf 'ok: no config files awaiting a manual merge\n'
-  fi
+  sysup_rpm_report_pending_conffiles
 }
 
 # ---------------------------------------------------------------------------
@@ -175,47 +152,14 @@ sysup_backend_require() {
   sysup_need_cmds dnf rpm find sort
 }
 
-# NAME.ARCH, not NAME: a multilib host installs both arches of a library, and a
-# bare name would collapse their two versions into one, hiding an upgrade.
-# rpm accepts the same NAME.ARCH form when listing files.
-#
-# Installonly packages (kernel, kernel-core, ...) keep several versions under
-# one NAME.ARCH. The driver's diff keys on the name, so each is written as one
-# line holding its comma-joined versions: an unchanged kernel set then compares
-# equal, and an added or removed kernel still shows as a change. The C locale
-# keeps a package's rows adjacent; other collations can ignore punctuation.
-#
-# gpg-pubkey entries are imported signing keys, not packages: they have no
-# architecture, several share one name, and `rpm -ql` cannot list them. A
-# newly imported key would otherwise look like an upgrade the restart step
-# cannot resolve.
+# The rpm database is shared with zypup, so rpm.sh owns the snapshot format
+# (NAME.ARCH keys, epochs, joined installonly versions, no signing keys).
 sysup_backend_snapshot() {
-  rpm -qa --qf '%{NAME}.%{ARCH} %{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' |
-    while read -r pkg version; do
-      [[ -n "${pkg:-}" ]] || continue
-      [[ "$pkg" != *.'(none)' ]] || continue
-      printf '%s %s\n' "$pkg" "$version"
-    done | LC_ALL=C sort | dnfup_join_versions
-}
-
-# Merge adjacent rows of one package into "<pkg> <v1>,<v2>,...".
-dnfup_join_versions() {
-  local pkg version current="" versions=""
-
-  while read -r pkg version; do
-    if [[ "$pkg" == "$current" ]]; then
-      versions+=",$version"
-      continue
-    fi
-    [[ -z "$current" ]] || printf '%s %s\n' "$current" "$versions"
-    current="$pkg"
-    versions="$version"
-  done
-  [[ -z "$current" ]] || printf '%s %s\n' "$current" "$versions"
+  sysup_rpm_snapshot
 }
 
 sysup_backend_package_files() {
-  rpm -ql "$1"
+  sysup_rpm_package_files "$1"
 }
 
 sysup_backend_checks() {

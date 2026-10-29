@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+# zypup-test - unit tests for the openSUSE/SLES upgrade helper.
+#
+# zypup reaches zypper through `sudo env ... zypper`, so the package manager
+# mocks are real executables on PATH rather than shell functions, matching
+# dnfup-test.
+
+set -euo pipefail
+export NO_COLOR=1
+
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
+# shellcheck source=lib/test.sh
+. "$TEST_DIR/lib/test.sh"
+
+ZYPUP_MOCK_BIN=$(_mock_bin)
+export PATH="$ZYPUP_MOCK_BIN:$PATH"
+
+# Written by the mocks, asserted by the tests. The zypper log records each
+# invocation's arguments prefixed with the ZYPP_LOCK_TIMEOUT it saw.
+ZYPUP_ZYPPER_LOG="$(_tmpdir)/zypper.log"
+ZYPUP_RPM_LOG="$(_tmpdir)/rpm.log"
+ZYPUP_SYSTEMCTL_LOG="$(_tmpdir)/systemctl.log"
+export ZYPUP_ZYPPER_LOG ZYPUP_RPM_LOG ZYPUP_SYSTEMCTL_LOG
+
+# Fixture state the mocks read.
+export ZYPUP_MOCK_INSTALLED=""     # rpm -qa rows: "<name>.<arch> <epoch>:<version>-<release>"
+export ZYPUP_MOCK_UPGRADED=""      # rows that replace ZYPUP_MOCK_INSTALLED on upgrade
+export ZYPUP_MOCK_PACKAGE_FILES="" # rpm -ql rows: "<name>.<arch> <file>"
+export ZYPUP_MOCK_ACTIVE_UNITS=""
+export ZYPUP_MOCK_FAILED_UNITS=""
+export ZYPUP_MOCK_UNNEEDED="" # stdout of `packages --unneeded`
+export ZYPUP_MOCK_UNNEEDED_STATUS=0
+export ZYPUP_MOCK_REFRESH_STATUS=0
+export ZYPUP_MOCK_UPGRADE_STATUSES="" # space-separated, one per upgrade run; 0 when exhausted
+export ZYPUP_MOCK_APPLY_BEFORE_FAILURE=0
+export ZYPUP_MOCK_VERIFY_OUTPUT=""
+export ZYPUP_MOCK_VERIFY_STATUS=0
+export ZYPUP_MOCK_REBOOT_STATUS=0 # needs-rebooting: 102 needed, 0 not, 2 unknown command
+export ZYPUP_MOCK_RPM_QA_STATUS=0
+ZYPUP_MOCK_STATE="$(_tmpdir)/installed"
+ZYPUP_MOCK_UPGRADE_COUNT="$(_tmpdir)/upgrade-count"
+export ZYPUP_MOCK_STATE ZYPUP_MOCK_UPGRADE_COUNT
+
+_zypup_write_mock() {
+  local name="$1"
+  cat >"$ZYPUP_MOCK_BIN/$name"
+  chmod +x "$ZYPUP_MOCK_BIN/$name"
+}
+
+# Model sudo's env_reset: the command sees only PATH and this suite's own
+# fixture variables. ZYPP_LOCK_TIMEOUT can then reach zypper only through the
+# `env` zypup passes it to, never by inheritance from the caller.
+_zypup_write_mock sudo <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "-v" ]] && exit 0
+keep=("PATH=$PATH")
+# Termux resolves `#!/usr/bin/env` shebangs through its LD_PRELOAD shim
+# (termux-exec); dropping it would leave the mock zypper unrunnable there.
+[[ -z "${LD_PRELOAD:-}" ]] || keep+=("LD_PRELOAD=$LD_PRELOAD")
+while IFS= read -r name; do
+  keep+=("$name=${!name}")
+done < <(compgen -e | grep '^ZYPUP_')
+exec env -i "${keep[@]}" "$@"
+EOF
+
+_zypup_write_mock zypper <<'EOF'
+#!/usr/bin/env bash
+printf 'ZYPP_LOCK_TIMEOUT=%s %s\n' "${ZYPP_LOCK_TIMEOUT:-unset}" "$*" >>"$ZYPUP_ZYPPER_LOG"
+
+# The first non-option argument is the command, as zypper parses it.
+command=""
+for arg in "$@"; do
+  [[ "$arg" == -* ]] && continue
+  command="$arg"
+  break
+done
+
+case "$command" in
+  refresh) exit "$ZYPUP_MOCK_REFRESH_STATUS" ;;
+  update | dist-upgrade)
+    count=$(cat "$ZYPUP_MOCK_UPGRADE_COUNT" 2>/dev/null || printf 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$ZYPUP_MOCK_UPGRADE_COUNT"
+    read -r -a statuses <<<"$ZYPUP_MOCK_UPGRADE_STATUSES"
+    status="${statuses[count - 1]:-0}"
+    if ((status != 0 && ZYPUP_MOCK_APPLY_BEFORE_FAILURE == 0)); then
+      exit "$status"
+    fi
+    [[ -z "$ZYPUP_MOCK_UPGRADED" ]] || printf '%s\n' "$ZYPUP_MOCK_UPGRADED" >"$ZYPUP_MOCK_STATE"
+    exit "$status"
+    ;;
+  verify)
+    printf '%s' "$ZYPUP_MOCK_VERIFY_OUTPUT"
+    exit "$ZYPUP_MOCK_VERIFY_STATUS"
+    ;;
+  needs-rebooting) exit "$ZYPUP_MOCK_REBOOT_STATUS" ;;
+  packages)
+    # A warning on stderr must never be mistaken for a package.
+    printf 'mock zypper warning on stderr\n' >&2
+    printf '%s' "$ZYPUP_MOCK_UNNEEDED"
+    exit "$ZYPUP_MOCK_UNNEEDED_STATUS"
+    ;;
+  remove | rm)
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+
+_zypup_write_mock rpm <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ZYPUP_RPM_LOG"
+case "${1:-}" in
+  -qa)
+    ((ZYPUP_MOCK_RPM_QA_STATUS == 0)) || exit "$ZYPUP_MOCK_RPM_QA_STATUS"
+    rows=$(cat "$ZYPUP_MOCK_STATE")
+    [[ -n "$rows" ]] || rows="$ZYPUP_MOCK_INSTALLED"
+    [[ -z "$rows" ]] || printf '%s\n' "$rows"
+    ;;
+  -ql)
+    found=0
+    while read -r pkg file; do
+      [[ "${pkg:-}" == "$2" ]] || continue
+      printf '%s\n' "$file"
+      found=1
+    done <<<"$ZYPUP_MOCK_PACKAGE_FILES"
+    if ((found == 0)); then
+      printf 'package %s is not installed\n' "$2"
+      exit 1
+    fi
+    ;;
+esac
+exit 0
+EOF
+
+_zypup_write_mock systemctl <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-units)
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] && printf '%s loaded active running mock unit\n' "$unit"
+    done <<<"$ZYPUP_MOCK_ACTIVE_UNITS"
+    ;;
+  show)
+    unit="${!#}"
+    if [[ "$*" == *--property=ActiveState* ]]; then
+      if grep -qxF -- "$unit" <<<"$ZYPUP_MOCK_ACTIVE_UNITS"; then
+        printf 'ActiveState=active\nActiveEnterTimestampMonotonic=100\n'
+      else
+        printf 'ActiveState=inactive\nActiveEnterTimestampMonotonic=0\n'
+      fi
+    else
+      printf 'yes\n'
+    fi
+    ;;
+  --failed) printf '%s' "$ZYPUP_MOCK_FAILED_UNITS" ;;
+  is-enabled) printf 'enabled\n' ;;
+  *) printf '%s\n' "$*" >>"$ZYPUP_SYSTEMCTL_LOG" ;;
+esac
+exit 0
+EOF
+
+export SYSUP_SOURCE_ONLY=1
+# Never read or write the host's deferred-restart state or boot identity.
+SYSUP_STATE_DIR="$(_tmpdir)/state"
+# Fake a running systemd: the host running the suite may have none.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+SYSUP_SYSTEMD_RUN_DIR="$(_tmpdir)"
+SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
+printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
+# shellcheck source=../lib/sysup/zypup
+. "$REPO_ROOT/lib/sysup/zypup"
+
+# Point every host path zypup reads at fixtures instead of the live system.
+ZYPUP_FIXTURE_ETC=$(_tmpdir)
+# shellcheck disable=SC2034 # read by the sourced rpm.sh under test.
+SYSUP_RPM_CONFFILE_ROOT="$ZYPUP_FIXTURE_ETC"
+ZYPUP_FIXTURE_HOST=$(_tmpdir)
+ZYPUP_MOUNTS_FILE="$ZYPUP_FIXTURE_HOST/mounts"
+ZYPUP_TRANSACTIONAL_UPDATE="$ZYPUP_FIXTURE_HOST/transactional-update"
+ZYPUP_LOCKS_FILE="$ZYPUP_FIXTURE_HOST/locks"
+# The upgrade verb reads os-release ID through detect.sh.
+SYSUP_OS_ROOT="$(_tmpdir)"
+mkdir -p "$SYSUP_OS_ROOT/etc"
+
+_zypup_os_id() {
+  printf 'ID=%s\n' "$1" >"$SYSUP_OS_ROOT/etc/os-release"
+}
+
+# The suite does not run on an openSUSE host, so neutralize the family guard
+# the way the other backend suites do. One case later restores it to prove it
+# runs.
+# shellcheck disable=SC2329 # invoked indirectly by the sourced zypup.
+sysup_require_family() {
+  return 0
+}
+
+_zypup_reset() {
+  : >"$ZYPUP_ZYPPER_LOG"
+  : >"$ZYPUP_RPM_LOG"
+  : >"$ZYPUP_SYSTEMCTL_LOG"
+  : >"$ZYPUP_MOCK_STATE"
+  rm -f "$ZYPUP_MOCK_UPGRADE_COUNT" "$ZYPUP_TRANSACTIONAL_UPDATE"
+  chmod u+r "$ZYPUP_LOCKS_FILE" 2>/dev/null || true
+  rm -f "$ZYPUP_LOCKS_FILE"
+  printf 'rootfs / rootfs rw 0 0\n/dev/vda2 / btrfs rw,relatime,subvol=/@ 0 0\n' >"$ZYPUP_MOUNTS_FILE"
+  _zypup_os_id opensuse-tumbleweed
+  ZYPUP_MOCK_INSTALLED=""
+  ZYPUP_MOCK_UPGRADED=""
+  ZYPUP_MOCK_PACKAGE_FILES=""
+  ZYPUP_MOCK_ACTIVE_UNITS=""
+  ZYPUP_MOCK_FAILED_UNITS=""
+  ZYPUP_MOCK_UNNEEDED=""
+  ZYPUP_MOCK_UNNEEDED_STATUS=0
+  ZYPUP_MOCK_REFRESH_STATUS=0
+  ZYPUP_MOCK_UPGRADE_STATUSES=""
+  ZYPUP_MOCK_APPLY_BEFORE_FAILURE=0
+  ZYPUP_MOCK_VERIFY_OUTPUT=""
+  ZYPUP_MOCK_VERIFY_STATUS=0
+  ZYPUP_MOCK_REBOOT_STATUS=0
+  ZYPUP_MOCK_RPM_QA_STATUS=0
+  ZYPUP_UPGRADE_REBOOT_NEEDED=0
+  rm -rf "${ZYPUP_FIXTURE_ETC:?}"/*
+  rm -rf "${SYSUP_STATE_DIR:?}"
+}
+
+# Capture output rather than discarding it: a non-zero status anywhere in the
+# composed driver path is otherwise invisible, and the assertion message is the
+# only place the cause would surface. sysup_main runs in this shell, not a
+# command substitution, so the reboot flag it sets stays observable.
+_zypup_main() {
+  local out
+  out=$(_tmpfile)
+  set +e
+  sysup_main "$@" >"$out" 2>&1
+  ZYPUP_STATUS=$?
+  set -e
+  ZYPUP_RESULT=$(cat "$out")
+}
+
+# The zypper log lines that ran a package upgrade.
+_zypup_upgrade_lines() {
+  grep -E ' (update|dist-upgrade)( |$)' "$ZYPUP_ZYPPER_LOG" || true
+}
+
+echo "=== zypup: usage ==="
+
+usage=$(sysup_backend_usage)
+_assert_contains "zypup usage: documents unattended package installation" \
+  "upgrade packages noninteractively" "$usage"
+_assert_contains "zypup usage: documents the shared flags" \
+  "--no-autoremove" "$usage"
+_assert_contains "zypup usage: rules out release upgrades" \
+  "never performs a release upgrade between Leap or SLES versions" "$usage"
+_assert_contains "zypup usage: says licenses are never accepted automatically" \
+  "licenses are never accepted" "$usage"
+
+echo ""
+echo "=== zypup: package snapshot ==="
+
+# The snapshot comes from rpm.sh, shared with dnfup; prove zypup reaches it.
+_zypup_reset
+ZYPUP_MOCK_INSTALLED=$'zsh.x86_64 0:5.9-1.1\nkernel-default.x86_64 0:6.11.2-1.1\nkernel-default.x86_64 0:6.10.9-1.1\ngpg-pubkey.(none) 0:aaaa-1111'
+_assert_eq "zypup snapshot: uses the shared rpm snapshot format" \
+  $'kernel-default.x86_64 0:6.10.9-1.1,0:6.11.2-1.1\nzsh.x86_64 0:5.9-1.1' "$(sysup_backend_snapshot)"
+
+echo ""
+echo "=== zypup: upgrade verb ==="
+
+for case_row in \
+  'opensuse-tumbleweed dist-upgrade' \
+  'opensuse-slowroll dist-upgrade' \
+  'opensuse-leap update' \
+  'sles update' \
+  'rolling-derivative dist-upgrade opensuse-tumbleweed' \
+  'fixed-derivative update suse'; do
+  read -r os_id verb os_id_like <<<"$case_row"
+  _zypup_reset
+  _zypup_os_id "$os_id"
+  if [[ -n "$os_id_like" ]]; then
+    printf 'ID_LIKE="opensuse %s"\n' "$os_id_like" >>"$SYSUP_OS_ROOT/etc/os-release"
+  fi
+  ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+  _zypup_main
+  _assert_eq "zypup verb: $os_id succeeds (output: $ZYPUP_RESULT)" "0" "$ZYPUP_STATUS"
+  _assert_eq "zypup verb: $os_id upgrades with $verb" \
+    "ZYPP_LOCK_TIMEOUT=300 --non-interactive $verb" "$(_zypup_upgrade_lines)"
+done
+
+echo ""
+echo "=== zypup: full run ==="
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="openssh-server.x86_64 0:9.8-1.1"
+ZYPUP_MOCK_UPGRADED="openssh-server.x86_64 0:9.9-1.1"
+ZYPUP_MOCK_PACKAGE_FILES=$'openssh-server.x86_64 /usr/lib/systemd/system/sshd.service'
+ZYPUP_MOCK_ACTIVE_UNITS="sshd.service"
+_zypup_main
+zypper_log=$(cat "$ZYPUP_ZYPPER_LOG")
+_assert_eq "zypup main: succeeds (output: $ZYPUP_RESULT)" "0" "$ZYPUP_STATUS"
+_assert_eq "zypup main: refreshes repositories before upgrading" \
+  $'--non-interactive refresh\n--non-interactive dist-upgrade' \
+  "$(grep -E ' (refresh|dist-upgrade)$' "$ZYPUP_ZYPPER_LOG" | cut -d' ' -f2-)"
+_assert_not_contains "zypup main: every zypper call carries the lock timeout" \
+  "ZYPP_LOCK_TIMEOUT=unset" "$zypper_log"
+_assert_not_contains "zypup main: never auto-agrees to licenses" \
+  "auto-agree" "$zypper_log"
+_assert_contains "zypup main: restarts services of upgraded packages" \
+  "try-restart sshd.service" "$(cat "$ZYPUP_SYSTEMCTL_LOG")"
+
+_zypup_reset
+ZYPUP_LOCK_TIMEOUT=17
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_zypup_main
+# shellcheck disable=SC2034 # read by the sourced zypup under test.
+ZYPUP_LOCK_TIMEOUT=300
+_assert_contains "zypup main: passes the configured lock timeout to zypper" \
+  "ZYPP_LOCK_TIMEOUT=17 --non-interactive dist-upgrade" "$(cat "$ZYPUP_ZYPPER_LOG")"
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_zypup_main -- --no-recommends
+_assert_eq "zypup main: forwards extra arguments after the verb" \
+  "ZYPP_LOCK_TIMEOUT=300 --non-interactive dist-upgrade --no-recommends" "$(_zypup_upgrade_lines)"
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+ZYPUP_MOCK_REFRESH_STATUS=4
+_zypup_main
+_assert_eq "zypup refresh: a failed refresh fails the run" "4" "$ZYPUP_STATUS"
+_assert_eq "zypup refresh: a failed refresh never upgrades" "" "$(_zypup_upgrade_lines)"
+_assert_contains "zypup refresh: a failed refresh still runs the checks" \
+  "checking package dependencies" "$ZYPUP_RESULT"
+
+echo ""
+echo "=== zypup: zypper exit codes ==="
+
+# zypper returns 106 or 107 only when its main exit code is 0, so a 102 can
+# hide a skipped repository or a failed scriptlet. zypup cannot see those then
+# and treats 102 as success; docs/design.md lists this under "Not yet handled".
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+ZYPUP_MOCK_UPGRADE_STATUSES="102"
+_zypup_main
+_assert_eq "zypup exit 102: a reboot-needed upgrade succeeds (output: $ZYPUP_RESULT)" \
+  "0" "$ZYPUP_STATUS"
+_assert_contains "zypup exit 102: reports the reboot the upgrade asked for" \
+  "reboot required to complete this upgrade" "$ZYPUP_RESULT"
+_assert_contains "zypup exit 102: still lists unneeded packages after the upgrade" \
+  "--quiet packages --unneeded" "$(cat "$ZYPUP_ZYPPER_LOG")"
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+ZYPUP_MOCK_UPGRADE_STATUSES="103 0"
+_zypup_main
+_assert_eq "zypup exit 103: the rerun's success is the result (output: $ZYPUP_RESULT)" \
+  "0" "$ZYPUP_STATUS"
+_assert_eq "zypup exit 103: runs the same upgrade exactly once more" \
+  $'ZYPP_LOCK_TIMEOUT=300 --non-interactive dist-upgrade\nZYPP_LOCK_TIMEOUT=300 --non-interactive dist-upgrade' \
+  "$(_zypup_upgrade_lines)"
+_assert_contains "zypup exit 103: says why it ran again" \
+  "running dist-upgrade again" "$ZYPUP_RESULT"
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+ZYPUP_MOCK_UPGRADE_STATUSES="103 8"
+_zypup_main
+_assert_eq "zypup exit 103: a failed rerun keeps the rerun's status" "8" "$ZYPUP_STATUS"
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+ZYPUP_MOCK_UPGRADE_STATUSES="103 103 0"
+_zypup_main
+_assert_eq "zypup exit 103: a second 103 is a failure" "103" "$ZYPUP_STATUS"
+_assert_eq "zypup exit 103: reruns at most once" "2" "$(_zypup_upgrade_lines | wc -l | tr -d ' ')"
+
+for failing in 106 107 8; do
+  _zypup_reset
+  ZYPUP_MOCK_INSTALLED="openssh-server.x86_64 0:9.8-1.1"
+  ZYPUP_MOCK_UPGRADED="openssh-server.x86_64 0:9.9-1.1"
+  ZYPUP_MOCK_PACKAGE_FILES=$'openssh-server.x86_64 /usr/lib/systemd/system/sshd.service'
+  ZYPUP_MOCK_ACTIVE_UNITS="sshd.service"
+  ZYPUP_MOCK_UPGRADE_STATUSES="$failing"
+  ZYPUP_MOCK_APPLY_BEFORE_FAILURE=1
+  _zypup_main
+  _assert_eq "zypup exit $failing: keeps the zypper failure status" "$failing" "$ZYPUP_STATUS"
+  _assert_not_contains "zypup exit $failing: skips the unneeded-package step" \
+    "packages --unneeded" "$(cat "$ZYPUP_ZYPPER_LOG")"
+  _assert_contains "zypup exit $failing: still restarts what a partial upgrade changed" \
+    "try-restart sshd.service" "$(cat "$ZYPUP_SYSTEMCTL_LOG")"
+  _assert_eq "zypup exit $failing: never reruns the upgrade" \
+    "1" "$(_zypup_upgrade_lines | wc -l | tr -d ' ')"
+done
+_zypup_reset
+ZYPUP_MOCK_UPGRADE_STATUSES=106
+# shellcheck disable=SC2119 # deliberately no extra zypper arguments.
+_assert_contains "zypup exit 106: names the skipped repository as the cause" \
+  "skipped a repository" "$(sysup_backend_upgrade 2>&1 || true)"
+_zypup_reset
+ZYPUP_MOCK_UPGRADE_STATUSES=107
+# shellcheck disable=SC2119 # deliberately no extra zypper arguments.
+_assert_contains "zypup exit 107: names the failed install script" \
+  "install script failed" "$(sysup_backend_upgrade 2>&1 || true)"
+
+_zypup_reset
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+ZYPUP_MOCK_ACTIVE_UNITS="sshd.service"
+_zypup_main --check-only
+zypper_log=$(cat "$ZYPUP_ZYPPER_LOG")
+_assert_eq "zypup check-only: succeeds (output: $ZYPUP_RESULT)" "0" "$ZYPUP_STATUS"
+_assert_eq "zypup check-only: never upgrades" "" "$(_zypup_upgrade_lines)"
+_assert_not_contains "zypup check-only: never refreshes repositories" \
+  "--non-interactive refresh" "$zypper_log"
+_assert_eq "zypup check-only: never touches systemd units" \
+  "" "$(cat "$ZYPUP_SYSTEMCTL_LOG")"
+_assert_contains "zypup check-only: still verifies dependencies" \
+  "--no-refresh verify --dry-run" "$zypper_log"
+
+echo ""
+echo "=== zypup: unneeded packages ==="
+
+for mode in apply report; do
+  _zypup_reset
+  ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+  ZYPUP_MOCK_UNNEEDED=$'S | Repository | Name     | Version | Arch\n--+------------+----------+---------+-------\ni | @System    | orphan-a | 1.0-1.1 | x86_64\n'
+  if [[ "$mode" == report ]]; then
+    _zypup_main --no-autoremove
+  else
+    _zypup_main
+  fi
+  zypper_log=$(cat "$ZYPUP_ZYPPER_LOG")
+  _assert_eq "zypup unneeded ($mode): succeeds (output: $ZYPUP_RESULT)" "0" "$ZYPUP_STATUS"
+  _assert_contains "zypup unneeded ($mode): lists zypper's unneeded packages" \
+    "  i | @System    | orphan-a | 1.0-1.1 | x86_64" "$ZYPUP_RESULT"
+  _assert_contains "zypup unneeded ($mode): queries without refreshing repositories" \
+    "--non-interactive --no-refresh --quiet packages --unneeded" "$zypper_log"
+  _assert_not_contains "zypup unneeded ($mode): never removes packages" \
+    " remove" "$zypper_log"
+  _assert_not_contains "zypup unneeded ($mode): never runs a zypper rm" \
+    " rm" "$zypper_log"
+  _assert_not_contains "zypup unneeded ($mode): zypper warnings are never listed as packages" \
+    "  mock zypper warning" "$ZYPUP_RESULT"
+done
+_assert_not_contains "zypup unneeded (report): no removal note under --no-autoremove" \
+  "zypup only lists these packages" "$ZYPUP_RESULT"
+_zypup_reset
+ZYPUP_MOCK_UNNEEDED=$'i | @System | orphan-a | 1.0-1.1 | x86_64\n'
+result=$(sysup_backend_autoremove apply 2>&1)
+_assert_contains "zypup unneeded (apply): says zypup only lists them, and why" \
+  "zypup only lists these packages; zypper has no autoremove" "$result"
+
+_zypup_reset
+result=$(sysup_backend_autoremove apply 2>&1)
+_assert_contains "zypup unneeded: says when nothing is eligible" \
+  "no packages are eligible for removal" "$result"
+
+_zypup_reset
+ZYPUP_MOCK_UNNEEDED_STATUS=4
+set +e
+result=$(sysup_backend_autoremove report 2>&1)
+status=$?
+set -e
+_assert_eq "zypup unneeded: a failed query is advisory" "0" "$status"
+_assert_contains "zypup unneeded: says the query failed" \
+  "could not determine which packages are no longer required" "$result"
+
+echo ""
+echo "=== zypup: package locks ==="
+
+_zypup_reset
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "zypup locks: an absent locks file means no locks" \
+  $'package locks (0)\n  (none)' "$result"
+
+_zypup_reset
+printf 'type: package\nmatch_type: glob\ncase_sensitive: on\nsolvable_name: demo-locked\n\ntype: package\nsolvable_name:   kernel-*  \n\ntype: package\nsolvable_provides: libdemo.so.1\n' >"$ZYPUP_LOCKS_FILE"
+result=$(sysup_backend_preamble 2>&1)
+_assert_eq "zypup locks: lists each locked solvable name, trimmed" \
+  $'\n==> package locks (2)\n  demo-locked\n  kernel-*' "$result"
+
+# A pattern, patch, or product lock must not read as a package of that name.
+_zypup_reset
+printf 'type: pattern\nsolvable_name: demo-pattern\n\nsolvable_name: demo-untyped\n\nsolvable_name: demo-product\ntype: product\n\ntype: package\nsolvable_name: demo-package\n' >"$ZYPUP_LOCKS_FILE"
+result=$(sysup_backend_preamble 2>&1)
+_assert_eq "zypup locks: names the kind of non-package locks, in either key order" \
+  $'\n==> package locks (4)\n  demo-pattern (pattern)\n  demo-untyped\n  demo-product (product)\n  demo-package' "$result"
+
+# Without a trailing newline the last stanza must still count.
+_zypup_reset
+printf 'type: package\nsolvable_name: tail-locked' >"$ZYPUP_LOCKS_FILE"
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "zypup locks: reads a final line without a newline" \
+  "  tail-locked" "$result"
+
+_zypup_reset
+printf 'solvable_name: secret\n' >"$ZYPUP_LOCKS_FILE"
+chmod 000 "$ZYPUP_LOCKS_FILE"
+if [[ -r "$ZYPUP_LOCKS_FILE" ]]; then
+  # Running as root defeats the permission fixture; model it with a directory,
+  # which exists but cannot be read as a file of lines either.
+  chmod u+r "$ZYPUP_LOCKS_FILE"
+  rm -f "$ZYPUP_LOCKS_FILE"
+  mkdir "$ZYPUP_LOCKS_FILE"
+fi
+set +e
+result=$(sysup_backend_preamble 2>&1)
+status=$?
+set -e
+rm -rf "$ZYPUP_LOCKS_FILE"
+_assert_eq "zypup locks: an unreadable locks file is not fatal" "0" "$status"
+_assert_contains "zypup locks: an unreadable locks file is reported as unknown" \
+  "package locks are unknown" "$result"
+_assert_not_contains "zypup locks: an unreadable locks file never claims none" \
+  "(none)" "$result"
+
+echo ""
+echo "=== zypup: checks ==="
+
+_zypup_reset
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+zypper_log=$(cat "$ZYPUP_ZYPPER_LOG")
+_assert_eq "zypup checks: a consistent host passes" "0" "$status"
+_assert_contains "zypup checks: verify is a dry run without refreshing repositories" \
+  "--non-interactive --no-refresh verify --dry-run" "$zypper_log"
+_assert_contains "zypup checks: needs-rebooting carries the lock timeout" \
+  "ZYPP_LOCK_TIMEOUT=300 --non-interactive --quiet needs-rebooting" "$zypper_log"
+_assert_contains "zypup checks: ok message does not overclaim a dry run" \
+  "no unresolvable dependency problems" "$result"
+
+_zypup_reset
+ZYPUP_MOCK_VERIFY_OUTPUT=$'Problem: nothing provides libdemo.so.1 needed by demo\n'
+ZYPUP_MOCK_VERIFY_STATUS=4
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "zypup checks: a verify failure fails the run" "1" "$status"
+_assert_contains "zypup checks: shows what zypper verify reported" \
+  "nothing provides libdemo.so.1" "$result"
+_assert_contains "zypup checks: does not claim a cause the status cannot establish" \
+  "dependency state is unverified" "$result"
+_assert_contains "zypup checks: a fatal check still runs the reboot check" \
+  "ok: no reboot required" "$result"
+_assert_contains "zypup checks: a fatal check still runs the conffile scan" \
+  "no config files awaiting a manual merge" "$result"
+
+_zypup_reset
+ZYPUP_MOCK_REBOOT_STATUS=102
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "zypup reboot: needs-rebooting status 102 means a reboot is required" \
+  "reboot required to complete this upgrade" "$result"
+
+# zypper predating needs-rebooting exits 2 for the unknown command.
+_zypup_reset
+ZYPUP_MOCK_REBOOT_STATUS=2
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_not_contains "zypup reboot: a missing needs-rebooting never claims a reboot is required" \
+  "reboot required to complete" "$result"
+_assert_contains "zypup reboot: a missing needs-rebooting leaves reboot state unknown" \
+  "could not determine whether a reboot is required" "$result"
+_assert_eq "zypup reboot: unknown reboot state is advisory" "0" "$status"
+
+_zypup_reset
+ZYPUP_MOCK_REBOOT_STATUS=1
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "zypup reboot: status 1 is not read as a reboot" \
+  "could not determine whether a reboot is required" "$result"
+
+_zypup_reset
+# shellcheck disable=SC2034 # read by the sourced zypup under test.
+ZYPUP_UPGRADE_REBOOT_NEEDED=1
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "zypup reboot: the upgrade's 102 is reported even if needs-rebooting says no" \
+  "reboot required to complete this upgrade" "$result"
+
+_zypup_reset
+mkdir -p "$ZYPUP_FIXTURE_ETC/ssh"
+: >"$ZYPUP_FIXTURE_ETC/ssh/sshd_config.rpmnew"
+: >"$ZYPUP_FIXTURE_ETC/demo.conf.rpmsave"
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "zypup conffiles: lists .rpmnew files" "sshd_config.rpmnew" "$result"
+_assert_contains "zypup conffiles: lists .rpmsave files" "demo.conf.rpmsave" "$result"
+
+echo ""
+echo "=== zypup: host guards ==="
+
+_zypup_write_transactional_update() {
+  printf '#!/bin/sh\nexit 0\n' >"$ZYPUP_TRANSACTIONAL_UPDATE"
+  chmod +x "$ZYPUP_TRANSACTIONAL_UPDATE"
+}
+
+_zypup_reset
+printf 'rootfs / rootfs rw 0 0\n/dev/vda2 / btrfs ro,relatime,subvol=/@/.snapshots/1/snapshot 0 0\n' >"$ZYPUP_MOUNTS_FILE"
+_zypup_write_transactional_update
+_zypup_main
+_assert_eq "zypup guard: refuses a read-only transactional root" "1" "$ZYPUP_STATUS"
+_assert_contains "zypup guard: names transactional-update" \
+  "transactional-update dup" "$ZYPUP_RESULT"
+_assert_eq "zypup guard: runs no zypper command on a transactional host" \
+  "" "$(cat "$ZYPUP_ZYPPER_LOG")"
+
+_zypup_reset
+_zypup_write_transactional_update
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_zypup_main
+_assert_eq "zypup guard: a writable root proceeds with transactional-update installed" \
+  "0" "$ZYPUP_STATUS"
+
+_zypup_reset
+printf '/dev/vda2 / btrfs ro,relatime 0 0\n' >"$ZYPUP_MOUNTS_FILE"
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_zypup_main
+_assert_eq "zypup guard: a read-only root without transactional-update proceeds" \
+  "0" "$ZYPUP_STATUS"
+
+# The last `/` entry is the one in effect; an earlier read-only one is covered.
+_zypup_reset
+printf '/dev/vda2 / btrfs ro 0 0\n/dev/vda2 / btrfs rw,relatime 0 0\n' >"$ZYPUP_MOUNTS_FILE"
+_zypup_write_transactional_update
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_zypup_main
+_assert_eq "zypup guard: only the last root mount decides" "0" "$ZYPUP_STATUS"
+
+# "ro" must match a whole option, not a substring such as "errors=remount-ro".
+_zypup_reset
+printf '/dev/vda2 / ext4 rw,errors=remount-ro 0 0\n' >"$ZYPUP_MOUNTS_FILE"
+_zypup_write_transactional_update
+ZYPUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_zypup_main
+_assert_eq "zypup guard: an option merely containing ro is not read-only" "0" "$ZYPUP_STATUS"
+
+echo ""
+echo "=== zypup: family guard ==="
+
+_zypup_reset
+zypup_test_os_root=$(_tmpdir)
+mkdir -p "$zypup_test_os_root/etc"
+printf 'ID=debian\n' >"$zypup_test_os_root/etc/os-release"
+# Restore the real guard for this case; unset alone would leave it undefined.
+unset -f sysup_require_family
+# shellcheck source=../lib/sysup/detect.sh
+. "$REPO_ROOT/lib/sysup/detect.sh"
+saved_os_root="$SYSUP_OS_ROOT"
+SYSUP_OS_ROOT="$zypup_test_os_root"
+_zypup_main
+SYSUP_OS_ROOT="$saved_os_root"
+# shellcheck disable=SC2329 # invoked indirectly by the sourced zypup.
+sysup_require_family() { return 0; }
+_assert_eq "zypup main: refuses to run on a non-SUSE host" "1" "$ZYPUP_STATUS"
+_assert_contains "zypup main: names the host it refused" \
+  "only supports openSUSE/SUSE-based hosts" "$ZYPUP_RESULT"
+_assert_eq "zypup main: runs no zypper command on the wrong family" \
+  "" "$(cat "$ZYPUP_ZYPPER_LOG")"
+
+_test_summary

@@ -68,6 +68,8 @@ jobs:
           - docker.io/library/archlinux:latest
           - docker.io/library/fedora:latest
           - docker.io/rockylinux/rockylinux:9
+          - docker.io/opensuse/tumbleweed:latest
+          - docker.io/opensuse/leap:latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # Name checkout's throwaway initial branch so Git skips its hint.

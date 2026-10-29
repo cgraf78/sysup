@@ -163,7 +163,7 @@ printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
 # Point the conffile scan at a fixture tree instead of the live system.
 DNFUP_FIXTURE_ETC=$(_tmpdir)
 # shellcheck disable=SC2034 # read by the sourced dnfup under test.
-DNFUP_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
+SYSUP_RPM_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
 # Never let the live host's image-based marker decide a test.
 DNFUP_OSTREE_BOOTED_FILE="$(_tmpdir)/absent"
 
@@ -474,10 +474,10 @@ _assert_contains "dnfup conffiles: says when nothing awaits a merge" \
 
 # An unreadable tree must not be reported as clean.
 _dnfup_reset
-DNFUP_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC/missing"
+SYSUP_RPM_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC/missing"
 result=$(sysup_backend_checks 2>&1)
 # shellcheck disable=SC2034 # read by the sourced dnfup under test.
-DNFUP_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
+SYSUP_RPM_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
 _assert_contains "dnfup conffiles: a failed scan is reported as incomplete" \
   "could not completely scan" "$result"
 _assert_not_contains "dnfup conffiles: a failed scan never claims a clean tree" \
