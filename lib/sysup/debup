@@ -54,8 +54,8 @@ DEBUP_CONFFILE_ROOT="${DEBUP_CONFFILE_ROOT:-/etc}"
 sysup_backend_usage() {
   cat <<'EOF'
 Usage: sysup [--full-upgrade] [--no-autoremove] [--check-only]
-             [--no-restart-upgraded-services] [--restart-failed] [--]
-             [extra apt-get args...]
+             [--no-restart-upgraded-services] [--restart-failed]
+             [-- apt-get args...]
 
 Upgrade a Debian or Ubuntu host within its installed release, then verify the
 failure modes most likely to leave services broken after the upgrade.
@@ -78,7 +78,7 @@ EOF
   sysup_usage_common_options
   cat <<'EOF'
 
-Extra arguments are passed through to the apt-get upgrade invocation. Package
+Arguments after -- are passed through to the apt-get upgrade invocation. Package
 installation is noninteractive by default.
 
 debup never performs a release upgrade; use the distribution's documented

@@ -12,6 +12,7 @@ program	lib/sysup/systemd.sh
 program	test/run
 program	test/lib/test.sh
 program	test/sysup-test
+program	test/common-test
 program	test/archup-test
 program	test/debup-test
 program	test/dnfup-test

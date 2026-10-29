@@ -8,6 +8,10 @@ functions and shell state from reaching another.
 - `sysup-test` covers OS detection, family guards, exact argv dispatch, help and
   error behavior, Bash 3.2 constraints, shdeps-style relative and absolute
   symlinks, and the manual installation layout.
+- `common-test` covers the shared driver with a fake backend: rejection of
+  unknown arguments, the sudo keeper's refresh and shutdown (normal return,
+  failed upgrade, revoked credentials, and a parent that dies without
+  cleanup), and package-manager lock detection and waits.
 - `archup-test` covers package-manager argument policy, AUR membership and
   rebuild decisions, orphan removal, missing-library failures, package
   snapshots, service restarts, persistent deferred-restart reminders, partial

@@ -62,7 +62,7 @@ Optional hooks, with defaults in `common.sh`:
 
 | Hook | Default | Override |
 | --- | --- | --- |
-| `sysup_backend_parse_arg <arg>` | unhandled (arg falls through to the package manager) | `debup` adds `--full-upgrade` |
+| `sysup_backend_parse_arg <arg>` | unhandled (sysup rejects the argument with status 2) | `debup` adds `--full-upgrade` |
 | `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages |
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
 | `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded` |
@@ -86,11 +86,19 @@ require extending the parser contract.
 
 ### Run sequence
 
-1. Parse shared flags; unrecognized arguments pass through to the package
+1. Parse shared flags. Arguments after `--` go to the package manager; any
+   other argument the backend does not claim is rejected with status 2
+   before anything runs, so a mistyped option cannot reach the package
    manager.
 2. `sysup_backend_require`, then `sysup_backend_preamble`.
 3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, remove
-   unused packages, snapshot again, and diff to get the upgraded set.
+   unused packages, snapshot again, and diff to get the upgraded set. Once
+   `sudo` is warm, a background keeper refreshes it every
+   `SYSUP_SUDO_REFRESH` seconds (default 60; 0 disables) until the run
+   returns, so a long upgrade cannot leave the later steps at a password
+   prompt. `sysup_main` stops and reaps it on every return path; it also
+   exits on its own within one interval if the run dies without cleanup or
+   `sudo -n -v` is refused.
    `sysup_backend_autoremove apply` runs only after a clean upgrade: after a
    partial failure the dependency graph may be mid-transition, so removal is
    skipped with a note. `--no-autoremove` calls it with `report` instead. It
@@ -126,6 +134,15 @@ failure: an upgrade can install some packages before returning nonzero. The
 driver re-snapshots best-effort, restarts services for anything it can prove
 changed, reports unverified discovery explicitly, and preserves the original
 package-manager status.
+
+### Lock waits
+
+`sysup_wait_path_free PATH TIMEOUT WHAT` waits, polling every
+`SYSUP_LOCK_POLL` seconds, until no process has a package-manager lock file
+open. Holders are found through `/proc/<pid>/fd` links (read as root), not
+`/proc/locks`: the latter names files by device and inode, and on btrfs
+`stat()` reports a per-subvolume device that never matches it. Backends can use it
+where the package manager itself fails at once on a held lock.
 
 ### Deferred restarts
 
@@ -286,6 +303,8 @@ or excluded packages are not listed the way `debup` lists held packages.
 
 ## Testing
 
+- `common-test` drives the shared driver with a fake backend: argument
+  rejection, the sudo keeper's lifecycle, and lock waits.
 - `archup-test` covers the extracted shared hooks, AUR decisions, orphan
   removal, library scanning, package diffs, service restarts, and partial
   failures.

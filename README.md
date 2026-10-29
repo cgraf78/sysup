@@ -74,6 +74,10 @@ Common options:
 - `-h` or `--help` prints the options for the detected host; and
 - `--` sends every remaining argument to the selected package manager.
 
+Package-manager arguments must follow `--`. Any other argument before it is
+rejected with exit status 2, so a mistyped option fails before anything runs
+instead of reaching the package manager.
+
 ### Arch
 
 The Arch backend reports foreign packages, upgrades with `yay -Syu --devel`
