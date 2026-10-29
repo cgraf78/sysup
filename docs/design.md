@@ -92,7 +92,11 @@ require extending the parser contract.
    manager.
 2. `sysup_backend_require`, then `sysup_backend_preamble`.
 3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, remove
-   unused packages, snapshot again, and diff to get the upgraded set. Once
+   unused packages, snapshot again, and diff to get the upgraded set.
+   Warming first probes `sudo -n -k true`; when sudo needs no password it
+   skips both the prompt and the keeper, since `sudo -v` prompts under the
+   default `verifypw=all` unless every matching sudoers rule is NOPASSWD
+   (stock openSUSE also grants `ALL ALL=(ALL) ALL`). Otherwise, once
    `sudo` is warm, a background keeper refreshes it every
    `SYSUP_SUDO_REFRESH` seconds (default 60; 0 disables) until the run
    returns, so a long upgrade cannot leave the later steps at a password

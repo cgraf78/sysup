@@ -20,6 +20,9 @@ COMMON_SUDO_LOG="$(_tmpdir)/sudo.log"
 COMMON_UPGRADE_LOG="$(_tmpdir)/upgrade.log"
 export COMMON_SUDO_LOG COMMON_UPGRADE_LOG
 export COMMON_SUDO_REFRESH_STATUS=0
+# Whether the mock sudo runs commands without a password; 1 models a host
+# where it needs one, the case the keeper exists for.
+export COMMON_SUDO_NOPASSWD_STATUS=1
 
 # sudo is a real executable so the keeper's background subshell, which has no
 # access to later function redefinitions, still reaches the mock.
@@ -29,6 +32,7 @@ printf '%s\n' "$*" >>"$COMMON_SUDO_LOG"
 case "$*" in
   -v) exit 0 ;;
   "-n -v") exit "$COMMON_SUDO_REFRESH_STATUS" ;;
+  "-n -k true") exit "$COMMON_SUDO_NOPASSWD_STATUS" ;;
 esac
 [[ "$1" != -n ]] || shift
 exec "$@"
@@ -75,6 +79,7 @@ _common_reset() {
   COMMON_UPGRADE_SECONDS=0
   COMMON_UPGRADE_STATUS=0
   COMMON_SUDO_REFRESH_STATUS=0
+  COMMON_SUDO_NOPASSWD_STATUS=1
   SYSUP_SUDO_REFRESH=60
 }
 
@@ -274,6 +279,32 @@ else
   sleep 0.3
   _assert_eq "common keeper: --check-only never starts it" \
     "0" "$(_common_refresh_count)"
+
+  # A host where sudo needs a password: probe, then prompt once.
+  _common_reset
+  _common_main
+  _assert_eq "common sudo: a password host succeeds" "0" "$COMMON_STATUS"
+  _assert_eq "common sudo: a password host probes, then prompts" \
+    $'-n -k true\n-v' "$(grep -E '^(-n -k true|-v)$' "$COMMON_SUDO_LOG")"
+
+  # Passwordless sudo: no prompt, and no keeper, whose `sudo -n -v` would
+  # fail under verifypw=all and has no credential to keep warm anyway.
+  _common_reset
+  COMMON_SUDO_NOPASSWD_STATUS=0
+  COMMON_UPGRADE_SECONDS=0.5
+  # shellcheck disable=SC2034 # read by the sourced common.sh under test.
+  SYSUP_SUDO_REFRESH=0.1
+  _common_main
+  _assert_eq "common sudo: a passwordless host succeeds" "0" "$COMMON_STATUS"
+  _assert_not_contains "common sudo: a passwordless host is never prompted" \
+    $'\n-v\n' $'\n'"$(cat "$COMMON_SUDO_LOG")"$'\n'
+  _assert_eq "common sudo: a passwordless host starts no keeper" \
+    "0" "$(_common_refresh_count)"
+
+  # The probe must ignore a cached credential (-k); without it a recent
+  # sudo would pass for NOPASSWD and the run would go unrefreshed.
+  _assert_contains "common sudo: the probe ignores cached credentials" \
+    "-n -k true" "$(cat "$COMMON_SUDO_LOG")"
 fi
 
 echo ""
