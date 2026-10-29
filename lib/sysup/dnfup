@@ -221,14 +221,26 @@ sysup_backend_autoremove() {
 # list` needs a plugin on dnf4 and loads repositories, and an informational
 # list must not fail on either. Repository-level excludes are not covered.
 dnfup_pinned_packages() {
-  local line
+  local line section="" item
+  local -a items=()
 
   if [[ -e "$DNFUP_CONF" ]]; then
     [[ -r "$DNFUP_CONF" ]] || return 1
     # `exclude` is the old spelling of `excludepkgs`; both take a comma- or
     # space-separated list, and only the [main] section applies globally.
-    sed -n '/^\[main\]/,/^\[/{s/^[[:space:]]*\(excludepkgs\|exclude\)[[:space:]]*=[[:space:]]*//p}' \
-      "$DNFUP_CONF" | tr -s ', ' '\n' | sed '/^$/d; s/$/ (excluded)/'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*\[([^]]*)\] ]]; then
+        section="${BASH_REMATCH[1]}"
+        continue
+      fi
+      [[ "$section" == main ]] || continue
+      [[ "$line" =~ ^[[:space:]]*(excludepkgs|exclude)[[:space:]]*=(.*)$ ]] || continue
+      # read -a splits without globbing, so a `kernel*` pattern stays literal.
+      read -ra items <<<"${BASH_REMATCH[2]//,/ }"
+      for item in ${items[@]+"${items[@]}"}; do
+        printf '%s (excluded)\n' "$item"
+      done
+    done <"$DNFUP_CONF"
   fi
 
   # dnf4: one NEVRA pattern per line; a leading `!` marks an exclude entry.

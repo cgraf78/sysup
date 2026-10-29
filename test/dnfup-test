@@ -589,6 +589,17 @@ _assert_contains "dnfup pinned: lists dnf5 versionlocks" \
 _assert_not_contains "dnfup pinned: does not list dnf5 conditions" \
   "evr" "$result"
 
+# A pattern is listed as written, never expanded against the working directory.
+_dnfup_reset
+printf '[main]\nexcludepkgs=kernel*\n' >"$DNFUP_CONF"
+glob_dir=$(_tmpdir)
+: >"$glob_dir/kernel-decoy"
+result=$(cd "$glob_dir" && sysup_backend_preamble 2>&1)
+_assert_contains "dnfup pinned: does not glob-expand patterns" \
+  "  kernel* (excluded)" "$result"
+_assert_not_contains "dnfup pinned: lists no working-directory file" \
+  "kernel-decoy" "$result"
+
 # An unreadable source warns and never stops the run. Root reads anything, so
 # only a non-root runner can model this.
 if ((EUID != 0)); then
