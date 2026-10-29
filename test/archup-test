@@ -73,7 +73,19 @@ _archup_mock_reset() {
   # shellcheck disable=SC2034 # Read by the sourced backend removal hook.
   ARCHUP_CONFIRMATION_ARG=--noconfirm
   ARCHUP_FILE_STATUS=0
+  ARCHUP_FILE_OUTPUT_FAULT=""
+  declare -gA ARCHUP_FILE_DESCRIPTIONS=()
+  ARCHUP_FILE_COMMAND_LOG="$ARCHUP_MOCK_ROOT/file-commands.log"
+  : >"$ARCHUP_FILE_COMMAND_LOG"
   ARCHUP_LDD_STATUS=0
+  ARCHUP_LDD_COMMAND_LOG="$ARCHUP_MOCK_ROOT/ldd-commands.log"
+  : >"$ARCHUP_LDD_COMMAND_LOG"
+  # The running kernel's modules are present unless a test removes them, so
+  # every other test sees a host that needs no reboot.
+  ARCHUP_MODULES_ROOT="$ARCHUP_MOCK_ROOT/modules"
+  ARCHUP_KERNEL_RELEASE="6.0.0-mock-arch1-1"
+  ARCHUP_KERNEL_RELEASE_STATUS=0
+  mkdir -p "$ARCHUP_MODULES_ROOT/$ARCHUP_KERNEL_RELEASE/kernel"
   ARCHUP_SYSTEMCTL_LOG="$ARCHUP_MOCK_ROOT/systemctl-commands.log"
   : >"$ARCHUP_SYSTEMCTL_LOG"
   declare -gA ARCHUP_ACTIVE_SINCE=()
@@ -87,6 +99,12 @@ _archup_mock_reset() {
 
 archup_is_root() {
   ((ARCHUP_IS_ROOT != 0))
+}
+
+# Never consult the host's uname: the fixture names the running release.
+archup_running_kernel_release() {
+  ((ARCHUP_KERNEL_RELEASE_STATUS == 0)) || return "$ARCHUP_KERNEL_RELEASE_STATUS"
+  printf '%s\n' "$ARCHUP_KERNEL_RELEASE"
 }
 
 _archup_mock_add_package() {
@@ -122,6 +140,25 @@ _archup_mock_add_debug_file() {
   : >"$file"
   ARCHUP_PACKAGE_FILES["$pkg"]+=$'\n'"$file"
   ARCHUP_LDD_REJECTED_FILES+=" $file"
+}
+
+# Add another dynamically linked ELF file, at a caller-chosen name below the
+# package's fixture root, to an existing package.
+_archup_mock_add_elf_file() {
+  local pkg="$1" name="$2" libs="$3"
+  local file="$ARCHUP_MOCK_ROOT/$pkg/$name"
+
+  mkdir -p "$(dirname "$file")"
+  : >"$file"
+  ARCHUP_PACKAGE_FILES["$pkg"]+=$'\n'"$file"
+  case "$libs" in
+    broken) ARCHUP_LDD_OUTPUT["$file"]=$'libgone.so.1 => not found' ;;
+    ok) ARCHUP_LDD_OUTPUT["$file"]=$'libok.so => /usr/lib/libok.so' ;;
+    *)
+      echo "unknown mock lib state: $libs" >&2
+      return 2
+      ;;
+  esac
 }
 
 _archup_mock_add_service() {
@@ -267,19 +304,56 @@ yay() {
   printf '%s\n' "$*" >>"$ARCHUP_YAY_COMMAND_LOG"
 }
 
+# Mirrors `file -N -r -0 -f -`: names arrive on stdin, one per line, and each
+# is answered by one "name\0: description\n" record in input order. Every
+# invocation is logged so tests can prove the scan batches a whole package.
 file() {
+  local name desc
+  local -a names=()
+
+  printf '%s\n' "$*" >>"$ARCHUP_FILE_COMMAND_LOG"
+  [[ "$*" == "-N -r -0 -f -" ]] || {
+    printf 'unexpected file args: %s\n' "$*" >&2
+    return 2
+  }
   if ((ARCHUP_FILE_STATUS != 0)); then
-    printf 'mock file inspection failed for %s\n' "${2:-}" >&2
+    printf 'mock file inspection failed\n' >&2
     return "$ARCHUP_FILE_STATUS"
   fi
-  if [[ "$1" == *.service ]]; then
-    printf 'ASCII text\n'
-    return
-  fi
-  printf 'ELF 64-bit LSB pie executable, dynamically linked\n'
+  while IFS= read -r name; do
+    names+=("$name")
+  done
+  # Simulate output that no longer pairs one record with each input name: in
+  # count (drop-last, extra), in order (swap), or in the name echoed back for
+  # the first or last record (rename-first, rename-last).
+  case "$ARCHUP_FILE_OUTPUT_FAULT" in
+    drop-last) unset "names[$((${#names[@]} - 1))]" ;;
+    extra) names+=("${names[0]}") ;;
+    swap)
+      name="${names[0]}"
+      names[0]="${names[1]}"
+      names[1]="$name"
+      ;;
+    rename-first) names[0]+=".other" ;;
+    rename-last) names[${#names[@]} - 1]+=".other" ;;
+  esac
+  for name in ${names[@]+"${names[@]}"}; do
+    if [[ -n "${ARCHUP_FILE_DESCRIPTIONS[$name]+set}" ]]; then
+      desc="${ARCHUP_FILE_DESCRIPTIONS[$name]}"
+    elif [[ "$name" == *.service ]]; then
+      desc="ASCII text"
+    else
+      desc="ELF 64-bit LSB pie executable, dynamically linked"
+    fi
+    printf '%s\0: %s\n' "$name" "$desc"
+  done
+  # A stray NUL after the last record, or a failure after complete output.
+  [[ "$ARCHUP_FILE_OUTPUT_FAULT" != trailing-nul ]] || printf '\0'
+  [[ "$ARCHUP_FILE_OUTPUT_FAULT" != fail-after-output ]] || return 3
 }
 
 ldd() {
+  printf '%s\n' "$1" >>"$ARCHUP_LDD_COMMAND_LOG"
   if ((ARCHUP_LDD_STATUS != 0)); then
     printf 'mock ldd inspection failed for %s\n' "$1" >&2
     return "$ARCHUP_LDD_STATUS"
@@ -465,7 +539,33 @@ sudo_commands=$(cat "$ARCHUP_SUDO_COMMAND_LOG")
 _assert_contains "archup root: warms the invoking user's sudo credential" \
   "-u chris -H -- sudo -v" "$sudo_commands"
 _assert_contains "archup root: runs yay as the invoking non-root user" \
-  "-u chris -H -- yay -Syu --devel --noconfirm" "$sudo_commands"
+  "-u chris -H -- yay -Syu --devel --sudoloop --noconfirm" "$sudo_commands"
+
+# A long AUR build outlives the build user's sudo timestamp, so yay must keep
+# it fresh itself when it was started from root.
+_archup_mock_reset
+_archup_mock_add_package root-rebuild 1 broken
+ARCHUP_IS_ROOT=1
+SUDO_USER=chris
+# shellcheck disable=SC2119 # The sysup driver passes upgrade args; this call has none.
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_contains "archup root: the AUR rebuild keeps the build user's sudo alive" \
+  "-u chris -H -- yay -S --aur --rebuild --redownload --answerclean All --sudoloop --noconfirm root-rebuild" \
+  "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+_assert_contains "archup root: the AUR membership query runs as the build user" \
+  "-u chris -H -- yay -Si --aur root-rebuild" "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+_assert_eq "archup root: the AUR membership query needs no sudo loop" \
+  "" "$(grep -e '-Si' "$ARCHUP_SUDO_COMMAND_LOG" | grep -e '--sudoloop' || true)"
+
+_archup_mock_reset
+_archup_mock_add_package user-rebuild 1 broken
+# shellcheck disable=SC2119 # The sysup driver passes upgrade args; this call has none.
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_not_contains "archup non-root: yay runs without a sudo loop" \
+  "--sudoloop" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+_assert_contains "archup non-root: the rebuild still runs" \
+  "-S --aur --rebuild --redownload --answerclean All --noconfirm user-rebuild" \
+  "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
 
 _archup_mock_reset
 _archup_mock_add_package root-explicit-user 1 ok
@@ -475,19 +575,74 @@ export SUDO_USER=root
 sysup_backend_upgrade >/dev/null
 sudo_commands=$(cat "$ARCHUP_SUDO_COMMAND_LOG")
 _assert_contains "archup root: explicit user overrides an unusable SUDO_USER" \
-  "-u chris -H -- yay -Syu --devel --noconfirm" "$sudo_commands"
+  "-u chris -H -- yay -Syu --devel --sudoloop --noconfirm" "$sudo_commands"
+
+# A root shell from `sudo -i` or `su` names no build user at all. Repository
+# packages still upgrade; AUR packages are skipped rather than built as root.
+for sudo_user in "" root; do
+  _archup_mock_reset
+  _archup_mock_add_package root-no-user 1 broken
+  ARCHUP_IS_ROOT=1
+  SUDO_USER="$sudo_user"
+  set +e
+  result=$(sysup_backend_upgrade --confirm 2>&1)
+  status=$?
+  set -e
+  _assert_eq "archup root: no AUR user (SUDO_USER='$sudo_user') upgrades repositories" \
+    "0" "$status"
+  _assert_eq "archup root: no AUR user (SUDO_USER='$sudo_user') falls back to pacman" \
+    "-Syu --confirm" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+  _assert_eq "archup root: no AUR user (SUDO_USER='$sudo_user') never runs yay" \
+    "" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+  _assert_not_contains "archup root: no AUR user (SUDO_USER='$sudo_user') runs no build user" \
+    "-u " "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+  _assert_contains "archup root: no AUR user (SUDO_USER='$sudo_user') warns AUR is skipped" \
+    "warning: running as root with no non-root AUR user (set SYSUP_ARCH_USER); skipping AUR packages" \
+    "$result"
+done
 
 _archup_mock_reset
+_archup_mock_add_package root-no-user 1 ok
 ARCHUP_IS_ROOT=1
+set +e
+result=$(sysup_backend_upgrade 2>/dev/null)
+set -e
+_assert_not_contains "archup root: the no-AUR-user warning goes to stderr" \
+  "warning:" "$result"
+
+# SUDO_USER naming an account that does not exist is a named user, not an
+# absent one, so it fails closed rather than falling back.
+_archup_mock_reset
+_archup_mock_add_package root-missing-sudo-user 1 ok
+ARCHUP_IS_ROOT=1
+SUDO_USER="missing-user"
 set +e
 result=$(sysup_backend_upgrade 2>&1)
 status=$?
 set -e
-_assert_eq "archup root: ambiguous AUR ownership fails closed" "1" "$status"
-_assert_contains "archup root: ambiguous ownership explains the explicit override" \
-  "SYSUP_ARCH_USER" "$result"
-_assert_not_contains "archup root: never invokes yay as root" \
-  "-Syu" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+_assert_eq "archup root: a nonexistent SUDO_USER fails closed" "1" "$status"
+_assert_eq "archup root: a nonexistent SUDO_USER runs no pacman upgrade" \
+  "" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+# The fallback is for an absent user only. A user the operator named
+# explicitly but cannot be used still fails before any package manager runs.
+for arch_user in root missing-user; do
+  _archup_mock_reset
+  _archup_mock_add_package root-bad-user 1 ok
+  ARCHUP_IS_ROOT=1
+  SYSUP_ARCH_USER="$arch_user"
+  set +e
+  result=$(sysup_backend_upgrade 2>&1)
+  status=$?
+  set -e
+  _assert_eq "archup root: SYSUP_ARCH_USER=$arch_user fails closed" "1" "$status"
+  _assert_eq "archup root: SYSUP_ARCH_USER=$arch_user runs no pacman upgrade" \
+    "" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+  _assert_eq "archup root: SYSUP_ARCH_USER=$arch_user runs no yay" \
+    "" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+  _assert_not_contains "archup root: SYSUP_ARCH_USER=$arch_user is not a silent fallback" \
+    "skipping AUR packages" "$result"
+done
 
 _archup_mock_reset
 ARCHUP_IS_ROOT=1
@@ -511,6 +666,10 @@ _assert_contains "archup usage: documents failed-unit reporting last" \
   "report failed systemd units" "$usage"
 _assert_contains "archup usage: documents root AUR ownership" \
   "SYSUP_ARCH_USER" "$usage"
+_assert_contains "archup usage: documents the root repository-only fallback" \
+  "skipped with a warning" "$usage"
+_assert_contains "archup usage: documents the reboot check" \
+  "report whether the running kernel needs a reboot" "$usage"
 
 echo ""
 echo "=== archup: pending package configuration ==="
@@ -553,6 +712,103 @@ _assert_contains "archup pending config: missing pacdiff is actionable" \
   "install pacman-contrib" "$result"
 _assert_not_contains "archup pending config: missing pacdiff never claims an all-clear" \
   "ok: no config files" "$result"
+
+echo ""
+echo "=== archup: reboot required ==="
+
+_archup_mock_reset
+result=$(report_reboot_required 2>&1)
+_assert_contains "archup reboot: present modules for the running kernel need no reboot" \
+  "ok: no reboot required" "$result"
+_assert_not_contains "archup reboot: present modules are not reported as pending" \
+  "reboot required to complete" "$result"
+
+# Upgrading the kernel package deletes the running release's modules.
+_archup_mock_reset
+mkdir -p "$ARCHUP_MODULES_ROOT/6.1.0-mock-arch1-1/kernel"
+rm -rf "${ARCHUP_MODULES_ROOT:?}/$ARCHUP_KERNEL_RELEASE"
+result=$(report_reboot_required 2>&1)
+_assert_contains "archup reboot: missing modules for the running kernel need a reboot" \
+  "reboot required to complete this upgrade" "$result"
+_assert_not_contains "archup reboot: missing modules never claim an all-clear" \
+  "ok: no reboot required" "$result"
+
+# pacman leaves a release directory behind while unowned files remain in it
+# (depmod indexes, DKMS updates/), but its kernel/ tree is gone.
+_archup_mock_reset
+rm -rf "${ARCHUP_MODULES_ROOT:?}/$ARCHUP_KERNEL_RELEASE/kernel"
+mkdir -p "$ARCHUP_MODULES_ROOT/$ARCHUP_KERNEL_RELEASE/updates"
+: >"$ARCHUP_MODULES_ROOT/$ARCHUP_KERNEL_RELEASE/modules.weakdep"
+result=$(report_reboot_required 2>&1)
+_assert_contains "archup reboot: a leftover release directory still needs a reboot" \
+  "reboot required to complete this upgrade" "$result"
+
+_archup_mock_reset
+ARCHUP_KERNEL_RELEASE_STATUS=1
+set +e
+result=$(report_reboot_required 2>&1)
+status=$?
+set -e
+_assert_eq "archup reboot: an unknown kernel release is advisory" "0" "$status"
+_assert_contains "archup reboot: an unknown kernel release is reported as unknown" \
+  "warning: could not determine whether a reboot is required" "$result"
+_assert_not_contains "archup reboot: an unknown kernel release never claims an all-clear" \
+  "ok: no reboot required" "$result"
+_assert_not_contains "archup reboot: an unknown kernel release never claims a reboot" \
+  "reboot required to complete" "$result"
+
+_archup_mock_reset
+ARCHUP_KERNEL_RELEASE=""
+result=$(report_reboot_required 2>&1)
+_assert_contains "archup reboot: an empty kernel release is reported as unknown" \
+  "could not determine whether a reboot is required" "$result"
+
+# A container runs the host's kernel and ships no modules tree at all.
+_archup_mock_reset
+rm -rf "$ARCHUP_MODULES_ROOT"
+result=$(report_reboot_required 2>&1)
+_assert_contains "archup reboot: a missing modules root is reported as unknown" \
+  "could not determine whether a reboot is required" "$result"
+_assert_not_contains "archup reboot: a missing modules root never claims a reboot" \
+  "reboot required to complete" "$result"
+
+# The check is advisory in the full run: it never changes the exit status,
+# whether or not a reboot is pending, and it runs under --check-only too.
+for reboot_case in present missing; do
+  for run_mode in upgrade check-only; do
+    _archup_mock_reset
+    _archup_mock_add_package steady-pkg 1 ok 1.0
+    if [[ "$reboot_case" == missing ]]; then
+      rm -rf "${ARCHUP_MODULES_ROOT:?}/$ARCHUP_KERNEL_RELEASE"
+      expected="reboot required to complete this upgrade"
+    else
+      expected="ok: no reboot required"
+    fi
+    run_args=()
+    [[ "$run_mode" == upgrade ]] || run_args=(--check-only)
+    set +e
+    result=$(sysup_main ${run_args[@]+"${run_args[@]}"} 2>&1)
+    status=$?
+    set -e
+    _assert_eq "archup reboot: $reboot_case modules leave a $run_mode run successful" \
+      "0" "$status"
+    _assert_contains "archup reboot: $run_mode run reports $reboot_case modules" \
+      "$expected" "$result"
+  done
+done
+
+# Advisory status must not mask a fatal check that ran before it.
+_archup_mock_reset
+_archup_mock_add_package broken-local 0 broken
+rm -rf "${ARCHUP_MODULES_ROOT:?}/$ARCHUP_KERNEL_RELEASE"
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "archup reboot: a pending reboot keeps a failed library scan failing" \
+  "1" "$status"
+_assert_contains "archup reboot: a failed library scan still reports the reboot" \
+  "reboot required to complete this upgrade" "$result"
 
 echo ""
 echo "=== archup: missing-library scan failures ==="
@@ -607,6 +863,109 @@ _assert_contains "archup scan: foreign-package query failure is actionable" \
   "could not list foreign packages" "$result"
 _assert_not_contains "archup scan: foreign-package query failure never claims an all-clear" \
   "ok: no missing shared libraries" "$result"
+
+# Batched output is paired with its input by name, so a missing, extra,
+# reordered, or misnamed record, or a failed `file`, leaves the scan
+# unverified instead of misattributing a type.
+for file_fault in drop-last extra swap rename-first rename-last trailing-nul \
+  fail-after-output; do
+  _archup_mock_reset
+  _archup_mock_add_package garbled-file-output 1 ok
+  _archup_mock_add_elf_file garbled-file-output lib/libextra.so ok
+  _archup_mock_add_elf_file garbled-file-output lib/libthird.so ok
+  ARCHUP_FILE_OUTPUT_FAULT="$file_fault"
+  set +e
+  result=$(scan_missing_libs 2>&1)
+  status=$?
+  set -e
+  _assert_eq "archup scan: $file_fault file output fails the check" "1" "$status"
+  _assert_contains "archup scan: $file_fault file output is actionable" \
+    "could not identify files owned by garbled-file-output" "$result"
+  _assert_eq "archup scan: $file_fault file output inspects no libraries" \
+    "" "$(cat "$ARCHUP_LDD_COMMAND_LOG")"
+done
+
+echo ""
+echo "=== archup: batched file identification ==="
+
+# One `file` call covers every regular file of a package, including names with
+# spaces, glob characters, and the ": " separator `file` itself prints, and each ELF file
+# still gets its own ldd check in package order.
+_archup_mock_reset
+_archup_mock_add_package multi-elf 1 ok
+_archup_mock_add_elf_file multi-elf "lib/lib with spaces.so" broken
+_archup_mock_add_elf_file multi-elf "lib/odd: name.so" ok
+_archup_mock_add_elf_file multi-elf "bin/second tool" broken
+_archup_mock_add_elf_file multi-elf "lib/glob[*]?.so" ok
+_archup_mock_add_service multi-elf multi.service
+_archup_mock_add_package single-elf 1 ok
+set +e
+result=$(scan_foreign_package_libs report 2>&1)
+status=$?
+set -e
+_assert_eq "archup batch: a broken file in a multi-file package is found" "1" "$status"
+_assert_eq "archup batch: one file invocation per package" \
+  $'-N -r -0 -f -\n-N -r -0 -f -' "$(cat "$ARCHUP_FILE_COMMAND_LOG")"
+_assert_eq "archup batch: ldd runs once per regular ELF file, in package order" \
+  "$(printf '%s\n' "$ARCHUP_MOCK_ROOT/multi-elf/bin/multi-elf" \
+    "$ARCHUP_MOCK_ROOT/multi-elf/lib/lib with spaces.so" \
+    "$ARCHUP_MOCK_ROOT/multi-elf/lib/odd: name.so" \
+    "$ARCHUP_MOCK_ROOT/multi-elf/bin/second tool" \
+    "$ARCHUP_MOCK_ROOT/multi-elf/lib/glob[*]?.so" \
+    "$ARCHUP_MOCK_ROOT/single-elf/bin/single-elf")" \
+  "$(cat "$ARCHUP_LDD_COMMAND_LOG")"
+_assert_eq "archup batch: report output names each broken file under its package" \
+  "$(printf '%s\n' "broken libraries in multi-elf:" \
+    "  $ARCHUP_MOCK_ROOT/multi-elf/lib/lib with spaces.so" \
+    "    libgone.so.1 => not found" \
+    "  $ARCHUP_MOCK_ROOT/multi-elf/bin/second tool" \
+    "    libgone.so.1 => not found")" \
+  "$result"
+
+result=$(scan_foreign_package_libs packages) || true
+_assert_eq "archup batch: package mode names a multi-file package once" \
+  "multi-elf" "$result"
+
+# `file -r` quotes file contents raw, so a description can hold a newline or
+# ": "; the NUL-delimited pairing must still attribute it to the right file.
+_archup_mock_reset
+_archup_mock_add_package odd-description 1 broken
+_archup_mock_add_elf_file odd-description lib/libnext.so ok
+ARCHUP_FILE_DESCRIPTIONS["$ARCHUP_MOCK_ROOT/odd-description/bin/odd-description"]=$'ELF 64-bit LSB executable, dynamically linked, interpreter /lib/ld\nfake: line'
+set +e
+result=$(scan_foreign_package_libs report 2>&1)
+status=$?
+set -e
+_assert_eq "archup batch: a multi-line description is still classified" "1" "$status"
+_assert_contains "archup batch: a multi-line description keeps its file's ldd result" \
+  "  $ARCHUP_MOCK_ROOT/odd-description/bin/odd-description"$'\n'"    libmissing.so => not found" \
+  "$result"
+_assert_not_contains "archup batch: a multi-line description is not unverified" \
+  "could not identify" "$result"
+
+# Real `file` never prints an empty description, and command substitution
+# would drop an empty last one, so it fails closed rather than shifting.
+_archup_mock_reset
+_archup_mock_add_package empty-description 1 ok
+_archup_mock_add_elf_file empty-description lib/libtail.so ok
+ARCHUP_FILE_DESCRIPTIONS["$ARCHUP_MOCK_ROOT/empty-description/lib/libtail.so"]=""
+set +e
+result=$(scan_missing_libs 2>&1)
+status=$?
+set -e
+_assert_eq "archup batch: an empty last description fails the check" "1" "$status"
+_assert_contains "archup batch: an empty last description is unverified" \
+  "could not identify files owned by empty-description" "$result"
+
+# A package with no regular files on disk needs no file call at all.
+_archup_mock_reset
+_archup_mock_add_package fileless 1 ok
+ARCHUP_PACKAGE_FILES[fileless]="$ARCHUP_MOCK_ROOT/fileless/"
+result=$(scan_missing_libs 2>&1)
+_assert_contains "archup batch: a package without regular files scans clean" \
+  "ok: no missing shared libraries" "$result"
+_assert_eq "archup batch: a package without regular files skips file" \
+  "" "$(cat "$ARCHUP_FILE_COMMAND_LOG")"
 
 echo ""
 echo "=== archup: hosts without foreign packages ==="

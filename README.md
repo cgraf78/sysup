@@ -85,8 +85,11 @@ when available or `pacman -Syu` otherwise, and scans foreign-package ELF files
 for missing shared libraries. After a successful upgrade it removes orphaned
 dependencies (`pacman -Qdtq`) with `pacman -Rn`, one layer at a time, so
 optional dependencies still count as required. It also reports `.pacnew` and
-`.pacsave` files that await manual review when `pacdiff` is available. Broken
-AUR packages are rebuilt and their active services are restarted even when the
+`.pacsave` files that await manual review when `pacdiff` is available, and
+reports that a reboot is required when the running kernel's module tree
+under `/usr/lib/modules` is gone, as it is after a kernel package upgrade;
+both reports are advisory and never change the exit status. Broken AUR
+packages are rebuilt and their active services are restarted even when the
 rebuilt package version is unchanged.
 
 Package operations are noninteractive by default. Pass `--confirm` after `--`
@@ -97,10 +100,16 @@ database, while cleanup operates on the default host database. Run plain
 
 When `sysup` is started from an interactive root shell, it never runs `yay` as
 root. It uses the non-root account in `SYSUP_ARCH_USER`, falling back to
-`SUDO_USER` when that is unset, and warms that account's sudo credential
-before starting the upgrade. An unattended root invocation therefore fails
-closed unless the account already has noninteractive sudo authorization;
-`sysup --check-only` remains suitable for unattended diagnostics.
+`SUDO_USER` when that is unset, warms that account's sudo credential before
+starting the upgrade, and passes `yay --sudoloop` so a long AUR build does not
+outlive it. An unattended root invocation that names an AUR account
+therefore fails closed unless the account already has noninteractive sudo
+authorization; `sysup --check-only` remains suitable for unattended
+diagnostics. With `yay` installed, `SYSUP_ARCH_USER` naming root or a missing
+account is an error. When neither variable names a non-root account (a
+`su -` shell or root login, where `SUDO_USER` is unset or root), `sysup` warns
+that AUR packages are skipped and upgrades repository packages with
+`pacman -Syu`.
 
 ### Debian and Ubuntu
 
@@ -161,8 +170,8 @@ ordering.
 
 Upgrading a supported host requires Bash 4 or newer, `sudo` for privilege
 transitions, and the host's normal package tools. The Arch path additionally uses
-`file`, `id`, `ldd`, and `sort`; `yay` and `pacdiff` from `pacman-contrib` are
-optional. The Debian path uses `apt-get`,
+`file`, `id`, `ldd`, `sort`, and `uname`; `yay` and `pacdiff` from
+`pacman-contrib` are optional. The Debian path uses `apt-get`,
 `apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
 optional. The Fedora path uses `dnf`, `rpm`, `find`, and `sort`; the
 `needs-restarting` plugin (dnf-plugins-core or dnf5-plugins) is optional.

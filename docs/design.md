@@ -192,6 +192,44 @@ provider's `lib/sysup` directory, never through `PATH`. A shdeps link, manual
 install, or worktree invocation therefore dispatches within one coherent
 checkout.
 
+## `archup` behavior
+
+Upgrade with `yay -Syu --devel`, or `pacman -Syu` when `yay` is absent, then
+rebuild installed AUR packages whose ELF files have missing libraries. As
+root, `yay` runs as the non-root user in `SYSUP_ARCH_USER` (else
+`SUDO_USER`) with `--sudoloop`, so that user's sudo credential, warmed once
+before the upgrade, does not expire during a long build. With `yay`
+installed, a named user that is root or does not exist fails the run before
+any package manager starts. When
+no user is named at all (both unset, or `SUDO_USER=root` from sudo in a
+root shell),
+`archup` warns that AUR packages are skipped and upgrades repository packages
+with `pacman -Syu` rather than failing the whole upgrade.
+
+The missing-library scan runs `file -N -r -0 -f -` once per foreign package,
+feeding names on stdin so a large package cannot exceed the argument limit.
+It splits the output on NUL and requires each record to start with the name
+it was given, because a raw description can itself contain a newline or
+`: `. Output that does not pair one record with each name leaves the scan
+unverified. `ldd` still runs per dynamically linked ELF file.
+
+Checks:
+
+| Check | Severity |
+| --- | --- |
+| Missing shared libraries in foreign packages | fatal |
+| Pending `.pacnew`/`.pacsave` merges (`pacdiff --output`) | advisory |
+| Reboot required (`/usr/lib/modules/$(uname -r)/kernel` missing) | advisory |
+| Failed systemd units | fatal |
+
+Arch writes no reboot-required flag, but a kernel package upgrade deletes the
+running release's module tree, which is exactly the state a reboot resolves.
+The check tests the release's `kernel/` subdirectory because pacman keeps the
+release directory while unowned files (depmod indexes, DKMS `updates/`)
+remain in it. A missing modules root (a container running the host's kernel) or an
+unavailable or empty release reports reboot state as unknown rather than
+required.
+
 ## `debup` behavior
 
 Upgrade, as root, with `DEBIAN_FRONTEND=noninteractive`:
@@ -309,9 +347,9 @@ or excluded packages are not listed the way `debup` lists held packages.
 
 - `common-test` drives the shared driver with a fake backend: argument
   rejection, the sudo keeper's lifecycle, and lock waits.
-- `archup-test` covers the extracted shared hooks, AUR decisions, orphan
-  removal, library scanning, package diffs, service restarts, and partial
-  failures.
+- `archup-test` covers the extracted shared hooks, AUR decisions and the root
+  build-user policy, orphan removal, batched library scanning, the reboot
+  check, package diffs, service restarts, and partial failures.
 - `debup-test` mocks `apt-get`, `dpkg`, `dpkg-query`, and `systemctl` to cover
   the upgrade verb, default autoremove and its opt-out, each check, and
   `needrestart` preference.

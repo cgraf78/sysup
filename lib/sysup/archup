@@ -24,8 +24,28 @@ ARCHUP_CONFIRMATION_ARG=--noconfirm
 # Upper bound on orphan-removal passes; real dependency chains are shallow.
 ARCHUP_ORPHAN_PASSES="${ARCHUP_ORPHAN_PASSES:-10}"
 
+# Where kernel packages install their modules, one directory per release.
+# Overridable so tests never read the host's kernel state.
+ARCHUP_MODULES_ROOT="${ARCHUP_MODULES_ROOT:-/usr/lib/modules}"
+
 archup_is_root() {
   ((EUID == 0))
+}
+
+# A function rather than a bare `uname -r` so tests can pin the release
+# without depending on the kernel the suite happens to run under.
+archup_running_kernel_release() {
+  uname -r
+}
+
+# Whether the operator named an AUR build user for a root run. Only the
+# complete absence of one (SUDO_USER unset after `su -` or a root login, or
+# root when sudo ran from a root shell) permits
+# the repository-only fallback; a named but unusable user still fails closed
+# in archup_yay_user, because the operator asked for AUR upgrades.
+archup_aur_user_named() {
+  [[ -n "${SYSUP_ARCH_USER:-}" ]] && return 0
+  [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]
 }
 
 archup_yay_user() {
@@ -134,7 +154,8 @@ Default flow:
   4. rebuild installed AUR packages whose ELF files have missing libraries
   5. remove orphaned dependencies no installed package still requires,
      counting optional dependencies as required
-  6. report pending .pacnew/.pacsave merges and check shared libraries
+  6. check shared libraries, report pending .pacnew/.pacsave merges, and
+     report whether the running kernel needs a reboot
   7. restart active services shipped by packages upgraded or rebuilt in this run
   8. optionally restart failed enabled units with --restart-failed
   9. report failed systemd units when systemd is available
@@ -151,7 +172,10 @@ by default; pass --confirm after -- to restore package-manager prompts.
 When invoked as root, yay runs as the non-root user named by SYSUP_ARCH_USER,
 or by SUDO_USER when SYSUP_ARCH_USER is unset. The user must be able to
 authenticate sudo interactively; unattended root AUR upgrades fail closed
-instead of building packages as root.
+instead of building packages as root. With yay installed, SYSUP_ARCH_USER
+naming root or a missing user is an error. When neither variable names a
+non-root user, AUR packages are skipped with a warning and pacman upgrades
+repository packages only.
 EOF
 }
 
@@ -272,8 +296,9 @@ warn_non_aur_foreign_packages() {
 # binaries no longer load, so scan the ones built locally.
 scan_foreign_package_libs() {
   local mode="${1:-report}"
-  local packages pkg listing file desc dependencies missing line
-  local found=0 pkg_printed
+  local packages pkg listing file described desc dependencies missing line
+  local found=0 pkg_printed index
+  local -a files=() descs=()
 
   if ! packages="$(foreign_packages)"; then
     printf 'error: could not list foreign packages; missing-library state is unverified\n' >&2
@@ -290,14 +315,33 @@ scan_foreign_package_libs() {
       return 2
     fi
 
+    files=()
     while IFS= read -r file; do
-      [[ -f "$file" ]] || continue
+      [[ -f "$file" ]] && files+=("$file")
+    done <<<"$listing"
+    ((${#files[@]})) || continue
 
-      if ! desc="$(file -b "$file")"; then
-        printf 'error: could not identify %s with file; missing-library state is unverified\n' \
-          "$file" >&2
-        return 2
-      fi
+    # One `file` process per package rather than per file: the scan runs
+    # twice per run over every file of every foreign package, and process
+    # startup dominated it.
+    if ! described="$(_archup_describe_files "${files[@]}")"; then
+      printf 'error: could not identify files owned by %s with file; missing-library state is unverified\n' \
+        "$pkg" >&2
+      return 2
+    fi
+    descs=()
+    mapfile -t descs <<<"$described"
+    # Each description is one line, so only an empty last description (which
+    # command substitution drops) can leave the counts unequal.
+    if ((${#descs[@]} != ${#files[@]})); then
+      printf 'error: could not identify files owned by %s with file; missing-library state is unverified\n' \
+        "$pkg" >&2
+      return 2
+    fi
+
+    for index in "${!files[@]}"; do
+      file="${files[index]}"
+      desc="${descs[index]}"
       [[ "$desc" == *ELF* ]] || continue
       # Static executables and relocatable objects have no runtime shared-library
       # dependencies; ldd legitimately rejects them.
@@ -343,10 +387,59 @@ scan_foreign_package_libs() {
         printf '    %s\n' "$line"
       done <<<"$missing"
       found=1
-    done <<<"$listing"
+    done
   done <<<"$packages"
 
   ((found == 0))
+}
+
+# Print one `file` description per line for the files named in "$@", in
+# order, or fail when `file` fails or its output cannot be paired with them.
+#
+# Names go in on stdin (-f -) instead of argv, so a large package cannot
+# exceed the argument-length limit, and the shell fixtures in the tests still
+# intercept the call (xargs would exec the real binary). pacman's listing is
+# newline-delimited, so no owned name contains a newline, which is all -f
+# needs. -N drops alignment padding and -r keeps name bytes raw so each name
+# matches what was sent.
+_archup_describe_files() {
+  printf '%s\n' "$@" | file -N -r -0 -f - | _archup_pair_file_output "$@"
+}
+
+# Pair `file -N -r -0` output with the names in "$@".
+#
+# Each record is "name\0: description\n". Under -r the description is raw too,
+# and it quotes file contents (an ELF interpreter string, say), so it can hold
+# a newline or ": ", and neither can delimit records. A NUL can appear in
+# neither a name nor a description, so the stream splits on NUL into the first
+# name, then one ": description\n<next name>" chunk per file, the last without
+# a following name. Every chunk must match the name expected next; any other
+# shape leaves the pairing unknown, and attributing a description to the wrong
+# file could hide a broken binary. Descriptions are printed with newlines
+# folded to spaces: callers match substrings and need one line per file.
+_archup_pair_file_output() {
+  local -a names=("$@")
+  local chunk desc next index
+
+  IFS= read -r -d '' chunk || return 1
+  [[ "$chunk" == "${names[0]}" ]] || return 1
+  for ((index = 0; index < ${#names[@]}; index++)); do
+    if ((index + 1 < ${#names[@]})); then
+      IFS= read -r -d '' chunk || return 1
+      next="${names[index + 1]}"
+      [[ "$chunk" == ": "*$'\n'"$next" ]] || return 1
+      desc="${chunk%$'\n'"$next"}"
+    else
+      # The last record runs to end of input; a further NUL means extra output.
+      if IFS= read -r -d '' chunk; then
+        return 1
+      fi
+      [[ "$chunk" == ": "*$'\n' ]] || return 1
+      desc="${chunk%$'\n'}"
+    fi
+    desc="${desc#: }"
+    printf '%s\n' "${desc//$'\n'/ }"
+  done
 }
 
 broken_foreign_packages() {
@@ -425,6 +518,49 @@ report_pending_pacman_configs() {
   fi
 }
 
+# Arch keeps one kernel per package, so upgrading it deletes the running
+# release's module directory. The running kernel then cannot load a module it
+# has not already loaded (a USB drive's filesystem, a VPN's tunnel device), so
+# a missing directory is exactly the state a reboot resolves. Arch writes no
+# reboot-required flag the way Ubuntu does, so this is the direct signal.
+#
+# Test the release's kernel/ tree, not the release directory: pacman removes
+# a directory only once it is empty, so unowned leftovers (depmod's index
+# files, DKMS's updates/) keep it alive after the package is gone. Both Arch
+# kernel packages and `make modules_install` create kernel/, and DKMS never
+# writes there.
+#
+# Return 0 when a reboot is required, 1 when not, 2 when it cannot be told.
+# The modules root itself missing (a container, which runs the host's kernel)
+# says nothing about this host's kernel, so it is unknown rather than
+# "required".
+archup_reboot_required() {
+  local release
+
+  release="$(archup_running_kernel_release 2>/dev/null)" || return 2
+  [[ -n "$release" ]] || return 2
+  [[ -d "$ARCHUP_MODULES_ROOT" ]] || return 2
+  [[ -d "$ARCHUP_MODULES_ROOT/$release/kernel" ]] && return 1
+  return 0
+}
+
+# Advisory, like debup's report: a pending reboot is the expected result of a
+# kernel upgrade, not a failure, so it never changes the exit status.
+report_reboot_required() {
+  local status=0
+
+  sysup_log "checking whether a reboot is required"
+  archup_reboot_required || status=$?
+  case "$status" in
+    0) printf 'reboot required to complete this upgrade\n' ;;
+    1) printf 'ok: no reboot required\n' ;;
+    *)
+      printf 'warning: could not determine whether a reboot is required; the running kernel release or %s is unavailable\n' \
+        "$ARCHUP_MODULES_ROOT" >&2
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # sysup backend hooks
 # ---------------------------------------------------------------------------
@@ -465,7 +601,10 @@ sysup_backend_checks() {
   local status=0
 
   scan_missing_libs || status=$?
+  # Advisory: pending config merges and a pending reboot are expected output
+  # from a successful upgrade, so neither changes the exit status.
   report_pending_pacman_configs
+  report_reboot_required
   return "$status"
 }
 
@@ -538,10 +677,11 @@ sysup_backend_autoremove() {
 sysup_backend_upgrade() {
   local confirmation_arg=--noconfirm arg
   local -a upgrade_args=()
+  local -a yay_install_args=()
   local -a broken_packages=()
   local -a rebuild_targets=()
   local broken_output="" rebuild_output=""
-  local scan_status=0 rebuild_status=0
+  local scan_status=0 rebuild_status=0 repo_only=0
 
   # yay tracks its own no-confirm state separately from the options it passes
   # to pacman, so giving it both flags restores pacman's prompt but not yay's
@@ -557,49 +697,74 @@ sysup_backend_upgrade() {
 
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
 
-  if command -v yay >/dev/null 2>&1; then
-    archup_prepare_yay || return
-    archup_run_yay -Syu --devel "${upgrade_args[@]}" || return
+  if ! command -v yay >/dev/null 2>&1; then
+    sysup_log "yay not found; upgrading repository packages only"
+    repo_only=1
+  elif archup_is_root && ! archup_aur_user_named; then
+    # A root shell from `su -` or a root login names no build user, and yay
+    # must never build as root. Failing the whole run would leave repository
+    # packages (and their security fixes) unapplied as well, so upgrade those
+    # and say plainly that AUR packages were left alone.
+    printf 'warning: running as root with no non-root AUR user (set SYSUP_ARCH_USER); skipping AUR packages because yay must not build as root\n' >&2
+    sysup_log "upgrading repository packages only"
+    repo_only=1
+  fi
+  if ((repo_only)); then
+    sysup_run_as_root pacman -Syu "${upgrade_args[@]}"
+    return
+  fi
 
-    broken_output="$(broken_foreign_packages)" || scan_status=$?
-    if ((scan_status != 0)); then
-      printf 'warning: automatic AUR rebuild scan was incomplete; continuing to post-upgrade checks\n' >&2
-      warn_non_aur_foreign_packages
-      return 0
-    fi
-    if [[ -n "$broken_output" ]]; then
-      mapfile -t broken_packages <<<"$broken_output"
-    fi
-    if ((${#broken_packages[@]} == 0)); then
-      sysup_log "no broken foreign package libraries found after upgrade"
-      warn_non_aur_foreign_packages
-      return
-    fi
+  # From root, yay runs as the build user and reaches pacman through that
+  # user's sudo, warmed once by archup_prepare_yay. sudo's credential cache
+  # expires (5 minutes by default) during a long AUR build, and the nested
+  # prompt then stalls the run or fails it unattended. --sudoloop makes yay
+  # refresh the credential in the background. A non-root run is deliberately
+  # left to a generic sudo keeper in the shared driver rather than a yay flag,
+  # so only this path passes it.
+  if archup_is_root; then
+    yay_install_args+=(--sudoloop)
+  fi
 
-    rebuild_output="$(printf '%s\n' "${broken_packages[@]}" | aur_rebuild_targets)" || rebuild_status=$?
-    if [[ -n "$rebuild_output" ]]; then
-      mapfile -t rebuild_targets <<<"$rebuild_output"
-    fi
-    if ((${#rebuild_targets[@]})); then
-      sysup_log "rebuilding broken AUR packages (${#rebuild_targets[@]})"
-      printf '  %s\n' "${rebuild_targets[@]}"
-      # yay can install one target and fail later (another target or a hook).
-      # Mark every attempted same-version rebuild before invoking it so the
-      # driver's best-effort failure path restarts any service that did change.
-      # Restarting an untouched active service is the safe conservative case.
-      SYSUP_EXTRA_UPGRADED_PACKAGES+=("${rebuild_targets[@]}")
-      archup_run_yay -S --aur --rebuild --redownload --answerclean All \
-        "${upgrade_args[@]}" "${rebuild_targets[@]}" || return
-    elif ((rebuild_status == 0)); then
-      sysup_log "broken foreign packages are not available in AUR"
-    fi
+  archup_prepare_yay || return
+  archup_run_yay -Syu --devel \
+    "${yay_install_args[@]+"${yay_install_args[@]}"}" "${upgrade_args[@]}" || return
 
+  broken_output="$(broken_foreign_packages)" || scan_status=$?
+  if ((scan_status != 0)); then
+    printf 'warning: automatic AUR rebuild scan was incomplete; continuing to post-upgrade checks\n' >&2
+    warn_non_aur_foreign_packages
+    return 0
+  fi
+  if [[ -n "$broken_output" ]]; then
+    mapfile -t broken_packages <<<"$broken_output"
+  fi
+  if ((${#broken_packages[@]} == 0)); then
+    sysup_log "no broken foreign package libraries found after upgrade"
     warn_non_aur_foreign_packages
     return
   fi
 
-  sysup_log "yay not found; upgrading repository packages only"
-  sysup_run_as_root pacman -Syu "${upgrade_args[@]}"
+  rebuild_output="$(printf '%s\n' "${broken_packages[@]}" | aur_rebuild_targets)" || rebuild_status=$?
+  if [[ -n "$rebuild_output" ]]; then
+    mapfile -t rebuild_targets <<<"$rebuild_output"
+  fi
+  if ((${#rebuild_targets[@]})); then
+    sysup_log "rebuilding broken AUR packages (${#rebuild_targets[@]})"
+    printf '  %s\n' "${rebuild_targets[@]}"
+    # yay can install one target and fail later (another target or a hook).
+    # Mark every attempted same-version rebuild before invoking it so the
+    # driver's best-effort failure path restarts any service that did change.
+    # Restarting an untouched active service is the safe conservative case.
+    SYSUP_EXTRA_UPGRADED_PACKAGES+=("${rebuild_targets[@]}")
+    archup_run_yay -S --aur --rebuild --redownload --answerclean All \
+      "${yay_install_args[@]+"${yay_install_args[@]}"}" \
+      "${upgrade_args[@]}" "${rebuild_targets[@]}" || return
+  elif ((rebuild_status == 0)); then
+    sysup_log "broken foreign packages are not available in AUR"
+  fi
+
+  warn_non_aur_foreign_packages
+  return
 }
 
 if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then
