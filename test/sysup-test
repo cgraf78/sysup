@@ -157,6 +157,41 @@ SYSUP_OS_ROOT="$os_root"
 _assert_eq "sysup detect: falls back to /etc/arch-release" \
   "arch" "$(sysup_os_family)"
 
+# os-release(5): /usr/lib/os-release is the fallback when /etc has none.
+os_root=$(_sysup_os_root)
+mkdir -p "$os_root/usr/lib"
+printf '%s\n' 'ID=debian' >"$os_root/usr/lib/os-release"
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: falls back to /usr/lib/os-release" \
+  "debian" "$(sysup_os_family)"
+_assert_eq "sysup detect: describes the host from /usr/lib/os-release" \
+  "ID=debian ID_LIKE=unknown" "$(sysup_os_description)"
+
+os_root=$(_sysup_os_root)
+mkdir -p "$os_root/usr/lib"
+printf '%s\n' 'ID=debian' >"$os_root/usr/lib/os-release"
+_sysup_write_os_release "$os_root" 'ID=arch'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: /etc/os-release takes precedence over /usr/lib" \
+  "arch" "$(sysup_os_family)"
+
+# ID is matched before ID_LIKE, so a distribution naming its own family in ID
+# is never reassigned by an unrelated ID_LIKE token.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=debian' 'ID_LIKE=arch'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: ID wins over ID_LIKE" "debian" "$(sysup_os_family)"
+
+# An empty ID must not match the table's empty columns.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=' 'ID_LIKE='
+SYSUP_OS_ROOT="$os_root"
+set +e
+sysup_os_family >/dev/null
+status=$?
+set -e
+_assert_eq "sysup detect: empty ID and ID_LIKE are unsupported" "1" "$status"
+
 os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
 SYSUP_OS_ROOT="$os_root"
@@ -200,6 +235,8 @@ _assert_eq "sysup detect: os-release assignments do not leak into the caller" \
 
 _assert_eq "sysup detect: supported families are reported for errors" \
   "arch,debian" "$(sysup_supported_families)"
+_assert_eq "sysup detect: family table maps each family to its backend" \
+  $'arch archup\ndebian debup' "$(sysup_family_commands)"
 
 echo ""
 echo "=== sysup: family guard ==="
@@ -309,6 +346,10 @@ set -e
 _assert_eq "sysup dispatch: --help succeeds on an unsupported host" "0" "$status"
 _assert_contains "sysup dispatch: --help explains the dispatch" \
   "Usage: sysup" "$result"
+_assert_contains "sysup dispatch: --help lists the Arch route from the table" \
+  "  arch    -> archup" "$result"
+_assert_contains "sysup dispatch: --help lists the Debian route from the table" \
+  "  debian  -> debup" "$result"
 
 os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=debian'

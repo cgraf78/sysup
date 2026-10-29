@@ -147,11 +147,17 @@ locks make overlapping upgrade runs unlikely, and the loser only warns.
 
 ## Detection
 
-`sysup_os_family` maps `/etc/os-release` `ID`, then each `ID_LIKE` token, to a
-family. `/etc/arch-release` and `/etc/debian_version` are fallbacks for
-derivatives with an unhelpful `os-release`. `_sysup_family_table` is the single
-family table; `sysup_family_command` and `sysup_family_label` expose it to both
-the dispatcher and the per-backend family guard.
+`sysup_os_family` maps os-release `ID`, then each `ID_LIKE` token, to a family.
+It reads `/etc/os-release`, falling back to `/usr/lib/os-release` as
+os-release(5) specifies. A per-family marker file under `/etc`
+(`/etc/arch-release`, `/etc/debian_version`) is the fallback for derivatives
+with an unhelpful `os-release`.
+
+`_sysup_family_table` is the single family table. Each row holds the family,
+its backend command, a human label, the os-release IDs that select it, and its
+marker file, so adding a family is one row plus its backend. Detection,
+`sysup_family_command`, `sysup_family_label`, and the dispatcher's `--help`
+routes all read it.
 
 `sysup` follows its own portable symlink chain and resolves the backend from the
 provider's `lib/sysup` directory, never through `PATH`. A shdeps link, manual
@@ -175,7 +181,14 @@ Upgrade, as root, with `DEBIAN_FRONTEND=noninteractive`:
 Conffiles use `--force-confdef --force-confold`, so a package never silently
 replaces a locally modified config file. `NEEDRESTART_MODE=l` keeps
 `needrestart`'s APT hook from prompting mid-upgrade; `debup` drives the restart
-itself afterward.
+itself afterward with `needrestart -r a` under the noninteractive debconf
+frontend, so its kernel and microcode pending-reboot notices print instead of
+waiting for a keypress on a terminal.
+
+The package snapshot keeps rows whose dpkg desired state is install (`i`) or
+hold (`h`) and whose current state is not `n` (not installed) or `c` (config
+files only). A held package is still installed and can be upgraded on explicit
+request, so leaving it out would hide that upgrade from the restart step.
 
 `DPkg::Lock::Timeout` covers only the two dpkg locks, not the lists lock that
 `apt-get update` takes (Debian #1012173), so `update` gets its own bounded retry.

@@ -41,14 +41,22 @@ _SYSUP_LIB_DIR=$(cd "$_SYSUP_BIN_DIR/../lib/sysup" >/dev/null 2>&1 && pwd -P) ||
 . "$_SYSUP_LIB_DIR/detect.sh"
 
 usage() {
+  local family command
+
   cat <<EOF
 Usage: sysup [backend args...]
 
 Detect this host's OS family and run its upgrade backend, forwarding every
 argument. Supported families: $(sysup_supported_families).
 
-  arch    -> archup
-  debian  -> debup
+EOF
+  # Rendered from the family table so a new family needs no edit here.
+  while read -r family command; do
+    printf '  %-7s -> %s\n' "$family" "$command"
+  done <<EOF
+$(sysup_family_commands)
+EOF
+  cat <<EOF
 
 On a supported host, --help also prints the selected backend's flags.
 EOF
