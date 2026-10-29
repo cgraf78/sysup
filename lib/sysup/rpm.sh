@@ -59,8 +59,9 @@ sysup_rpm_package_files() {
 
 # Config files an upgrade wrote beside a locally modified copy (.rpmnew), or
 # saved when it replaced one (.rpmsave, .rpmorig). Either way the operator has
-# a merge to review. Runs unprivileged, so a root-only directory can make it
-# incomplete; the caller reports that rather than escalating to list filenames.
+# a merge to review. Runs as root only when that needs no prompt (see
+# sysup_scan_as_root); unprivileged, a root-only directory can make it
+# incomplete, which the caller reports.
 sysup_rpm_pending_conffiles() {
   sysup_scan_as_root find "$SYSUP_RPM_CONFFILE_ROOT" \
     \( -name '*.rpmnew' -o -name '*.rpmsave' -o -name '*.rpmorig' \) \
