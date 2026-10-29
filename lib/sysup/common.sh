@@ -49,6 +49,22 @@ sysup_run_as_root() {
   sudo "$@"
 }
 
+# Run a read-only advisory scan as root when that needs no password prompt (a
+# root run, a cached credential, or NOPASSWD), and as the invoking user
+# otherwise. Root-only directories under /etc (sudoers.d, ssl/private) hide
+# pending config merges from an unprivileged scan, but a --check-only run never
+# warms sudo, and prompting for an advisory report would make an unattended
+# check hang. An unprivileged `find` reports what it cannot read through its
+# exit status, which callers surface as an incomplete scan; pacdiff cannot.
+sysup_scan_as_root() {
+  if ((EUID != 0)) && command -v sudo >/dev/null 2>&1 &&
+    sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+    return
+  fi
+  "$@"
+}
+
 # Set once sudo has been shown to need no password, so there is no credential
 # to keep warm.
 _SYSUP_SUDO_PASSWORDLESS=0

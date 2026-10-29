@@ -220,11 +220,11 @@ debup_reboot_required() {
 # Config files a package upgrade could not install because the local copy
 # diverged. They are inert until merged, so the new defaults are not in effect.
 #
-# This runs unprivileged, so a root-only directory under /etc can make the scan
-# incomplete. The caller reports that uncertainty rather than escalating just
-# to list filenames.
+# This runs as root only when that needs no prompt (see sysup_scan_as_root);
+# unprivileged, a root-only directory under /etc can make the scan incomplete,
+# and the caller reports that uncertainty.
 debup_pending_conffiles() {
-  find "$DEBUP_CONFFILE_ROOT" \
+  sysup_scan_as_root find "$DEBUP_CONFFILE_ROOT" \
     \( -name '*.dpkg-dist' -o -name '*.dpkg-new' -o -name '*.ucf-dist' \) \
     -type f -print 2>/dev/null | sort
 }

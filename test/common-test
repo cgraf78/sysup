@@ -23,6 +23,8 @@ export COMMON_SUDO_REFRESH_STATUS=0
 # Whether the mock sudo runs commands without a password; 1 models a host
 # where it needs one, the case the keeper exists for.
 export COMMON_SUDO_NOPASSWD_STATUS=1
+# Whether `sudo -n` can run a command now; 1 models no cached credential.
+export COMMON_SUDO_CACHED_STATUS=0
 
 # sudo is a real executable so the keeper's background subshell, which has no
 # access to later function redefinitions, still reaches the mock.
@@ -33,6 +35,7 @@ case "$*" in
   -v) exit 0 ;;
   "-n -v") exit "$COMMON_SUDO_REFRESH_STATUS" ;;
   "-n -k true") exit "$COMMON_SUDO_NOPASSWD_STATUS" ;;
+  "-n true") exit "$COMMON_SUDO_CACHED_STATUS" ;;
 esac
 [[ "$1" != -n ]] || shift
 exec "$@"
@@ -80,6 +83,7 @@ _common_reset() {
   COMMON_UPGRADE_STATUS=0
   COMMON_SUDO_REFRESH_STATUS=0
   COMMON_SUDO_NOPASSWD_STATUS=1
+  COMMON_SUDO_CACHED_STATUS=0
   SYSUP_SUDO_REFRESH=60
 }
 
@@ -407,5 +411,40 @@ status=$?
 set -e
 wait "$releaser"
 _assert_eq "common lock: returns once the holder releases the lock" "0" "$status"
+
+echo ""
+echo "=== common: advisory scans as root ==="
+
+# Root runs every scan directly, so only a non-root runner reaches sudo.
+if ((EUID != 0)); then
+  _common_reset
+  result=$(sysup_scan_as_root echo scanned)
+  _assert_eq "common scan: runs the command" "scanned" "$result"
+  _assert_contains "common scan: uses sudo when it needs no password" \
+    "-n echo scanned" "$(cat "$COMMON_SUDO_LOG")"
+
+  _common_reset
+  set +e
+  sysup_scan_as_root false
+  status=$?
+  set -e
+  _assert_eq "common scan: keeps the command's exit status under sudo" "1" "$status"
+
+  _common_reset
+  COMMON_SUDO_CACHED_STATUS=1
+  result=$(sysup_scan_as_root echo scanned)
+  _assert_eq "common scan: falls back to the invoking user" "scanned" "$result"
+  _assert_eq "common scan: never prompts for a password" \
+    "-n true" "$(cat "$COMMON_SUDO_LOG")"
+
+  _common_reset
+  result=$(
+    # shellcheck disable=SC2123 # deliberately leave no sudo on PATH.
+    PATH=/nonexistent
+    sysup_scan_as_root echo scanned
+  )
+  _assert_eq "common scan: runs as the invoking user without sudo" "scanned" "$result"
+  _assert_eq "common scan: does not need sudo installed" "" "$(cat "$COMMON_SUDO_LOG")"
+fi
 
 _test_summary
