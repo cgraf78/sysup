@@ -157,6 +157,20 @@ open. Holders are found through `/proc/<pid>/fd` links (read as root), not
 where the package manager itself fails at once on a held lock: `debup` before
 `apt-get update` and `archup` before the upgrade.
 
+### Config-merge scans
+
+The pending config-merge reports (`pacdiff --output`, and the `find` over
+`/etc` in `debup` and `rpm.sh`) run through `sysup_scan_as_root`: as root
+when that needs no password (a root run, a cached sudo credential, or
+NOPASSWD), and as the invoking user otherwise. Root-only directories such as
+`/etc/sudoers.d` and `/etc/ssl/private` hide pending merges from an
+unprivileged scan, but `--check-only` never warms sudo, and an advisory report
+must not stop an unattended check at a password prompt. An unprivileged
+`find` that cannot read a directory reports the scan as incomplete rather than
+clean; `pacdiff` tests each pacman-recorded backup path and cannot tell an
+unreadable directory from a missing file, so its unprivileged report may be
+silently incomplete.
+
 ### Deferred restarts
 
 A deferral is reported once by the run that upgraded the package, which is
@@ -450,7 +464,7 @@ which is reported as unknown rather than as a reboot.
 ## Testing
 
 - `common-test` drives the shared driver with a fake backend: argument
-  rejection, the sudo keeper's lifecycle, and lock waits.
+  rejection, the sudo keeper's lifecycle, lock waits, and root config scans.
 - `archup-test` covers the extracted shared hooks, AUR decisions and the root
   build-user policy, orphan removal, batched library scanning, the reboot
   check, package diffs, service restarts, and partial failures.

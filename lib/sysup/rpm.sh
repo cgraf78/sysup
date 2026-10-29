@@ -62,7 +62,7 @@ sysup_rpm_package_files() {
 # a merge to review. Runs unprivileged, so a root-only directory can make it
 # incomplete; the caller reports that rather than escalating to list filenames.
 sysup_rpm_pending_conffiles() {
-  find "$SYSUP_RPM_CONFFILE_ROOT" \
+  sysup_scan_as_root find "$SYSUP_RPM_CONFFILE_ROOT" \
     \( -name '*.rpmnew' -o -name '*.rpmsave' -o -name '*.rpmorig' \) \
     -type f -print 2>/dev/null | sort
 }

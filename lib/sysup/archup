@@ -513,7 +513,7 @@ report_pending_pacman_configs() {
     printf 'warning: could not scan for config files awaiting a manual merge; install pacman-contrib\n' >&2
     return 0
   fi
-  if ! listing=$(pacdiff --output); then
+  if ! listing=$(sysup_scan_as_root pacdiff --output); then
     printf 'warning: could not scan for config files awaiting a manual merge\n' >&2
     return 0
   fi

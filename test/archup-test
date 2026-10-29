@@ -268,6 +268,7 @@ command() {
   builtin command "$@"
 }
 
+# shellcheck disable=SC2329 # Exercised indirectly by the pending-config report.
 pacdiff() {
   printf '%s\n' "$*" >>"$ARCHUP_PACDIFF_COMMAND_LOG"
   printf '%s\n' "$ARCHUP_PACDIFF_OUTPUT"
@@ -723,6 +724,11 @@ _assert_contains "archup pending config: reports .pacsave files" \
   "/etc/removed.conf.pacsave" "$result"
 _assert_contains "archup pending config: indents every pending path" \
   "  /etc/removed.conf.pacsave" "$result"
+# Root-only directories hide .pacnew files from an unprivileged scan.
+if ((EUID != 0)); then
+  _assert_contains "archup pending config: scans as root without prompting" \
+    "-n pacdiff --output" "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+fi
 
 _archup_mock_reset
 result=$(report_pending_pacman_configs 2>&1)
