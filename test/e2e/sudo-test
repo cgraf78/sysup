@@ -112,7 +112,7 @@ for scenario in password cached mixed keeper; do
   chmod 0440 "$policy"
   visudo -cf "$policy"
   : >"$fixture/sudo.log"
-  runuser -u "$account" -- /bin/bash "$fixture/case" "$repo" "$scenario" \
+  sudo -u "$account" -- /bin/bash "$fixture/case" "$repo" "$scenario" \
     "$fixture/askpass"
   if grep -q 'a password is required' "$fixture/sudo.log"; then
     printf 'sudo-test: %s generated a refused-command security alert\n' "$scenario" >&2
