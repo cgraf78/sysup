@@ -19,7 +19,8 @@ functions and shell state from reaching another.
 - `debup-test` covers apt/dpkg policy, retries, autoremove, integrity and
   advisory checks, multiarch snapshots, needrestart, check-only behavior,
   partial upgrades, family refusal, service restarts, and failed units.
-- `dnfup-test` covers dnf/rpm policy, autoremove and its report, multilib,
+- `dnfup-test` covers dnf/rpm policy, versionlocked and excluded packages,
+  the rpm lock wait, autoremove and its report, multilib,
   installonly, and signing-key snapshots, image-based and yum-only refusal,
   partial upgrades, each check, check-only behavior, and family refusal.
 - `zypup-test` covers the per-release upgrade verb, refresh ordering, the zypp

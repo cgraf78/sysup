@@ -129,7 +129,9 @@ and prefers `needrestart` when it is installed.
 ### Fedora and RHEL
 
 The Fedora backend covers Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, and
-other dnf-based RHEL derivatives. It runs `dnf upgrade --refresh -y`, then
+other dnf-based RHEL derivatives. It lists versionlocked and excluded
+packages, waits for another rpm transaction to release its lock, runs
+`dnf upgrade --refresh -y`, then
 `dnf autoremove -y` after a successful upgrade. It never runs
 `dnf system-upgrade`, and it refuses rpm-ostree/bootc image-based hosts, which
 upgrade through `rpm-ostree upgrade` or `bootc upgrade` instead. It runs

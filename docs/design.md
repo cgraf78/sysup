@@ -71,7 +71,7 @@ Optional hooks, with defaults in `common.sh`:
 | Hook | Default | Override |
 | --- | --- | --- |
 | `sysup_backend_parse_arg <arg>` | unhandled (sysup rejects the argument with status 2) | `debup` adds `--full-upgrade` |
-| `sysup_backend_preamble` | no-op | `archup` lists foreign packages and `IgnorePkg`/`IgnoreGroup` entries; `debup` lists held packages; `zypup` lists package locks |
+| `sysup_backend_preamble` | no-op | `archup` lists foreign packages and `IgnorePkg`/`IgnoreGroup` entries; `debup` lists held packages; `dnfup` lists versionlocked and excluded packages; `zypup` lists package locks |
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
 | `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded`; `zypup` only lists `zypper packages --unneeded`, in both modes |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
@@ -155,7 +155,7 @@ open. Holders are found through `/proc/<pid>/fd` links (read as root), not
 `/proc/locks`: the latter names files by device and inode, and on btrfs
 `stat()` reports a per-subvolume device that never matches it. Backends use it
 where the package manager itself fails at once on a held lock: `debup` before
-`apt-get update` and `archup` before the upgrade.
+`apt-get update`, and `archup` and `dnfup` before the upgrade.
 
 ### Config-merge scans
 
@@ -325,8 +325,23 @@ Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, Oracle Linux, and Amazon Linux
 - yum-only releases (RHEL/CentOS 7, Amazon Linux 2), with an error that says
   so instead of a bare missing-command report.
 
+The preamble lists the packages dnf will not upgrade, the analogue of held
+packages: `excludepkgs` (or the older `exclude`) in the `[main]` section of
+`/etc/dnf/dnf.conf`, marked `(excluded)`, and the versionlock entries of both
+dnf generations, marked `(versionlock)`: dnf4's plugin list
+(`/etc/dnf/plugins/versionlock.list`, one NEVRA pattern per line, `!` for an
+exclude entry) and dnf5's built-in `/etc/dnf/versionlock.toml` (package names
+only). The files are read directly because `dnf versionlock list` needs a
+plugin on dnf4 and loads repositories. Per-repository excludes and drop-in
+files under `/etc/dnf/libdnf5.conf.d` are not listed. An unreadable file is a
+warning.
+
 Upgrade, as root:
 
+- Wait for the rpm transaction lock (`rpm --eval '%{_rpmlock_path}'`, falling
+  back to `/var/lib/rpm/.rpm.lock`) with `sysup_wait_path_free`, up to
+  `DNFUP_LOCK_TIMEOUT` seconds (default 300). dnf4 waits for it itself, but
+  dnf5 fails at once while `dnf-automatic` or PackageKit holds it.
 - `dnf upgrade --refresh -y`, forwarding extra arguments. dnf never prompts
   about config files; it writes `.rpmnew`/`.rpmsave` instead, which the checks
   report. Fedora's default `best=False` lets dnf skip a package whose
@@ -373,10 +388,6 @@ advisories were not consulted. dnf4's check uses only the rpmdb. For the same
 reason `dnfup` probes `needs-restarting --help` first, since dnf exits 1 for
 an unknown command too, and reports reboot state as unknown when the plugin
 is missing rather than claiming a reboot.
-
-Not yet handled: dnf5 fails at once when another process (`dnf-automatic`,
-PackageKit) holds the rpm transaction lock, where dnf4 waits; and versionlocked
-or excluded packages are not listed the way `debup` lists held packages.
 
 ## `zypup` behavior
 
@@ -472,7 +483,8 @@ which is reported as unknown rather than as a reboot.
   the upgrade verb, default autoremove and its opt-out, each check, and
   `needrestart` preference.
 - `dnfup-test` mocks `dnf`, `rpm`, and `systemctl` to cover the upgrade and
-  autoremove policy, multilib, installonly, and signing-key snapshots, each
+  autoremove policy, versionlocked and excluded packages, the rpm lock wait,
+  multilib, installonly, and signing-key snapshots, each
   check, and the image-based, yum-only, and family guards.
 - `test/e2e/distro-run` boots a stock image of each supported family with
   systemd as PID 1 and runs the real `sysup` (check-only, upgrade as root,

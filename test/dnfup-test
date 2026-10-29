@@ -37,6 +37,7 @@ export DNFUP_MOCK_REPOQUERY_STATUS=0
 export DNFUP_MOCK_NEEDS_RESTARTING=1 # 0 models a host without the plugin
 export DNFUP_MOCK_REBOOT_STATUS=0
 export DNFUP_MOCK_RPM_QA_STATUS=0
+export DNFUP_MOCK_RPMLOCK_PATH="" # rpm --eval '%{_rpmlock_path}' output
 DNFUP_MOCK_STATE="$(_tmpdir)/installed"
 export DNFUP_MOCK_STATE
 
@@ -49,6 +50,8 @@ _dnfup_write_mock() {
 _dnfup_write_mock sudo <<'EOF'
 #!/usr/bin/env bash
 [[ "${1:-}" == "-v" ]] && exit 0
+# Non-prompting probes and lock scans (`sudo -n ...`) run like any command.
+[[ "${1:-}" == "-n" ]] && shift
 exec "$@"
 EOF
 
@@ -100,6 +103,7 @@ _dnfup_write_mock rpm <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$DNFUP_RPM_LOG"
 case "${1:-}" in
+  --eval) printf '%s\n' "${DNFUP_MOCK_RPMLOCK_PATH:-$2}" ;;
   -qa)
     ((DNFUP_MOCK_RPM_QA_STATUS == 0)) || exit "$DNFUP_MOCK_RPM_QA_STATUS"
     rows=$(cat "$DNFUP_MOCK_STATE")
@@ -166,6 +170,18 @@ DNFUP_FIXTURE_ETC=$(_tmpdir)
 SYSUP_RPM_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
 # Never let the live host's image-based marker decide a test.
 DNFUP_OSTREE_BOOTED_FILE="$(_tmpdir)/absent"
+# Pinned-package sources are fixtures too; absent unless a case writes them.
+DNFUP_PIN_DIR=$(_tmpdir)
+DNFUP_CONF="$DNFUP_PIN_DIR/dnf.conf"
+DNFUP_VERSIONLOCK_LIST="$DNFUP_PIN_DIR/versionlock.list"
+DNFUP_VERSIONLOCK_TOML="$DNFUP_PIN_DIR/versionlock.toml"
+# Lock waits read a fixture process table, never the host's: by default no
+# process holds anything.
+# shellcheck disable=SC2034 # read by the sourced common.sh under test.
+SYSUP_PROC_ROOT=$(_tmpdir)
+# shellcheck disable=SC2034 # read by the sourced common.sh under test.
+SYSUP_LOCK_POLL=0.1
+DNFUP_RPM_LOCK="$(_tmpdir)/.rpm.lock"
 
 # The suite does not run on a Fedora host, so neutralize the family guard the
 # way the other backend suites do. One case later restores it to prove it runs.
@@ -194,7 +210,8 @@ _dnfup_reset() {
   DNFUP_MOCK_NEEDS_RESTARTING=1
   DNFUP_MOCK_REBOOT_STATUS=0
   DNFUP_MOCK_RPM_QA_STATUS=0
-  rm -rf "${DNFUP_FIXTURE_ETC:?}"/*
+  DNFUP_MOCK_RPMLOCK_PATH=""
+  rm -rf "${DNFUP_FIXTURE_ETC:?}"/* "${DNFUP_PIN_DIR:?}"/*
   rm -rf "${SYSUP_STATE_DIR:?}"
 }
 
@@ -513,6 +530,147 @@ hash -r
 _assert_eq "dnfup guard: refuses a yum-only host" "1" "$DNFUP_STATUS"
 _assert_contains "dnfup guard: says the host has yum but not dnf" \
   "has yum but not dnf" "$DNFUP_RESULT"
+
+echo ""
+echo "=== dnfup: versionlocked and excluded packages ==="
+
+_dnfup_reset
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "dnfup pinned: a host with no pins says so" \
+  $'versionlocked and excluded packages (0)\n  (none)' "$result"
+
+# dnf.conf [main] excludes, in both spellings and separators; a repository
+# section's exclude applies only to that repository and is not listed.
+_dnfup_reset
+cat >"$DNFUP_CONF" <<'EOF'
+[main]
+gpgcheck=True
+excludepkgs=kernel*, firefox
+exclude = podman  buildah
+[updates]
+excludepkgs=repo-only
+EOF
+# dnf4 versionlock.list: comments, blank lines, and `!` exclude entries.
+cat >"$DNFUP_VERSIONLOCK_LIST" <<'EOF'
+# Added locks on Mon Oct 26 2026
+bash-0:5.2.26-3.fc40.*
+
+!nginx-1:1.24.0-1.fc40.*
+EOF
+# dnf5 versionlock.toml: only package names are listed, not conditions.
+cat >"$DNFUP_VERSIONLOCK_TOML" <<'EOF'
+version = "1.0"
+[[packages]]
+name = "zsh"
+[[packages.conditions]]
+key = "evr"
+comparator = "="
+value = "5.9-15.fc41"
+EOF
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "dnfup pinned: counts every pinned package" \
+  "versionlocked and excluded packages (7)" "$result"
+_assert_contains "dnfup pinned: lists dnf.conf excludepkgs" \
+  "  kernel* (excluded)" "$result"
+_assert_contains "dnfup pinned: splits excludes on commas" \
+  "  firefox (excluded)" "$result"
+_assert_contains "dnfup pinned: reads the old exclude spelling and splits on spaces" \
+  $'  podman (excluded)\n  buildah (excluded)' "$result"
+_assert_not_contains "dnfup pinned: ignores repository-section excludes" \
+  "repo-only" "$result"
+_assert_contains "dnfup pinned: lists dnf4 versionlocks" \
+  "  bash-0:5.2.26-3.fc40.* (versionlock)" "$result"
+_assert_contains "dnfup pinned: marks dnf4 exclude entries as excluded" \
+  "  nginx-1:1.24.0-1.fc40.* (excluded)" "$result"
+_assert_not_contains "dnfup pinned: skips versionlock comments" \
+  "Added locks" "$result"
+_assert_contains "dnfup pinned: lists dnf5 versionlocks" \
+  "  zsh (versionlock)" "$result"
+_assert_not_contains "dnfup pinned: does not list dnf5 conditions" \
+  "evr" "$result"
+
+# An unreadable source warns and never stops the run. Root reads anything, so
+# only a non-root runner can model this.
+if ((EUID != 0)); then
+  _dnfup_reset
+  printf 'bash-0:5.2.26-3.fc40.*\n' >"$DNFUP_VERSIONLOCK_LIST"
+  chmod 000 "$DNFUP_VERSIONLOCK_LIST"
+  set +e
+  result=$(sysup_backend_preamble 2>&1)
+  status=$?
+  set -e
+  chmod 600 "$DNFUP_VERSIONLOCK_LIST"
+  _assert_eq "dnfup pinned: an unreadable file is not fatal" "0" "$status"
+  _assert_contains "dnfup pinned: an unreadable file is a warning" \
+    "could not read the dnf exclude or versionlock configuration" "$result"
+fi
+
+# The preamble runs in a real invocation, including --check-only.
+_dnfup_reset
+printf '[main]\nexcludepkgs=kernel*\n' >"$DNFUP_CONF"
+_dnfup_main --check-only
+_assert_contains "dnfup pinned: sysup reports pinned packages" \
+  "  kernel* (excluded)" "$DNFUP_RESULT"
+
+echo ""
+echo "=== dnfup: rpm transaction lock ==="
+
+# The lock path comes from rpm's own macro, so a relocated rpmdb is followed.
+saved_rpm_lock="$DNFUP_RPM_LOCK"
+DNFUP_RPM_LOCK=""
+_dnfup_reset
+DNFUP_MOCK_RPMLOCK_PATH=/usr/lib/sysimage/rpm/.rpm.lock
+_assert_eq "dnfup lock: asks rpm where its lock lives" \
+  "/usr/lib/sysimage/rpm/.rpm.lock" "$(dnfup_rpm_lock_path)"
+# An rpm without the macro echoes it back unexpanded.
+_dnfup_reset
+_assert_eq "dnfup lock: falls back when rpm does not define the macro" \
+  "/var/lib/rpm/.rpm.lock" "$(dnfup_rpm_lock_path)"
+DNFUP_RPM_LOCK="$saved_rpm_lock"
+_assert_eq "dnfup lock: an explicit path wins over rpm" \
+  "$DNFUP_RPM_LOCK" "$(dnfup_rpm_lock_path)"
+
+# Holder detection needs a find with -lname, which BusyBox (the shared CI
+# matrix's Alpine leg) lacks; supported families all ship GNU findutils.
+if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
+  mkdir -p "$SYSUP_PROC_ROOT/4242/fd"
+
+  # A held lock is waited out, then the upgrade proceeds.
+  _dnfup_reset
+  ln -s "$DNFUP_RPM_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  (sleep 0.4 && rm -f "$SYSUP_PROC_ROOT/4242/fd/3") &
+  releaser=$!
+  set +e
+  # shellcheck disable=SC2119 # an upgrade with no extra dnf arguments.
+  result=$(sysup_backend_upgrade 2>&1)
+  status=$?
+  set -e
+  wait "$releaser"
+  _assert_eq "dnfup lock: a held rpm lock is waited out" "0" "$status"
+  _assert_contains "dnfup lock: says what it waits for" \
+    "for the rpm transaction lock" "$result"
+  _assert_contains "dnfup lock: upgrades once the lock is free" \
+    "upgrade --refresh -y" "$(cat "$DNFUP_DNF_LOG")"
+
+  # A lock held past the deadline fails before dnf runs.
+  _dnfup_reset
+  ln -s "$DNFUP_RPM_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # read by the sourced dnfup under test.
+  DNFUP_LOCK_TIMEOUT=1
+  set +e
+  # shellcheck disable=SC2119 # an upgrade with no extra dnf arguments.
+  result=$(sysup_backend_upgrade 2>&1)
+  status=$?
+  set -e
+  rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # read by the sourced dnfup under test.
+  DNFUP_LOCK_TIMEOUT=300
+  _assert_eq "dnfup lock: a lock held past the deadline fails" "1" "$status"
+  _assert_contains "dnfup lock: names the lock it gave up on" \
+    "the rpm transaction lock is still held" "$result"
+  _assert_eq "dnfup lock: runs no dnf against a held lock" \
+    "" "$(cat "$DNFUP_DNF_LOG")"
+fi
 
 echo ""
 echo "=== dnfup: family guard ==="
