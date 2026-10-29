@@ -2,8 +2,8 @@
 
 ## Problem
 
-Arch, Debian-family, and Fedora-family package managers expose different upgrade and recovery
-semantics, but operators need one command whose checks, service restarts, and
+Arch, Debian-family, Fedora-family, and SUSE-family package managers expose
+different upgrade and recovery semantics, but operators need one command whose checks, service restarts, and
 failure reporting remain consistent across supported hosts.
 
 ## Goals
@@ -11,6 +11,8 @@ failure reporting remain consistent across supported hosts.
 - A Debian/Ubuntu upgrade helper, `debup`, with post-upgrade checks equivalent
   in spirit to `archup`'s.
 - A Fedora/RHEL upgrade helper, `dnfup`, built on the same contract.
+- An openSUSE/SLES upgrade helper, `zypup`, built on the same contract and
+  sharing the rpm database helpers in `rpm.sh` with `dnfup`.
 - A `sysup` front door that detects the OS family and runs the right backend.
 - One authoritative copy of the logic every backend shares, rather than a second
   copy of `archup`'s systemd and snapshot handling.
@@ -18,9 +20,13 @@ failure reporting remain consistent across supported hosts.
 ## Non-goals
 
 - Cross-release OS upgrades. `debup` never edits APT sources and never invokes
-  `do-release-upgrade`; `dnfup` never runs `dnf system-upgrade`.
-- openSUSE. It is RPM-based but upgrades through `zypper`, and Tumbleweed and
-  Leap need different verbs; it would be its own family, not part of `dnfup`.
+  `do-release-upgrade`; `dnfup` never runs `dnf system-upgrade`; `zypup`
+  never moves Leap or SLES to another release. Tumbleweed and Slowroll are
+  rolling, so `zypper dist-upgrade` is their in-release upgrade.
+- Transactional and image-based hosts (Fedora Atomic, CoreOS, openSUSE
+  MicroOS, SLE Micro). Their read-only root changes only through
+  `rpm-ostree`, `bootc`, or `transactional-update`, which the backends name
+  instead of running.
 - Distributions without systemd (Alpine, Void, Gentoo with OpenRC). The shared
   restart and failed-unit handling is systemd-only, so they need a service
   layer of their own first.
@@ -36,7 +42,9 @@ lib/sysup/
   archup       private Arch backend
   debup        private Debian backend
   dnfup        private Fedora/RHEL backend
+  zypup        private openSUSE/SLES backend
   detect.sh    OS family vocabulary and detection
+  rpm.sh       rpm snapshot, package files, and conffile scan for dnfup/zypup
   common.sh    logging, privilege, package-diff, and the shared run driver
   systemd.sh   failed units and service restarts for upgraded packages
 ```
@@ -63,9 +71,9 @@ Optional hooks, with defaults in `common.sh`:
 | Hook | Default | Override |
 | --- | --- | --- |
 | `sysup_backend_parse_arg <arg>` | unhandled (sysup rejects the argument with status 2) | `debup` adds `--full-upgrade` |
-| `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages |
+| `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages; `zypup` lists package locks |
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
-| `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded` |
+| `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded`; `zypup` only lists `zypper packages --unneeded`, in both modes |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
 | `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one, and reports it unverified when either version cannot be read |
 | `sysup_backend_restart_services <pkg...>` | shared systemd restart | `debup` prefers `needrestart` |
@@ -178,7 +186,8 @@ locks make overlapping upgrade runs unlikely, and the loser only warns.
 `sysup_os_family` maps os-release `ID`, then each `ID_LIKE` token, to a family.
 It reads `/etc/os-release`, falling back to `/usr/lib/os-release` as
 os-release(5) specifies. A per-family marker file under `/etc`
-(`/etc/arch-release`, `/etc/debian_version`) is the fallback for derivatives
+(`/etc/arch-release`, `/etc/debian_version`, `/etc/redhat-release`,
+`/etc/SUSE-brand`) is the fallback for derivatives
 with an unhelpful `os-release`.
 
 `_sysup_family_table` is the single family table. Each row holds the family,
@@ -343,6 +352,89 @@ Not yet handled: dnf5 fails at once when another process (`dnf-automatic`,
 PackageKit) holds the rpm transaction lock, where dnf4 waits; and versionlocked
 or excluded packages are not listed the way `debup` lists held packages.
 
+## `zypup` behavior
+
+The `suse` family matches os-release `opensuse`, `suse`, and `sles`, plus the
+flavor IDs `opensuse-tumbleweed`, `opensuse-slowroll`, and `opensuse-leap` so
+detection does not depend on `ID_LIKE`; `/etc/SUSE-brand` is the marker
+fallback. `zypup` refuses transactional hosts before touching zypper: when
+the last `/` entry in `/proc/self/mounts` is mounted `ro` and
+`transactional-update` is installed (openSUSE MicroOS, Aeon, Kalpa, Leap
+Micro, SLE Micro), the error names `transactional-update up` and `dup`. Both
+conditions are required, since either alone also occurs on ordinary hosts.
+
+Upgrade, as root, every zypper call with `--non-interactive` and
+`ZYPP_LOCK_TIMEOUT` (default 300 seconds, `ZYPUP_LOCK_TIMEOUT`) passed through
+`sudo env`, so another zypper, YaST, or PackageKit holding the zypp lock is
+waited out; libzypp's own default fails at once:
+
+- `zypper refresh` as its own step, so a repository that cannot be refreshed
+  stops the run before any package changes. zypper(8) warns that
+  `dist-upgrade` must not continue when enabled repositories fail to refresh.
+- `zypper dist-upgrade` when os-release `ID` is `opensuse-tumbleweed` or
+  `opensuse-slowroll`, or `ID_LIKE` names either (a derivative of a rolling
+  release), otherwise `zypper update`, forwarding extra arguments.
+  On a rolling release `update` cannot apply vendor changes, splits, or
+  removals, so `dist-upgrade` is the supported verb there.
+- Licenses are never accepted automatically: under `--non-interactive` the
+  license prompt's default declines, the transaction aborts, and the failure
+  is reported like any other.
+
+Decisions use zypper's exit status alone (zypper(8), EXIT CODES):
+
+| Status | Meaning | `zypup` |
+| --- | --- | --- |
+| 102 `ZYPPER_EXIT_INF_REBOOT_NEEDED` | succeeded; reboot suggested (also hides 106 and 107, below) | success; reported by the reboot check |
+| 103 `ZYPPER_EXIT_INF_RESTART_NEEDED` | a patch affecting the package manager was installed; run again (rare for `update` and `dist-upgrade`) | runs the same command once more and uses that result |
+| 106 `ZYPPER_EXIT_INF_REPOS_SKIPPED` | a repository failed to refresh and was skipped | failure, status kept |
+| 107 `ZYPPER_EXIT_INF_RPM_SCRIPT_FAILED` | installed, but a `%post` script failed | failure, status kept |
+| other non-zero | error | failure, status kept |
+
+A failure skips the cleanup step like any other backend's. zypper substitutes
+106 or 107 only when its main exit code is 0 (`main.cc` returns the "info"
+code only then), so a run that also needs a reboot exits 102 and hides them.
+
+Not yet handled: an upgrade that exits 102 is treated as a success even if it
+also skipped a repository (106) or a `%post` script failed (107), because the
+exit status no longer carries those and `zypup` does not parse zypper's
+output. That combination is common on Tumbleweed, where most snapshots need
+a reboot.
+
+zypper has no autoremove. `zypper packages --unneeded` lists what libzypp
+considers unneeded from install-reason records, which `zypup` does not trust
+for unattended removal, so both `apply` and `report` only list them, and
+`apply` adds a note saying so. The listing is printed as zypper renders it
+and never parsed: `--xmlout` does not cover the `packages` command (its table
+is written as plain text even in XML mode), so there is no structured form.
+`--quiet` suppresses the "No packages found." notice while still printing the
+table, so empty output means nothing is unneeded. A failed query is a warning.
+
+The preamble lists the `solvable_name` of each lock in `/etc/zypp/locks`, the
+openSUSE analogue of held packages, with its `type` in parentheses when the
+lock is on a pattern, patch, or product rather than a package. An absent file means no locks; an
+unreadable one is a warning, since the list is informational.
+
+The snapshot, package files, and conffile scan come from `rpm.sh` and match
+`dnfup`'s exactly (`NAME.ARCH`, epochs, joined multiversion kernels, no
+`gpg-pubkey`). Service restarts use the shared package-diff path.
+
+Checks:
+
+| Check | Severity |
+| --- | --- |
+| `zypper verify --dry-run` | fatal |
+| Reboot required (the upgrade's 102, else `zypper needs-rebooting`) | advisory |
+| Pending config merges (`.rpmnew`/`.rpmsave`/`.rpmorig` under `/etc`) | advisory |
+| Failed systemd units | fatal |
+
+`verify` and `packages --unneeded` run with `--no-refresh`, so an unreachable
+repository cannot fail a question about the installed system;
+`needs-rebooting` reads only a flag file. A repair that
+`verify` can plan still exits 0 under `--dry-run`, so its "ok" message claims
+only that no unresolvable problem was found. `needs-rebooting` exits 102 for
+a suggested reboot and 0 otherwise; a zypper that predates the command exits 2,
+which is reported as unknown rather than as a reboot.
+
 ## Testing
 
 - `common-test` drives the shared driver with a fake backend: argument
@@ -360,6 +452,10 @@ or excluded packages are not listed the way `debup` lists held packages.
   systemd as PID 1 and runs the real `sysup` (check-only, upgrade as root,
   upgrade through sudo, check-only again) against the real package manager.
   It is the only test that does not mock them, and CI runs it per family.
+- `zypup-test` mocks `zypper`, `rpm`, `sudo`, and `systemctl` to cover the
+  per-release verb, refresh ordering, lock timeout, informational exit codes,
+  the unneeded listing that never removes, package locks, each check, and the
+  transactional and family guards.
 - `sysup-test` covers family detection from fixture `os-release` files,
   symlink-aware dispatch to the private backend, exact argument forwarding,
   portability constraints, and the installation layout.

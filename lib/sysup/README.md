@@ -1,13 +1,16 @@
 # Private sysup implementation
 
-This directory owns both package-manager backends and the policy they share.
+This directory owns the package-manager backends and the policy they share.
 Only `bin/sysup` is a stable command surface; files and function names here are
 implementation details that may change together.
 
 - `archup` supplies Arch, pacman, yay, AUR rebuild, and missing-library policy.
 - `debup` supplies Debian/Ubuntu, apt, dpkg, conffile, reboot, and needrestart
   policy.
-- `dnfup` supplies Fedora/RHEL, dnf, rpm, conffile, and reboot policy.
+- `dnfup` supplies Fedora/RHEL, dnf, and reboot policy.
+- `zypup` supplies openSUSE/SLES, zypper, package-lock, and reboot policy.
+- `rpm.sh` holds the rpm snapshot, package-file, and pending-conffile helpers
+  that `dnfup` and `zypup` share.
 - `common.sh` parses shared flags and owns the upgrade/check/restart ordering.
 - `detect.sh` defines the supported-family vocabulary and family guards.
 - `systemd.sh` discovers affected active units and handles failed units.
@@ -18,8 +21,8 @@ enumeration, upgrade, checks, and usage text. Centralizing orchestration is a
 safety property: partial package-manager failures still reach verification and
 best-effort service restart, while the original failure status remains final.
 
-`archup`, `debup`, and `dnfup` are executable because the dispatcher replaces itself with
-the selected backend. They intentionally do not live in `bin/`; publishing them
+`archup`, `debup`, `dnfup`, and `zypup` are executable because the dispatcher
+replaces itself with the selected backend. They intentionally do not live in `bin/`; publishing them
 as separate commands would create extra user-facing APIs and make independent
 installation/version skew possible.
 

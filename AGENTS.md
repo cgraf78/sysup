@@ -2,22 +2,24 @@
 
 ## About
 
-`sysup` upgrades Arch, Debian, Ubuntu, and Fedora/RHEL hosts through one
-command, then restarts affected services and checks package and systemd state.
-It runs real package managers as root, so tests must never reach one.
+`sysup` upgrades Arch, Debian, Ubuntu, Fedora/RHEL, and openSUSE/SLES hosts
+through one command, then restarts affected services and checks package and
+systemd state. It runs real package managers as root, so tests must never
+reach one.
 
 ## Layout
 
 - `bin/sysup`: the only public command. It detects the host family and
   `exec`s the matching backend.
 - `lib/sysup/`: the private implementation (see its README). `archup`,
-  `debup`, and `dnfup` are the backends; `common.sh` owns flag parsing and the
-  upgrade, check, and restart ordering; `detect.sh` the family vocabulary;
+  `debup`, `dnfup`, and `zypup` are the backends; `common.sh` owns flag
+  parsing and the upgrade, check, and restart ordering; `detect.sh` the family
+  vocabulary; `rpm.sh` the rpm database helpers `dnfup` and `zypup` share;
   `systemd.sh` affected units, failed units, and deferred restarts.
 - `docs/design.md`: the backend hook contract and run ordering.
 - `test/run` runs `sysup-test`, `common-test`, `archup-test`, `debup-test`,
-  and `dnfup-test`, each in its own Bash process; `test/lib/test.sh` holds the
-  assertions.
+  `dnfup-test`, and `zypup-test`, each in its own Bash process;
+  `test/lib/test.sh` holds the assertions.
 - `support/install-checkout.sh`: the repo-owned install delegate.
 
 ## Invariants

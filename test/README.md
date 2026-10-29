@@ -20,8 +20,12 @@ functions and shell state from reaching another.
   advisory checks, multiarch snapshots, needrestart, check-only behavior,
   partial upgrades, family refusal, service restarts, and failed units.
 - `dnfup-test` covers dnf/rpm policy, autoremove and its report, multilib,
-  installonly, and signing-key snapshots, image-based and yum-only refusal, partial upgrades, each check, check-only behavior,
-  and family refusal.
+  installonly, and signing-key snapshots, image-based and yum-only refusal,
+  partial upgrades, each check, check-only behavior, and family refusal.
+- `zypup-test` covers the per-release upgrade verb, refresh ordering, the zypp
+  lock timeout, zypper's informational exit codes, the unneeded-package
+  listing that never removes, package locks, each check, transactional-host
+  and family refusal, and check-only behavior.
 - `lib/test.sh` provides only the assertions and guarded temporary directories
   these suites need. It is intentionally independent of dotfiles.
 

@@ -3,10 +3,10 @@
 [![Tests](https://github.com/cgraf78/sysup/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/sysup/actions/workflows/test.yml?query=branch%3Amain)
 [![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
 [![Bash](https://img.shields.io/badge/bash-%3E%3D4.0-blue)](#requirements)
-[![Platform](https://img.shields.io/badge/platform-Arch%20%7C%20Debian%20%7C%20Ubuntu%20%7C%20Fedora-lightgrey)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Arch%20%7C%20Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20openSUSE-lightgrey)](#requirements)
 
-`sysup` is one command for upgrading Arch, Debian, Ubuntu, and Fedora/RHEL
-systems. It detects the host family, applies conservative package-manager
+`sysup` is one command for upgrading Arch, Debian, Ubuntu, Fedora/RHEL, and
+openSUSE/SLES systems. It detects the host family, applies conservative package-manager
 policy, restarts services affected by the upgrade, and reports broken package
 or systemd state before returning.
 
@@ -54,8 +54,8 @@ provider-private `lib/sysup` tree. For example, a
 cgraf78/sysup  github
 ```
 
-Only `sysup` is a public command. The Arch, Debian, and Fedora implementations
-live under `lib/sysup` so their shared sequencing and package policy always
+Only `sysup` is a public command. The Arch, Debian, Fedora, and openSUSE
+implementations live under `lib/sysup` so their shared sequencing and package policy always
 update with the dispatcher.
 
 ## Usage
@@ -135,6 +135,28 @@ upgrade through `rpm-ostree upgrade` or `bootc upgrade` instead. It runs
 and reports reboot state through `dnf needs-restarting -r` when that plugin is
 installed. Services are restarted through the shared package-diff path.
 
+### openSUSE and SLES
+
+The openSUSE backend covers Tumbleweed, Slowroll, Leap, and SLES. It lists
+package locks, runs `zypper refresh`, then upgrades with
+`zypper dist-upgrade` on the rolling releases (Tumbleweed and Slowroll) and
+`zypper update` on Leap and SLES. It never moves Leap or SLES to another
+release. zypper runs with `--non-interactive` and `ZYPP_LOCK_TIMEOUT`, so it
+waits for PackageKit or another zypper instead of failing at once; licenses
+are never accepted automatically, so a package that needs license
+confirmation stops the upgrade. When zypper installs a patch affecting the
+package manager and asks to be run again (rare for these verbs), the upgrade
+runs once more.
+
+zypper has no autoremove, so this backend only lists the packages
+`zypper packages --unneeded` reports and never removes them. It refuses
+transactional hosts with a read-only root (MicroOS, Aeon, Kalpa, Leap Micro,
+SLE Micro), which upgrade through `transactional-update` instead. It runs
+`zypper verify --dry-run`, reports `.rpmnew`/`.rpmsave`/`.rpmorig` files
+awaiting a merge, and reports reboot state through
+`zypper needs-rebooting`. Services are restarted through the shared
+package-diff path.
+
 ## Failure and restart policy
 
 `sysup` snapshots package versions before and after mutation. Unused packages
@@ -145,7 +167,8 @@ applied upgrade may already require service restarts. The original package
 manager status retains precedence, while independent check and restart
 failures are also surfaced instead of short-circuiting one another.
 
-The shared fallback (Arch, Fedora, and Debian without `needrestart`) restarts
+The shared fallback (Arch, Fedora, openSUSE, and Debian without
+`needrestart`) restarts
 only active units owned by packages proven to have changed. When `needrestart` is available, Debian instead uses its
 runtime deleted-file analysis, which may restart another service affected by an
 upgraded library even when that service belongs to a different package. The
@@ -175,8 +198,10 @@ transitions, and the host's normal package tools. The Arch path additionally use
 `apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
 optional. The Fedora path uses `dnf`, `rpm`, `find`, and `sort`; the
 `needs-restarting` plugin (dnf-plugins-core or dnf5-plugins) is optional.
-systemd integration is used when `systemctl` is available and systemd is the
-running init (`/run/systemd/system` exists); recording deferred
+The openSUSE path uses `zypper`, `rpm`, `find`, and `sort`; reboot state
+needs a zypper with `needs-rebooting`. systemd integration is used when
+`systemctl` is available and systemd is the running init
+(`/run/systemd/system` exists); recording deferred
 restarts also uses `install` and `mktemp`.
 
 The dispatcher and OS detection remain compatible with Bash 3.2 so an

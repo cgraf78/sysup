@@ -14,6 +14,10 @@
 # derivatives whose os-release names neither. A new family is added here and
 # nowhere else.
 #
+# The suse row lists the openSUSE flavor IDs as well as the shared `opensuse`
+# and `suse` ID_LIKE tokens, so Tumbleweed, Slowroll, and Leap still match if
+# a release ships without ID_LIKE. SLES uses ID=sles with ID_LIKE=suse.
+#
 # A plain table rather than associative arrays because those need bash 4, and
 # macOS still ships bash 3.2 as /bin/bash. This file is what tells an
 # unsupported host so — it has to survive the oldest shell it can land on and
@@ -22,7 +26,8 @@ _sysup_family_table() {
   printf '%s\n' \
     'arch|archup|Arch Linux|arch|arch-release' \
     'debian|debup|Debian-based|debian ubuntu|debian_version' \
-    'fedora|dnfup|Fedora/RHEL-based|fedora rhel centos|redhat-release'
+    'fedora|dnfup|Fedora/RHEL-based|fedora rhel centos|redhat-release' \
+    'suse|zypup|openSUSE/SUSE-based|opensuse suse sles opensuse-tumbleweed opensuse-slowroll opensuse-leap|SUSE-brand'
 }
 _sysup_family_field() {
   local want="$1" field="$2" family command label ids marker

@@ -162,15 +162,43 @@ SYSUP_OS_ROOT="$os_root"
 _assert_eq "sysup detect: falls back to /etc/redhat-release" \
   "fedora" "$(sysup_os_family)"
 
-# openSUSE is RPM-based but not dnf-based, so it must not match the Fedora row.
+# openSUSE is RPM-based but upgrades through zypper, so it must select its
+# own family rather than the Fedora row. Each flavor's ID with its ID_LIKE.
 os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=opensuse-tumbleweed' 'ID_LIKE="opensuse suse"'
 SYSUP_OS_ROOT="$os_root"
-set +e
-sysup_os_family >/dev/null
-status=$?
-set -e
-_assert_eq "sysup detect: openSUSE is not treated as Fedora" "1" "$status"
+result=$(sysup_os_family)
+_assert_eq "sysup detect: openSUSE Tumbleweed is the suse family" "suse" "$result"
+_assert_not_contains "sysup detect: openSUSE is not treated as Fedora" "fedora" "$result"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=opensuse-slowroll' 'ID_LIKE="opensuse suse"'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: openSUSE Slowroll is the suse family" "suse" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=opensuse-leap' 'ID_LIKE="suse opensuse"'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: openSUSE Leap is the suse family" "suse" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=sles' 'ID_LIKE="suse"'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: SLES is the suse family" "suse" "$(sysup_os_family)"
+
+# The flavor IDs alone must match, in case a release omits ID_LIKE.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=opensuse-slowroll'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: an openSUSE flavor ID matches without ID_LIKE" \
+  "suse" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=homegrown'
+: >"$os_root/etc/SUSE-brand"
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: falls back to /etc/SUSE-brand" \
+  "suse" "$(sysup_os_family)"
 
 # An unhelpful os-release must not defeat detection when the family marker file
 # is present.
@@ -265,9 +293,9 @@ _assert_eq "sysup detect: os-release assignments do not leak into the caller" \
   "" "${ID:-}${NAME:-}"
 
 _assert_eq "sysup detect: supported families are reported for errors" \
-  "arch,debian,fedora" "$(sysup_supported_families)"
+  "arch,debian,fedora,suse" "$(sysup_supported_families)"
 _assert_eq "sysup detect: family table maps each family to its backend" \
-  $'arch archup\ndebian debup\nfedora dnfup' "$(sysup_family_commands)"
+  $'arch archup\ndebian debup\nfedora dnfup\nsuse zypup' "$(sysup_family_commands)"
 
 echo ""
 echo "=== sysup: family guard ==="
@@ -310,7 +338,7 @@ cp "$REPO_ROOT/lib/sysup/detect.sh" "$SYSUP_PROVIDER/lib/sysup/detect.sh"
 ln -s ../../provider/bin/sysup "$SYSUP_PUBLIC_BIN/sysup"
 
 SYSUP_DISPATCH_LOG="$SYSUP_FIXTURE/dispatch.log"
-for backend in archup debup dnfup; do
+for backend in archup debup dnfup zypup; do
   cat >"$SYSUP_PROVIDER/lib/sysup/$backend" <<EOF
 #!/usr/bin/env bash
 {
@@ -350,6 +378,12 @@ _assert_eq "sysup dispatch: RHEL-family host runs dnfup" \
   "dnfup" "$(cat "$SYSUP_DISPATCH_LOG")"
 
 os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=opensuse-leap' 'ID_LIKE="suse opensuse"'
+_sysup_dispatch "$os_root" >/dev/null 2>&1
+_assert_eq "sysup dispatch: openSUSE host runs zypup" \
+  "zypup" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=debian'
 _sysup_dispatch "$os_root" --check-only -- --extra >/dev/null 2>&1
 _assert_eq "sysup dispatch: forwards every argument to the backend" \
@@ -368,7 +402,7 @@ set -e
 _assert_eq "sysup dispatch: unsupported host fails" "1" "$status"
 _assert_contains "sysup dispatch: names the detected host" "ID=alpine" "$result"
 _assert_contains "sysup dispatch: lists the families it supports" \
-  "arch,debian,fedora" "$result"
+  "arch,debian,fedora,suse" "$result"
 _assert_eq "sysup dispatch: unsupported host runs no backend" \
   "" "$(cat "$SYSUP_DISPATCH_LOG")"
 
@@ -389,6 +423,8 @@ _assert_contains "sysup dispatch: --help lists the Debian route from the table" 
   "  debian  -> debup" "$result"
 _assert_contains "sysup dispatch: --help lists the Fedora route from the table" \
   "  fedora  -> dnfup" "$result"
+_assert_contains "sysup dispatch: --help lists the SUSE route from the table" \
+  "  suse    -> zypup" "$result"
 
 os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=debian'
@@ -622,6 +658,10 @@ _assert_eq "sysup families: fedora resolves to its backend" \
   "dnfup" "$(sysup_family_command fedora)"
 _assert_eq "sysup families: fedora resolves to its label" \
   "Fedora/RHEL-based" "$(sysup_family_label fedora)"
+_assert_eq "sysup families: suse resolves to its backend" \
+  "zypup" "$(sysup_family_command suse)"
+_assert_eq "sysup families: suse resolves to its label" \
+  "openSUSE/SUSE-based" "$(sysup_family_label suse)"
 set +e
 sysup_family_command alpine >/dev/null
 status=$?

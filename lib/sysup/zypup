@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# zypup - the openSUSE/SLES backend for sysup.
+#
+# Shared run sequence, systemd handling, family detection, and rpm database
+# helpers live beside this private backend; this file only supplies the zypper
+# specifics.
+#
+# This upgrades packages within the installed release. Tumbleweed and Slowroll
+# are rolling releases whose supported upgrade is `zypper dist-upgrade`; on
+# Leap and SLES it runs `zypper update` and never moves to another release.
+set -Eeuo pipefail
+
+# Read by the sysup library sourced below, for messages and the family guard.
+# shellcheck disable=SC2034
+SYSUP_BACKEND_NAME=zypup
+
+_zypup_lib_dir() {
+  local src="${BASH_SOURCE[0]}"
+  (cd "$(dirname "$src")" >/dev/null 2>&1 && pwd -P)
+}
+
+# shellcheck source=common.sh
+. "$(_zypup_lib_dir)/common.sh"
+# shellcheck source=rpm.sh
+. "$(_zypup_lib_dir)/rpm.sh"
+
+# Seconds zypper waits for the zypp lock held by another zypper, YaST, or
+# PackageKit instance before failing. libzypp's default is 0, which fails at
+# once; PackageKit's background refresh makes a collision routine on desktop
+# hosts, so it should be waited out rather than abort the run.
+ZYPUP_LOCK_TIMEOUT="${ZYPUP_LOCK_TIMEOUT:-300}"
+
+# System paths zypup reads. Overridable so tests can point them at a fixture
+# tree instead of the live system.
+ZYPUP_LOCKS_FILE="${ZYPUP_LOCKS_FILE:-/etc/zypp/locks}"
+ZYPUP_MOUNTS_FILE="${ZYPUP_MOUNTS_FILE:-/proc/self/mounts}"
+ZYPUP_TRANSACTIONAL_UPDATE="${ZYPUP_TRANSACTIONAL_UPDATE:-/usr/sbin/transactional-update}"
+
+# zypper's documented informational exit codes (zypper(8), EXIT CODES).
+ZYPUP_EXIT_REBOOT_NEEDED=102
+ZYPUP_EXIT_RESTART_NEEDED=103
+ZYPUP_EXIT_REPOS_SKIPPED=106
+ZYPUP_EXIT_RPM_SCRIPT_FAILED=107
+
+# Set when the upgrade's own exit status said a reboot is needed, so the
+# pending-state report does not depend on needs-rebooting alone.
+ZYPUP_UPGRADE_REBOOT_NEEDED=0
+
+sysup_backend_usage() {
+  cat <<'EOF'
+Usage: sysup [--no-autoremove] [--check-only]
+             [--no-restart-upgraded-services] [--restart-failed] [--]
+             [-- zypper args...]
+
+Upgrade an openSUSE or SLES host within its installed release, then verify
+the failure modes most likely to leave services broken after the upgrade.
+
+Default flow:
+  1. report package locks
+  2. warm sudo credentials
+  3. refresh repositories and upgrade packages noninteractively: zypper
+     dist-upgrade on Tumbleweed and Slowroll, zypper update on Leap and SLES
+  4. list packages no longer required; zypup never removes them
+  5. run zypper verify, pending-config, and reboot-required checks
+  6. restart active services shipped by packages upgraded in this run
+  7. optionally restart failed enabled units with --restart-failed
+  8. report failed systemd units when systemd is available
+
+Options:
+EOF
+  sysup_usage_common_options
+  cat <<'EOF'
+
+Arguments after -- are passed through to the zypper upgrade invocation. Package
+installation is noninteractive by default, but licenses are never accepted
+automatically: a package that needs license confirmation stops the upgrade.
+
+zypup never performs a release upgrade between Leap or SLES versions; use the
+distribution's documented release-upgrade procedure for that.
+EOF
+}
+
+# zypper as root, noninteractively, waiting out another holder of the zypp
+# lock. `env` carries the timeout across sudo, whose env_reset would otherwise
+# drop it.
+#
+# --non-interactive answers each prompt with its default. The license prompt
+# defaults to "no", so a package that needs license confirmation aborts the
+# transaction rather than being accepted on the operator's behalf; that is
+# deliberate, and the failure is reported like any other.
+zypup_zypper() {
+  sysup_run_as_root env ZYPP_LOCK_TIMEOUT="$ZYPUP_LOCK_TIMEOUT" \
+    zypper --non-interactive "$@"
+}
+
+# zypper for questions answered from the installed system and the metadata
+# already cached. --no-refresh keeps a repository that cannot be reached from
+# turning a local question into a failure.
+zypup_zypper_local() {
+  zypup_zypper --no-refresh "$@"
+}
+
+# The upgrade verb for this release. On a rolling release `zypper update`
+# leaves packages behind whenever a snapshot needs a vendor change, a package
+# split, or a removal, so openSUSE documents `dist-upgrade` as the only
+# supported way to move Tumbleweed and Slowroll forward. On Leap and SLES,
+# `update` stays within the installed release.
+#
+# A derivative built on Tumbleweed names it in ID_LIKE and is just as rolling,
+# so that token selects `dist-upgrade` too.
+zypup_upgrade_verb() {
+  local token id_like
+
+  id_like="$(sysup_os_release_field ID_LIKE)"
+  # ID_LIKE is a space-separated list, so it is deliberately unquoted here.
+  # shellcheck disable=SC2086
+  for token in "$(sysup_os_release_field ID)" $id_like; do
+    case "$token" in
+      opensuse-tumbleweed | opensuse-slowroll)
+        printf 'dist-upgrade\n'
+        return 0
+        ;;
+    esac
+  done
+  printf 'update\n'
+}
+
+# Return 0 when the root filesystem is mounted read-only, 1 otherwise or when
+# the mount table cannot be read. The last `/` entry wins because a later
+# mount stacks over an earlier one (the initramfs rootfs, for example).
+zypup_root_read_only() {
+  local mountpoint options read_only=1
+
+  [[ -r "$ZYPUP_MOUNTS_FILE" ]] || return 1
+  while read -r _ mountpoint _ options _; do
+    [[ "$mountpoint" == / ]] || continue
+    case ",$options," in
+      *,ro,*) read_only=0 ;;
+      *) read_only=1 ;;
+    esac
+  done <"$ZYPUP_MOUNTS_FILE"
+  return "$read_only"
+}
+
+# Print one value of a "key: value" line with surrounding blanks removed.
+_zypup_lock_value() {
+  local value="${1#*:}"
+
+  value="${value#"${value%%[![:space:]]*}"}"
+  printf '%s' "${value%"${value##*[![:space:]]}"}"
+}
+
+# Print the locks, one per line: the locked name, followed by its kind in
+# parentheses when it is not a package (a pattern, patch, or product lock
+# would otherwise read as a package of that name). A missing locks file means
+# no locks; an unreadable one returns 1 so the caller can say the list is
+# unknown rather than empty.
+#
+# /etc/zypp/locks is a libzypp query file: blank-line-separated stanzas of
+# "key: value" attributes, in any order. `solvable_name` holds the locked name
+# or glob and `type` its kind, defaulting to package; a lock written another
+# way (by capability, say) has no name and is not listed.
+zypup_locked_packages() {
+  local line name="" kind="" more=1
+
+  [[ -e "$ZYPUP_LOCKS_FILE" ]] || return 0
+  [[ -r "$ZYPUP_LOCKS_FILE" ]] || return 1
+  while ((more)); do
+    IFS= read -r line || more=0
+    case "$line" in
+      solvable_name:*) name="$(_zypup_lock_value "$line")" ;;
+      type:*) kind="$(_zypup_lock_value "$line")" ;;
+    esac
+    # A blank line or the end of the file closes the stanza; a final line
+    # without a newline is still read before `more` stops the loop.
+    if [[ -z "${line//[[:space:]]/}" ]] || ((more == 0)); then
+      if [[ -n "$name" ]]; then
+        if [[ -z "$kind" || "$kind" == package ]]; then
+          printf '%s\n' "$name"
+        else
+          printf '%s (%s)\n' "$name" "$kind"
+        fi
+      fi
+      name=""
+      kind=""
+    fi
+  done <"$ZYPUP_LOCKS_FILE"
+}
+
+# Run one upgrade command and translate zypper's informational exit codes.
+#
+# 102: the upgrade succeeded and installed something that needs a reboot.
+#      Remember it for the pending-state report.
+# 103: zypper sets this only after installing a patch that affects the
+#      package manager itself, so it is rare for update and dist-upgrade. The
+#      command must be run again to install the rest: run it once more and use
+#      that result; a second 103 means the rerun did not finish either, and
+#      stays a failure.
+# 106: a repository failed to refresh and was skipped, so the upgrade ran
+#      against partial metadata.
+# 107: an RPM scriptlet failed; the package is installed but may not work.
+#
+# 106 and 107 keep their status, failing the run (and therefore skipping any
+# cleanup), because each leaves the upgrade unverified. Decisions use the exit
+# status alone; zypper's wording is for the operator.
+#
+# Known gap: zypper reports 106 and 107 only when the main exit code is 0
+# (its main.cc substitutes the "info" code only then). An upgrade that needs a
+# reboot and also skipped a repository or had a failed scriptlet therefore
+# exits 102, and is treated as a success here. Telling those apart would mean
+# reading zypper's output, which zypup does not parse.
+zypup_run_upgrade() {
+  local status=0
+
+  zypup_zypper "$@" || status=$?
+  if ((status == ZYPUP_EXIT_RESTART_NEEDED)); then
+    printf '\nnote: zypper installed a patch affecting the package manager itself; running %s again to finish the upgrade\n' "$1"
+    status=0
+    zypup_zypper "$@" || status=$?
+  fi
+
+  case "$status" in
+    0) return 0 ;;
+    "$ZYPUP_EXIT_REBOOT_NEEDED")
+      ZYPUP_UPGRADE_REBOOT_NEEDED=1
+      return 0
+      ;;
+    "$ZYPUP_EXIT_RESTART_NEEDED")
+      printf '\nerror: zypper still asks to be run again after a second %s\n' "$1" >&2
+      ;;
+    "$ZYPUP_EXIT_REPOS_SKIPPED")
+      printf '\nerror: zypper skipped a repository that failed to refresh; the upgrade may be incomplete\n' >&2
+      ;;
+    "$ZYPUP_EXIT_RPM_SCRIPT_FAILED")
+      printf '\nerror: an RPM install script failed; the affected packages are installed but may not work\n' >&2
+      ;;
+  esac
+  return "$status"
+}
+
+# Return 0 when a reboot is required, 1 when not, 2 when it cannot be told.
+#
+# `zypper needs-rebooting` exits 102 when a reboot is suggested and 0 when not.
+# A zypper that predates the command exits 2 (syntax error) instead, and any
+# other failure is equally distinct from both, so the exit status alone tells
+# "unknown" apart without a separate probe or parsing its prose.
+zypup_reboot_required() {
+  local status=0
+
+  ((ZYPUP_UPGRADE_REBOOT_NEEDED == 0)) || return 0
+  zypup_zypper --quiet needs-rebooting >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) return 1 ;;
+    "$ZYPUP_EXIT_REBOOT_NEEDED") return 0 ;;
+  esac
+  return 2
+}
+
+# `zypper verify` checks that every installed package's dependencies are
+# satisfied; --dry-run keeps it from installing or removing anything to repair
+# them.
+check_package_integrity() {
+  sysup_log "checking package dependencies"
+  if zypup_zypper_local verify --dry-run; then
+    # A repair zypper can plan still exits 0 under --dry-run, so this only
+    # proves no unresolvable problem; any proposed repair is printed above.
+    printf 'ok: zypper verify found no unresolvable dependency problems; review any repair it proposed above\n'
+    return 0
+  fi
+  # A lock, metadata, or privilege failure also exits non-zero, so do not
+  # assert a cause the status alone does not establish.
+  printf '\nerror: zypper verify failed; see its output above; dependency state is unverified\n' >&2
+  return 1
+}
+
+# Advisory: the upgrade succeeded, but its result is not fully live yet.
+report_pending_state() {
+  local reboot_status=0
+
+  sysup_log "checking for pending post-upgrade work"
+
+  if zypup_reboot_required; then
+    printf 'reboot required to complete this upgrade\n'
+  else
+    reboot_status=$?
+    if ((reboot_status == 1)); then
+      printf 'ok: no reboot required\n'
+    else
+      printf 'warning: could not determine whether a reboot is required; zypper needs-rebooting is unavailable or failed\n' >&2
+    fi
+  fi
+
+  sysup_rpm_report_pending_conffiles
+}
+
+# ---------------------------------------------------------------------------
+# sysup backend hooks
+# ---------------------------------------------------------------------------
+
+sysup_backend_require() {
+  sysup_require_family suse || return
+
+  # openSUSE MicroOS, Aeon, Kalpa, Leap Micro, and SLE Micro mount the root
+  # read-only and change it only through transactional-update snapshots.
+  # zypper would fail late with a generic error, so name the right tool before
+  # starting. Both conditions are required: a read-only root alone may be a
+  # rescue or maintenance state, and the tool alone is installable anywhere.
+  if zypup_root_read_only && [[ -x "$ZYPUP_TRANSACTIONAL_UPDATE" ]]; then
+    printf "error: this host has a read-only root managed by transactional-update; upgrade it with 'transactional-update up' or 'transactional-update dup'\n" >&2
+    return 1
+  fi
+  sysup_need_cmds zypper rpm find sort
+}
+
+# Package locks are the openSUSE analogue of held packages: the upgrade skips
+# them, so surface them rather than letting a locked package silently go
+# stale. The list is informational, so an unreadable locks file is a warning.
+sysup_backend_preamble() {
+  local -a locks=()
+  local listing
+
+  if ! listing="$(zypup_locked_packages)"; then
+    sysup_log "package locks (unknown)"
+    printf 'warning: could not read %s; package locks are unknown\n' "$ZYPUP_LOCKS_FILE" >&2
+    return 0
+  fi
+  if [[ -n "$listing" ]]; then
+    mapfile -t locks <<<"$listing"
+  fi
+  sysup_log "package locks (${#locks[@]})"
+  if ((${#locks[@]})); then
+    printf '  %s\n' "${locks[@]}"
+  else
+    printf '  (none)\n'
+  fi
+}
+
+sysup_backend_snapshot() {
+  sysup_rpm_snapshot
+}
+
+sysup_backend_package_files() {
+  sysup_rpm_package_files "$1"
+}
+
+sysup_backend_checks() {
+  local status=0
+
+  check_package_integrity || status=1
+  # Advisory: a pending reboot or unmerged config file is expected output from a
+  # successful upgrade, not a failure, so it never changes the exit status.
+  report_pending_state
+  return "$status"
+}
+
+# zypper has no autoremove command. `packages --unneeded` lists what libzypp
+# considers unneeded, but that rests on install-reason records not reliable
+# enough for unattended removal, so both modes only list the candidates and
+# leave removal to the operator.
+#
+# The listing is shown as zypper prints it, never parsed. zypper's --xmlout
+# does not cover this command: its table is written as plain text even in XML
+# mode, so there is no structured form to extract names from. --quiet
+# suppresses the "No packages found." notice and progress lines while still
+# printing the table, so empty output means nothing is unneeded. A failed
+# query is advisory, matching the other backends' reports. stderr stays on the
+# terminal so zypper warnings never read as packages.
+sysup_backend_autoremove() {
+  local listing line
+
+  if ! listing="$(zypup_zypper_local --quiet packages --unneeded)"; then
+    printf 'warning: could not determine which packages are no longer required\n' >&2
+    return 0
+  fi
+  if [[ -z "$listing" ]]; then
+    printf 'ok: no packages are eligible for removal\n'
+    return 0
+  fi
+  sysup_log "packages no longer required"
+  while IFS= read -r line; do
+    printf '  %s\n' "$line"
+  done <<<"$listing"
+  if [[ "$1" == apply ]]; then
+    printf '\nnote: zypup only lists these packages; zypper has no autoremove, and its unneeded list is not reliable enough to remove packages unattended. Review them and remove with zypper remove --clean-deps\n'
+  fi
+  return 0
+}
+
+# Refresh first, as its own step, so a repository that cannot be refreshed
+# stops the run before any package changes. `dist-upgrade` in particular must
+# not proceed on partial metadata: a package from a repository that failed to
+# load looks orphaned and can be replaced or removed.
+sysup_backend_upgrade() {
+  local verb
+
+  verb="$(zypup_upgrade_verb)"
+  zypup_zypper refresh || return
+  zypup_run_upgrade "$verb" "$@"
+}
+
+if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then
+  sysup_main "$@"
+fi
