@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# dnfup - the Fedora/RHEL backend for sysup.
+#
+# Shared run sequence, systemd handling, and family detection live beside this
+# private backend; this file only supplies the dnf/rpm specifics.
+#
+# This upgrades packages within the installed release. It never runs
+# `dnf system-upgrade` and never changes the configured release version.
+set -Eeuo pipefail
+
+# Read by the sysup library sourced below, for messages and the family guard.
+# shellcheck disable=SC2034
+SYSUP_BACKEND_NAME=dnfup
+
+_dnfup_lib_dir() {
+  local src="${BASH_SOURCE[0]}"
+  (cd "$(dirname "$src")" >/dev/null 2>&1 && pwd -P)
+}
+
+# shellcheck source=common.sh
+. "$(_dnfup_lib_dir)/common.sh"
+
+# System paths dnfup reads. Overridable so tests can point them at a fixture
+# tree instead of the live system.
+DNFUP_CONFFILE_ROOT="${DNFUP_CONFFILE_ROOT:-/etc}"
+# Present on hosts booted from an rpm-ostree or bootc image (Fedora Atomic
+# desktops, CoreOS, image-mode RHEL).
+DNFUP_OSTREE_BOOTED_FILE="${DNFUP_OSTREE_BOOTED_FILE:-/run/ostree-booted}"
+
+sysup_backend_usage() {
+  cat <<'EOF'
+Usage: sysup [--no-autoremove] [--check-only]
+             [--no-restart-upgraded-services] [--restart-failed] [--]
+             [extra dnf args...]
+
+Upgrade a Fedora or RHEL-family host within its installed release, then verify
+the failure modes most likely to leave services broken after the upgrade.
+
+Default flow:
+  1. warm sudo credentials
+  2. refresh metadata and upgrade packages noninteractively
+  3. remove packages no longer required
+  4. run dnf check, pending-config, and reboot-required checks
+  5. restart active services shipped by packages upgraded in this run
+  6. optionally restart failed enabled units with --restart-failed
+  7. report failed systemd units when systemd is available
+
+Options:
+EOF
+  sysup_usage_common_options
+  cat <<'EOF'
+
+Extra arguments are passed through to the dnf upgrade invocation. Package
+installation is noninteractive by default.
+
+dnfup never performs a release upgrade; use `dnf system-upgrade` or the
+distribution's documented procedure for that.
+EOF
+}
+
+dnfup_dnf() {
+  sysup_run_as_root dnf "$@"
+}
+
+# dnf for questions answered from the installed rpmdb alone. Repositories are
+# disabled because dnf otherwise loads every enabled repo first, and a load
+# failure (offline host, expired cache, mirror down) exits with the same status
+# these commands use for their findings.
+dnfup_dnf_local() {
+  dnfup_dnf --disablerepo='*' "$@"
+}
+
+# Config files an upgrade wrote beside a locally modified copy (.rpmnew), or
+# saved when it replaced one (.rpmsave, .rpmorig). Either way the operator has
+# a merge to review. Runs unprivileged, so a root-only directory can make it incomplete;
+# the caller reports that rather than escalating to list filenames.
+dnfup_pending_conffiles() {
+  find "$DNFUP_CONFFILE_ROOT" \
+    \( -name '*.rpmnew' -o -name '*.rpmsave' -o -name '*.rpmorig' \) \
+    -type f -print 2>/dev/null | sort
+}
+
+# Return 0 when a reboot is required, 1 when not, 2 when it cannot be told.
+#
+# `needs-restarting` ships in dnf-plugins-core (dnf4) and dnf5-plugins. It
+# exits 1 when a reboot is needed and 0 when not. dnf4 needs -r to select the
+# reboot check; dnf5 makes it the default and accepts -r for compatibility.
+# dnf also exits 1 for an unknown command, so a host without the plugin would
+# read as "reboot required"; probe for the command first rather than parsing
+# its prose.
+#
+# With repositories disabled, dnf5 consults only its built-in core-package
+# list, not the reboot_suggested flags in repository advisories. That trade is
+# deliberate: a repository that fails to load would exit 1 and read as "reboot
+# required". The "ok" message therefore says what was actually checked.
+dnfup_reboot_required() {
+  local status=0
+
+  dnfup_dnf_local needs-restarting --help >/dev/null 2>&1 || return 2
+  dnfup_dnf_local needs-restarting -r >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) return 1 ;;
+    1) return 0 ;;
+  esac
+  return 2
+}
+
+# `dnf check` in both dnf4 and dnf5 reports unsatisfied dependencies, duplicate
+# packages, and obsoleted packages still installed. Duplicates are the usual
+# remains of an interrupted transaction, which `rpm -Va` does not detect.
+check_package_integrity() {
+  sysup_log "checking package database integrity"
+  if dnfup_dnf_local check; then
+    printf 'ok: dnf check reports a consistent package database\n'
+    return 0
+  fi
+  # A database open or privilege failure also exits non-zero, so do not
+  # assert a cause the status alone does not establish.
+  printf '\nerror: dnf check failed; see its output above; package database state is unverified\n' >&2
+  return 1
+}
+
+# Advisory: the upgrade succeeded, but its result is not fully live yet.
+report_pending_state() {
+  local -a conffiles=()
+  local conffile_listing="" reboot_status=0 conffile_status=0
+
+  sysup_log "checking for pending post-upgrade work"
+
+  if dnfup_reboot_required; then
+    printf 'reboot required to complete this upgrade\n'
+  else
+    reboot_status=$?
+    if ((reboot_status == 1)); then
+      printf 'ok: no reboot required by packages updated since boot (repository advisories not consulted)\n'
+    else
+      printf 'warning: could not determine whether a reboot is required; install or repair the dnf needs-restarting plugin and check again\n' >&2
+    fi
+  fi
+
+  conffile_listing="$(dnfup_pending_conffiles)" || conffile_status=$?
+  if [[ -n "$conffile_listing" ]]; then
+    mapfile -t conffiles <<<"$conffile_listing"
+  fi
+  if ((${#conffiles[@]})); then
+    printf '\nconfig files awaiting a manual merge:\n'
+    printf '  %s\n' "${conffiles[@]}"
+  fi
+  if ((conffile_status != 0)); then
+    printf 'warning: could not completely scan for config files awaiting a manual merge\n' >&2
+  elif ((${#conffiles[@]} == 0)); then
+    printf 'ok: no config files awaiting a manual merge\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# sysup backend hooks
+# ---------------------------------------------------------------------------
+
+sysup_backend_require() {
+  sysup_require_family fedora || return
+
+  # dnf refuses to change a read-only image-based root, so the upgrade would
+  # fail late with a generic error. Name the right tool before starting.
+  if [[ -e "$DNFUP_OSTREE_BOOTED_FILE" ]]; then
+    printf "error: this host boots from an rpm-ostree or bootc image; upgrade it with 'rpm-ostree upgrade' or 'bootc upgrade'\n" >&2
+    return 1
+  fi
+
+  # RHEL/CentOS 7 and Amazon Linux 2 match the family but ship only yum.
+  if ! command -v dnf >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then
+    printf 'error: this host has yum but not dnf; dnfup supports dnf-based releases only\n' >&2
+    return 1
+  fi
+  sysup_need_cmds dnf rpm find sort
+}
+
+# NAME.ARCH, not NAME: a multilib host installs both arches of a library, and a
+# bare name would collapse their two versions into one, hiding an upgrade.
+# rpm accepts the same NAME.ARCH form when listing files.
+#
+# Installonly packages (kernel, kernel-core, ...) keep several versions under
+# one NAME.ARCH. The driver's diff keys on the name, so each is written as one
+# line holding its comma-joined versions: an unchanged kernel set then compares
+# equal, and an added or removed kernel still shows as a change. The C locale
+# keeps a package's rows adjacent; other collations can ignore punctuation.
+#
+# gpg-pubkey entries are imported signing keys, not packages: they have no
+# architecture, several share one name, and `rpm -ql` cannot list them. A
+# newly imported key would otherwise look like an upgrade the restart step
+# cannot resolve.
+sysup_backend_snapshot() {
+  rpm -qa --qf '%{NAME}.%{ARCH} %{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' |
+    while read -r pkg version; do
+      [[ -n "${pkg:-}" ]] || continue
+      [[ "$pkg" != *.'(none)' ]] || continue
+      printf '%s %s\n' "$pkg" "$version"
+    done | LC_ALL=C sort | dnfup_join_versions
+}
+
+# Merge adjacent rows of one package into "<pkg> <v1>,<v2>,...".
+dnfup_join_versions() {
+  local pkg version current="" versions=""
+
+  while read -r pkg version; do
+    if [[ "$pkg" == "$current" ]]; then
+      versions+=",$version"
+      continue
+    fi
+    [[ -z "$current" ]] || printf '%s %s\n' "$current" "$versions"
+    current="$pkg"
+    versions="$version"
+  done
+  [[ -z "$current" ]] || printf '%s %s\n' "$current" "$versions"
+}
+
+sysup_backend_package_files() {
+  rpm -ql "$1"
+}
+
+sysup_backend_checks() {
+  local status=0
+
+  check_package_integrity || status=1
+  # Advisory: a pending reboot or unmerged config file is expected output from a
+  # successful upgrade, not a failure, so it never changes the exit status.
+  report_pending_state
+  return "$status"
+}
+
+# Autoremove removes packages whose recorded install reason is "dependency".
+# The running kernel is guarded by protect_running_kernel, which makes the
+# transaction fail rather than skip it, so a wrongly recorded kernel surfaces as
+# a failed cleanup instead of an unbootable host.
+sysup_backend_autoremove() {
+  local listing
+  local -a unneeded=()
+
+  if [[ "$1" == report ]]; then
+    # A listing is advisory, matching the other backends' reports.
+    # stderr stays on the terminal: dnf warnings must not read as packages.
+    if ! listing="$(dnfup_dnf_local -q repoquery --unneeded)"; then
+      printf 'warning: could not determine which packages are no longer required\n' >&2
+      return 0
+    fi
+    if [[ -z "$listing" ]]; then
+      printf 'ok: no packages are eligible for autoremove\n'
+      return 0
+    fi
+    mapfile -t unneeded <<<"$listing"
+    sysup_log "packages no longer required"
+    printf '  %s\n' "${unneeded[@]}"
+    printf '\nhint: run sysup without --no-autoremove to remove them\n'
+    return 0
+  fi
+
+  sysup_log "removing packages no longer required"
+  dnfup_dnf autoremove -y
+}
+
+sysup_backend_upgrade() {
+  dnfup_dnf upgrade --refresh -y "$@"
+}
+
+if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then
+  sysup_main "$@"
+fi

@@ -21,7 +21,8 @@
 _sysup_family_table() {
   printf '%s\n' \
     'arch|archup|Arch Linux|arch|arch-release' \
-    'debian|debup|Debian-based|debian ubuntu|debian_version'
+    'debian|debup|Debian-based|debian ubuntu|debian_version' \
+    'fedora|dnfup|Fedora/RHEL-based|fedora rhel centos|redhat-release'
 }
 _sysup_family_field() {
   local want="$1" field="$2" family command label ids marker

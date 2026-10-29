@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+# dnfup-test - unit tests for the Fedora/RHEL upgrade helper.
+#
+# dnfup reaches dnf through `sudo dnf`, so the package manager mocks are real
+# executables on PATH rather than shell functions, matching debup-test.
+
+set -euo pipefail
+export NO_COLOR=1
+
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
+# shellcheck source=lib/test.sh
+. "$TEST_DIR/lib/test.sh"
+
+DNFUP_MOCK_BIN=$(_mock_bin)
+export PATH="$DNFUP_MOCK_BIN:$PATH"
+
+# Written by the mocks, asserted by the tests.
+DNFUP_DNF_LOG="$(_tmpdir)/dnf.log"
+DNFUP_RPM_LOG="$(_tmpdir)/rpm.log"
+DNFUP_SYSTEMCTL_LOG="$(_tmpdir)/systemctl.log"
+export DNFUP_DNF_LOG DNFUP_RPM_LOG DNFUP_SYSTEMCTL_LOG
+
+# Fixture state the mocks read.
+export DNFUP_MOCK_INSTALLED=""     # rpm -qa rows: "<name>.<arch> <epoch>:<version>-<release>"
+export DNFUP_MOCK_UPGRADED=""      # rows that replace DNFUP_MOCK_INSTALLED on upgrade
+export DNFUP_MOCK_PACKAGE_FILES="" # rpm -ql rows: "<name>.<arch> <file>"
+export DNFUP_MOCK_ACTIVE_UNITS=""
+export DNFUP_MOCK_FAILED_UNITS=""
+export DNFUP_MOCK_UNNEEDED=""
+export DNFUP_MOCK_CHECK_OUTPUT=""
+export DNFUP_MOCK_CHECK_STATUS=0
+export DNFUP_MOCK_UPGRADE_STATUS=0
+export DNFUP_MOCK_APPLY_BEFORE_FAILURE=0
+export DNFUP_MOCK_AUTOREMOVE_STATUS=0
+export DNFUP_MOCK_REPOQUERY_STATUS=0
+export DNFUP_MOCK_NEEDS_RESTARTING=1 # 0 models a host without the plugin
+export DNFUP_MOCK_REBOOT_STATUS=0
+export DNFUP_MOCK_RPM_QA_STATUS=0
+DNFUP_MOCK_STATE="$(_tmpdir)/installed"
+export DNFUP_MOCK_STATE
+
+_dnfup_write_mock() {
+  local name="$1"
+  cat >"$DNFUP_MOCK_BIN/$name"
+  chmod +x "$DNFUP_MOCK_BIN/$name"
+}
+
+_dnfup_write_mock sudo <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "-v" ]] && exit 0
+exec "$@"
+EOF
+
+_dnfup_write_mock dnf <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$DNFUP_DNF_LOG"
+
+# The first non-option argument is the command, as dnf parses it.
+command=""
+for arg in "$@"; do
+  [[ "$arg" == -* ]] && continue
+  command="$arg"
+  break
+done
+
+case "$command" in
+  upgrade)
+    if ((DNFUP_MOCK_APPLY_BEFORE_FAILURE != 0)) && [[ -n "$DNFUP_MOCK_UPGRADED" ]]; then
+      printf '%s\n' "$DNFUP_MOCK_UPGRADED" >"$DNFUP_MOCK_STATE"
+    fi
+    ((DNFUP_MOCK_UPGRADE_STATUS == 0)) || exit "$DNFUP_MOCK_UPGRADE_STATUS"
+    [[ -z "$DNFUP_MOCK_UPGRADED" ]] || printf '%s\n' "$DNFUP_MOCK_UPGRADED" >"$DNFUP_MOCK_STATE"
+    ;;
+  autoremove) exit "$DNFUP_MOCK_AUTOREMOVE_STATUS" ;;
+  check)
+    printf '%s' "$DNFUP_MOCK_CHECK_OUTPUT"
+    exit "$DNFUP_MOCK_CHECK_STATUS"
+    ;;
+  repoquery)
+    # A warning on stderr must never be mistaken for a package.
+    printf 'mock dnf warning on stderr\n' >&2
+    printf '%s' "$DNFUP_MOCK_UNNEEDED"
+    exit "$DNFUP_MOCK_REPOQUERY_STATUS"
+    ;;
+  needs-restarting)
+    if ((DNFUP_MOCK_NEEDS_RESTARTING == 0)); then
+      # dnf exits 1 for an unknown command, the same status as "reboot needed".
+      printf 'No such command: needs-restarting\n' >&2
+      exit 1
+    fi
+    [[ " $* " == *" --help "* ]] && exit 0
+    exit "$DNFUP_MOCK_REBOOT_STATUS"
+    ;;
+esac
+exit 0
+EOF
+
+_dnfup_write_mock rpm <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$DNFUP_RPM_LOG"
+case "${1:-}" in
+  -qa)
+    ((DNFUP_MOCK_RPM_QA_STATUS == 0)) || exit "$DNFUP_MOCK_RPM_QA_STATUS"
+    rows=$(cat "$DNFUP_MOCK_STATE")
+    [[ -n "$rows" ]] || rows="$DNFUP_MOCK_INSTALLED"
+    [[ -z "$rows" ]] || printf '%s\n' "$rows"
+    ;;
+  -ql)
+    found=0
+    while read -r pkg file; do
+      [[ "${pkg:-}" == "$2" ]] || continue
+      printf '%s\n' "$file"
+      found=1
+    done <<<"$DNFUP_MOCK_PACKAGE_FILES"
+    if ((found == 0)); then
+      printf 'package %s is not installed\n' "$2"
+      exit 1
+    fi
+    ;;
+esac
+exit 0
+EOF
+
+_dnfup_write_mock systemctl <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-units)
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] && printf '%s loaded active running mock unit\n' "$unit"
+    done <<<"$DNFUP_MOCK_ACTIVE_UNITS"
+    ;;
+  show)
+    unit="${!#}"
+    if [[ "$*" == *--property=ActiveState* ]]; then
+      if grep -qxF -- "$unit" <<<"$DNFUP_MOCK_ACTIVE_UNITS"; then
+        printf 'ActiveState=active\nActiveEnterTimestampMonotonic=100\n'
+      else
+        printf 'ActiveState=inactive\nActiveEnterTimestampMonotonic=0\n'
+      fi
+    else
+      printf 'yes\n'
+    fi
+    ;;
+  --failed) printf '%s' "$DNFUP_MOCK_FAILED_UNITS" ;;
+  is-enabled) printf 'enabled\n' ;;
+  *) printf '%s\n' "$*" >>"$DNFUP_SYSTEMCTL_LOG" ;;
+esac
+exit 0
+EOF
+
+export SYSUP_SOURCE_ONLY=1
+# Never read or write the host's deferred-restart state or boot identity.
+SYSUP_STATE_DIR="$(_tmpdir)/state"
+SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
+printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
+# shellcheck source=../lib/sysup/dnfup
+. "$REPO_ROOT/lib/sysup/dnfup"
+
+# Point the conffile scan at a fixture tree instead of the live system.
+DNFUP_FIXTURE_ETC=$(_tmpdir)
+# shellcheck disable=SC2034 # read by the sourced dnfup under test.
+DNFUP_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
+# Never let the live host's image-based marker decide a test.
+DNFUP_OSTREE_BOOTED_FILE="$(_tmpdir)/absent"
+
+# The suite does not run on a Fedora host, so neutralize the family guard the
+# way the other backend suites do. One case later restores it to prove it runs.
+# shellcheck disable=SC2329 # invoked indirectly by the sourced dnfup.
+sysup_require_family() {
+  return 0
+}
+
+_dnfup_reset() {
+  : >"$DNFUP_DNF_LOG"
+  : >"$DNFUP_RPM_LOG"
+  : >"$DNFUP_SYSTEMCTL_LOG"
+  : >"$DNFUP_MOCK_STATE"
+  DNFUP_MOCK_INSTALLED=""
+  DNFUP_MOCK_UPGRADED=""
+  DNFUP_MOCK_PACKAGE_FILES=""
+  DNFUP_MOCK_ACTIVE_UNITS=""
+  DNFUP_MOCK_FAILED_UNITS=""
+  DNFUP_MOCK_UNNEEDED=""
+  DNFUP_MOCK_CHECK_OUTPUT=""
+  DNFUP_MOCK_CHECK_STATUS=0
+  DNFUP_MOCK_UPGRADE_STATUS=0
+  DNFUP_MOCK_APPLY_BEFORE_FAILURE=0
+  DNFUP_MOCK_AUTOREMOVE_STATUS=0
+  DNFUP_MOCK_REPOQUERY_STATUS=0
+  DNFUP_MOCK_NEEDS_RESTARTING=1
+  DNFUP_MOCK_REBOOT_STATUS=0
+  DNFUP_MOCK_RPM_QA_STATUS=0
+  rm -rf "${DNFUP_FIXTURE_ETC:?}"/*
+  rm -rf "${SYSUP_STATE_DIR:?}"
+}
+
+# Capture output rather than discarding it: a non-zero status anywhere in the
+# composed driver path is otherwise invisible, and the assertion message is the
+# only place the cause would surface.
+_dnfup_main() {
+  set +e
+  DNFUP_RESULT=$(sysup_main "$@" 2>&1)
+  DNFUP_STATUS=$?
+  set -e
+}
+
+echo "=== dnfup: usage ==="
+
+usage=$(sysup_backend_usage)
+_assert_contains "dnfup usage: documents unattended package installation" \
+  "upgrade packages noninteractively" "$usage"
+_assert_contains "dnfup usage: documents the shared flags" \
+  "--no-autoremove" "$usage"
+_assert_contains "dnfup usage: rules out release upgrades" \
+  "never performs a release upgrade" "$usage"
+
+echo ""
+echo "=== dnfup: package snapshot ==="
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED=$'zsh.x86_64 0:5.9-1.fc41\nlibdemo.i686 0:1.0-1.fc41\nlibdemo.x86_64 0:1.0-1.fc41\ngpg-pubkey.(none) 0:aaaa-1111\ngpg-pubkey.(none) 0:bbbb-2222'
+snapshot=$(sysup_backend_snapshot)
+_assert_eq "dnfup snapshot: keeps both multilib arches, drops signing keys, sorts" \
+  $'libdemo.i686 0:1.0-1.fc41\nlibdemo.x86_64 0:1.0-1.fc41\nzsh.x86_64 0:5.9-1.fc41' "$snapshot"
+# shellcheck disable=SC2016 # These assertions intentionally match rpm's literal format tokens.
+_assert_contains "dnfup snapshot: requests architecture-qualified names" \
+  '%{NAME}.%{ARCH}' "$(cat "$DNFUP_RPM_LOG")"
+# shellcheck disable=SC2016
+_assert_contains "dnfup snapshot: includes the epoch so an epoch bump is an upgrade" \
+  '%{EPOCHNUM}:' "$(cat "$DNFUP_RPM_LOG")"
+
+# Installonly packages keep several versions under one NAME.ARCH. An
+# unchanged set must compare equal, and a new kernel must still register.
+_dnfup_reset
+DNFUP_MOCK_INSTALLED=$'kernel-core.x86_64 0:6.11.2-300\nkernel-core.x86_64 0:6.10.9-200\nbash.x86_64 0:5.2-1'
+snapshot=$(sysup_backend_snapshot)
+_assert_eq "dnfup snapshot: joins installonly versions into one row per package" \
+  $'bash.x86_64 0:5.2-1\nkernel-core.x86_64 0:6.10.9-200,0:6.11.2-300' "$snapshot"
+before=$(_tmpfile)
+after=$(_tmpfile)
+printf '%s\n' "$snapshot" >"$before"
+printf '%s\n' "$snapshot" >"$after"
+_assert_eq "dnfup snapshot: an unchanged kernel set is not an upgrade" \
+  "" "$(sysup_changed_packages "$before" "$after")"
+DNFUP_MOCK_INSTALLED=$'kernel-core.x86_64 0:6.11.2-300\nkernel-core.x86_64 0:6.10.9-200\nkernel-core.x86_64 0:6.11.5-300\nbash.x86_64 0:5.2-1'
+sysup_backend_snapshot >"$after"
+_assert_eq "dnfup snapshot: an added kernel is a change" \
+  "kernel-core.x86_64" "$(sysup_changed_packages "$before" "$after")"
+
+_dnfup_reset
+DNFUP_MOCK_RPM_QA_STATUS=1
+set +e
+sysup_backend_snapshot >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "dnfup snapshot: an rpm failure is not an empty package list" "1" "$status"
+
+echo ""
+echo "=== dnfup: full run ==="
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="openssh-server.x86_64 0:9.8-1.fc41"
+DNFUP_MOCK_UPGRADED="openssh-server.x86_64 0:9.9-1.fc41"
+DNFUP_MOCK_PACKAGE_FILES=$'openssh-server.x86_64 /usr/lib/systemd/system/sshd.service'
+DNFUP_MOCK_ACTIVE_UNITS="sshd.service"
+_dnfup_main
+dnf_log=$(cat "$DNFUP_DNF_LOG")
+_assert_eq "dnfup main: succeeds (output: $DNFUP_RESULT)" "0" "$DNFUP_STATUS"
+_assert_contains "dnfup main: refreshes metadata and upgrades noninteractively" \
+  "upgrade --refresh -y" "$dnf_log"
+_assert_contains "dnfup main: removes unneeded packages after a clean upgrade" \
+  "autoremove -y" "$dnf_log"
+_assert_contains "dnfup main: restarts services of upgraded packages" \
+  "try-restart sshd.service" "$(cat "$DNFUP_SYSTEMCTL_LOG")"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_dnfup_main -- --exclude=kernel*
+dnf_log=$(cat "$DNFUP_DNF_LOG")
+_assert_contains "dnfup main: forwards extra arguments to dnf upgrade" \
+  "upgrade --refresh -y --exclude=kernel*" "$dnf_log"
+_assert_not_contains "dnfup main: custom arguments skip automatic cleanup" \
+  "autoremove" "$dnf_log"
+
+# Only one arch of a multilib pair changed; its unit must still be found.
+_dnfup_reset
+DNFUP_MOCK_INSTALLED=$'libdemo.i686 0:1.0-1\nlibdemo.x86_64 0:1.0-1'
+DNFUP_MOCK_UPGRADED=$'libdemo.i686 0:2.0-1\nlibdemo.x86_64 0:1.0-1'
+DNFUP_MOCK_PACKAGE_FILES=$'libdemo.i686 /usr/lib/systemd/system/libdemo32.service'
+DNFUP_MOCK_ACTIVE_UNITS="libdemo32.service"
+_dnfup_main
+_assert_contains "dnfup main: preserves multilib identity through service discovery" \
+  "try-restart libdemo32.service" "$(cat "$DNFUP_SYSTEMCTL_LOG")"
+_assert_contains "dnfup main: lists files by name.arch" \
+  "-ql libdemo.i686" "$(cat "$DNFUP_RPM_LOG")"
+
+# An upgrade that imports a new signing key adds a gpg-pubkey row. rpm -ql
+# cannot list it, so it must not reach the restart step and fail the run.
+_dnfup_reset
+DNFUP_MOCK_INSTALLED=$'gpg-pubkey.(none) 0:aaaa-1111\nbase.x86_64 0:1.0-1'
+DNFUP_MOCK_UPGRADED=$'gpg-pubkey.(none) 0:aaaa-1111\ngpg-pubkey.(none) 0:bbbb-2222\nbase.x86_64 0:1.0-1'
+_dnfup_main
+_assert_eq "dnfup main: a new signing key does not fail the run (output: $DNFUP_RESULT)" \
+  "0" "$DNFUP_STATUS"
+_assert_not_contains "dnfup main: never lists files for a signing key" \
+  "gpg-pubkey" "$(cat "$DNFUP_RPM_LOG")"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="openssh-server.x86_64 0:9.8-1"
+DNFUP_MOCK_UPGRADED="openssh-server.x86_64 0:9.9-1"
+DNFUP_MOCK_PACKAGE_FILES=$'openssh-server.x86_64 /usr/lib/systemd/system/sshd.service'
+DNFUP_MOCK_ACTIVE_UNITS="sshd.service"
+DNFUP_MOCK_UPGRADE_STATUS=1
+DNFUP_MOCK_APPLY_BEFORE_FAILURE=1
+_dnfup_main
+_assert_eq "dnfup main: keeps the dnf failure status" "1" "$DNFUP_STATUS"
+_assert_not_contains "dnfup main: never removes packages after a failed upgrade" \
+  "autoremove" "$(cat "$DNFUP_DNF_LOG")"
+_assert_contains "dnfup main: still restarts what a partial upgrade changed" \
+  "try-restart sshd.service" "$(cat "$DNFUP_SYSTEMCTL_LOG")"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+DNFUP_MOCK_AUTOREMOVE_STATUS=1
+_dnfup_main
+_assert_eq "dnfup main: a failed autoremove fails the run" "1" "$DNFUP_STATUS"
+_assert_contains "dnfup main: a failed autoremove still runs the checks" \
+  "checking package database integrity" "$DNFUP_RESULT"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+DNFUP_MOCK_ACTIVE_UNITS="sshd.service"
+_dnfup_main --check-only
+_assert_eq "dnfup check-only: succeeds (output: $DNFUP_RESULT)" "0" "$DNFUP_STATUS"
+_assert_not_contains "dnfup check-only: never upgrades" \
+  "upgrade" "$(cat "$DNFUP_DNF_LOG")"
+_assert_not_contains "dnfup check-only: never removes packages" \
+  "autoremove" "$(cat "$DNFUP_DNF_LOG")"
+_assert_eq "dnfup check-only: never touches systemd units" \
+  "" "$(cat "$DNFUP_SYSTEMCTL_LOG")"
+_assert_contains "dnfup check-only: still checks the package database" \
+  "--disablerepo=* check" "$(cat "$DNFUP_DNF_LOG")"
+
+# An epoch bump with an unchanged version is still an upgrade.
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="demo.x86_64 0:1.0-1"
+DNFUP_MOCK_UPGRADED="demo.x86_64 1:1.0-1"
+DNFUP_MOCK_PACKAGE_FILES=$'demo.x86_64 /usr/lib/systemd/system/demo.service'
+DNFUP_MOCK_ACTIVE_UNITS="demo.service"
+_dnfup_main
+_assert_contains "dnfup main: an epoch-only bump restarts the package's services" \
+  "try-restart demo.service" "$(cat "$DNFUP_SYSTEMCTL_LOG")"
+
+echo ""
+echo "=== dnfup: autoremove report ==="
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+DNFUP_MOCK_UNNEEDED=$'orphan-a-0:1.0-1.x86_64\norphan-b-0:2.0-1.noarch\n'
+_dnfup_main --no-autoremove
+_assert_contains "dnfup report: lists packages no longer required" \
+  "  orphan-b-0:2.0-1.noarch" "$DNFUP_RESULT"
+_assert_contains "dnfup report: queries the rpmdb without loading repositories" \
+  "--disablerepo=* -q repoquery --unneeded" "$(cat "$DNFUP_DNF_LOG")"
+_assert_not_contains "dnfup report: does not remove them" \
+  "autoremove" "$(cat "$DNFUP_DNF_LOG")"
+_assert_not_contains "dnfup report: dnf warnings are never listed as packages" \
+  "  mock dnf warning" "$DNFUP_RESULT"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_dnfup_main --no-autoremove
+_assert_contains "dnfup report: says when nothing is eligible" \
+  "no packages are eligible for autoremove" "$DNFUP_RESULT"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+DNFUP_MOCK_REPOQUERY_STATUS=1
+_dnfup_main --no-autoremove
+_assert_eq "dnfup report: a failed query is advisory" "0" "$DNFUP_STATUS"
+_assert_contains "dnfup report: says the query failed" \
+  "could not determine which packages are no longer required" "$DNFUP_RESULT"
+
+echo ""
+echo "=== dnfup: checks ==="
+
+_dnfup_reset
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "dnfup checks: a consistent host passes" "0" "$status"
+_assert_contains "dnfup checks: reports a consistent package database" \
+  "dnf check reports a consistent package database" "$result"
+dnf_log=$(cat "$DNFUP_DNF_LOG")
+# Repository loading can fail offline with the same status as a finding.
+_assert_contains "dnfup checks: dnf check runs without loading repositories" \
+  "--disablerepo=* check" "$dnf_log"
+_assert_contains "dnfup checks: needs-restarting runs without loading repositories" \
+  "--disablerepo=* needs-restarting -r" "$dnf_log"
+_assert_contains "dnfup checks: the plugin probe runs without loading repositories" \
+  "--disablerepo=* needs-restarting --help" "$dnf_log"
+
+_dnfup_reset
+DNFUP_MOCK_CHECK_OUTPUT=$'demo-1.0-1.x86_64 is a duplicate with demo-2.0-1.x86_64\n'
+DNFUP_MOCK_CHECK_STATUS=1
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "dnfup checks: a dnf check finding fails the run" "1" "$status"
+_assert_contains "dnfup checks: shows what dnf check reported" \
+  "is a duplicate with" "$result"
+_assert_contains "dnfup checks: does not claim a cause the status cannot establish" \
+  "package database state is unverified" "$result"
+_assert_contains "dnfup checks: a fatal check still runs the advisory checks" \
+  "no config files awaiting a manual merge" "$result"
+
+_dnfup_reset
+DNFUP_MOCK_REBOOT_STATUS=1
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "dnfup reboot: needs-restarting status 1 means a reboot is required" \
+  "reboot required to complete this upgrade" "$result"
+
+_dnfup_reset
+DNFUP_MOCK_REBOOT_STATUS=0
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "dnfup reboot: needs-restarting status 0 means no reboot" \
+  "ok: no reboot required" "$result"
+
+# Without the plugin, dnf's unknown-command status equals "reboot needed".
+_dnfup_reset
+DNFUP_MOCK_NEEDS_RESTARTING=0
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_not_contains "dnfup reboot: a missing plugin never claims a reboot is required" \
+  "reboot required to complete" "$result"
+_assert_contains "dnfup reboot: a missing plugin leaves reboot state unknown" \
+  "could not determine whether a reboot is required" "$result"
+_assert_eq "dnfup reboot: unknown reboot state is advisory" "0" "$status"
+
+_dnfup_reset
+DNFUP_MOCK_REBOOT_STATUS=2
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "dnfup reboot: an unexpected status leaves reboot state unknown" \
+  "could not determine whether a reboot is required" "$result"
+
+_dnfup_reset
+mkdir -p "$DNFUP_FIXTURE_ETC/ssh"
+: >"$DNFUP_FIXTURE_ETC/ssh/sshd_config.rpmnew"
+: >"$DNFUP_FIXTURE_ETC/demo.conf.rpmsave"
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "dnfup conffiles: lists .rpmnew files" \
+  "sshd_config.rpmnew" "$result"
+_assert_contains "dnfup conffiles: lists .rpmsave files" \
+  "demo.conf.rpmsave" "$result"
+
+_dnfup_reset
+: >"$DNFUP_FIXTURE_ETC/legacy.conf.rpmorig"
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "dnfup conffiles: lists .rpmorig files" \
+  "legacy.conf.rpmorig" "$result"
+
+_dnfup_reset
+result=$(sysup_backend_checks 2>&1)
+_assert_contains "dnfup conffiles: says when nothing awaits a merge" \
+  "ok: no config files awaiting a manual merge" "$result"
+
+# An unreadable tree must not be reported as clean.
+_dnfup_reset
+DNFUP_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC/missing"
+result=$(sysup_backend_checks 2>&1)
+# shellcheck disable=SC2034 # read by the sourced dnfup under test.
+DNFUP_CONFFILE_ROOT="$DNFUP_FIXTURE_ETC"
+_assert_contains "dnfup conffiles: a failed scan is reported as incomplete" \
+  "could not completely scan" "$result"
+_assert_not_contains "dnfup conffiles: a failed scan never claims a clean tree" \
+  "ok: no config files awaiting a manual merge" "$result"
+
+echo ""
+echo "=== dnfup: host guards ==="
+
+# Image-based hosts refuse dnf changes to their read-only root.
+_dnfup_reset
+DNFUP_OSTREE_BOOTED_FILE="$(_tmpdir)/ostree-booted"
+: >"$DNFUP_OSTREE_BOOTED_FILE"
+_dnfup_main
+_assert_eq "dnfup guard: refuses an rpm-ostree or bootc host" "1" "$DNFUP_STATUS"
+_assert_contains "dnfup guard: names the image-based upgrade tools" \
+  "rpm-ostree upgrade" "$DNFUP_RESULT"
+_assert_eq "dnfup guard: runs no dnf command on an image-based host" \
+  "" "$(cat "$DNFUP_DNF_LOG")"
+DNFUP_OSTREE_BOOTED_FILE="$(_tmpdir)/absent"
+
+# A yum-only release matches the family but cannot run dnfup. Restrict PATH to
+# a directory holding only yum and the commands the guard itself needs.
+_dnfup_reset
+yum_only_bin=$(_tmpdir)
+printf '#!/bin/sh\nexit 0\n' >"$yum_only_bin/yum"
+chmod +x "$yum_only_bin/yum"
+saved_path="$PATH"
+PATH="$yum_only_bin"
+hash -r
+_dnfup_main
+PATH="$saved_path"
+hash -r
+_assert_eq "dnfup guard: refuses a yum-only host" "1" "$DNFUP_STATUS"
+_assert_contains "dnfup guard: says the host has yum but not dnf" \
+  "has yum but not dnf" "$DNFUP_RESULT"
+
+echo ""
+echo "=== dnfup: family guard ==="
+
+_dnfup_reset
+dnfup_test_os_root=$(_tmpdir)
+mkdir -p "$dnfup_test_os_root/etc"
+printf 'ID=debian\n' >"$dnfup_test_os_root/etc/os-release"
+# Restore the real guard for this case; unset alone would leave it undefined.
+unset -f sysup_require_family
+# shellcheck source=../lib/sysup/detect.sh
+. "$REPO_ROOT/lib/sysup/detect.sh"
+SYSUP_OS_ROOT="$dnfup_test_os_root"
+_dnfup_main
+# shellcheck disable=SC2034 # read by the sourced detect.sh.
+SYSUP_OS_ROOT=""
+# shellcheck disable=SC2329 # invoked indirectly by the sourced dnfup.
+sysup_require_family() { return 0; }
+_assert_eq "dnfup main: refuses to run on a non-Fedora host" "1" "$DNFUP_STATUS"
+_assert_contains "dnfup main: names the host it refused" \
+  "only supports Fedora/RHEL-based hosts" "$DNFUP_RESULT"
+_assert_eq "dnfup main: runs no dnf command on the wrong family" \
+  "" "$(cat "$DNFUP_DNF_LOG")"
+
+_test_summary

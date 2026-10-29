@@ -2,7 +2,7 @@
 
 ## Problem
 
-Arch and Debian-family package managers expose different upgrade and recovery
+Arch, Debian-family, and Fedora-family package managers expose different upgrade and recovery
 semantics, but operators need one command whose checks, service restarts, and
 failure reporting remain consistent across supported hosts.
 
@@ -10,14 +10,20 @@ failure reporting remain consistent across supported hosts.
 
 - A Debian/Ubuntu upgrade helper, `debup`, with post-upgrade checks equivalent
   in spirit to `archup`'s.
+- A Fedora/RHEL upgrade helper, `dnfup`, built on the same contract.
 - A `sysup` front door that detects the OS family and runs the right backend.
-- One authoritative copy of the logic both backends share, rather than a second
+- One authoritative copy of the logic every backend shares, rather than a second
   copy of `archup`'s systemd and snapshot handling.
 
 ## Non-goals
 
 - Cross-release OS upgrades. `debup` never edits APT sources and never invokes
-  `do-release-upgrade`.
+  `do-release-upgrade`; `dnfup` never runs `dnf system-upgrade`.
+- openSUSE. It is RPM-based but upgrades through `zypper`, and Tumbleweed and
+  Leap need different verbs; it would be its own family, not part of `dnfup`.
+- Distributions without systemd (Alpine, Void, Gentoo with OpenRC). The shared
+  restart and failed-unit handling is systemd-only, so they need a service
+  layer of their own first.
 - macOS/Homebrew support. `sysup` errors clearly on unsupported families; a
   `brewup` backend can be added later without changing the contract.
 - Remote execution. `sysup` upgrades the host it runs on.
@@ -29,6 +35,7 @@ bin/sysup                public dispatcher: detect family -> exec backend
 lib/sysup/
   archup       private Arch backend
   debup        private Debian backend
+  dnfup        private Fedora/RHEL backend
   detect.sh    OS family vocabulary and detection
   common.sh    logging, privilege, package-diff, and the shared run driver
   systemd.sh   failed units and service restarts for upgraded packages
@@ -58,7 +65,7 @@ Optional hooks, with defaults in `common.sh`:
 | `sysup_backend_parse_arg <arg>` | unhandled (arg falls through to the package manager) | `debup` adds `--full-upgrade` |
 | `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages |
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
-| `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove` |
+| `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded` |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
 | `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one, and reports it unverified when either version cannot be read |
 | `sysup_backend_restart_services <pkg...>` | shared systemd restart | `debup` prefers `needrestart` |
@@ -211,6 +218,72 @@ Checks:
 | Pending conffiles (`.dpkg-dist`/`.dpkg-new`/`.ucf-dist` under `/etc`) | advisory |
 | Failed systemd units | fatal |
 
+## `dnfup` behavior
+
+The `fedora` family matches os-release `fedora`, `rhel`, and `centos`, so
+Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, Oracle Linux, and Amazon Linux
+2023 all select it, with `/etc/redhat-release` as the marker fallback.
+`dnfup` then refuses two kinds of host before touching dnf:
+
+- Image-based hosts (`/run/ostree-booted`: Fedora Atomic desktops, CoreOS,
+  image-mode RHEL), where dnf cannot change the read-only root. The error
+  names `rpm-ostree upgrade` and `bootc upgrade`.
+- yum-only releases (RHEL/CentOS 7, Amazon Linux 2), with an error that says
+  so instead of a bare missing-command report.
+
+Upgrade, as root:
+
+- `dnf upgrade --refresh -y`, forwarding extra arguments. dnf never prompts
+  about config files; it writes `.rpmnew`/`.rpmsave` instead, which the checks
+  report. Fedora's default `best=False` lets dnf skip a package whose
+  dependencies cannot be met and still exit 0; RHEL's `best=True` fails
+  instead.
+- `dnf autoremove -y`, through the shared autoremove step. It removes packages
+  whose recorded install reason is "dependency"; `installonly_limit` does not
+  apply. `protect_running_kernel` makes the transaction fail rather than skip
+  the running kernel, so a wrongly recorded kernel surfaces as a failed
+  cleanup. `--no-autoremove` reports `dnf repoquery --unneeded` instead.
+
+The snapshot keys packages by `NAME.ARCH` with `EPOCHNUM:VERSION-RELEASE`, so
+both arches of a multilib library stay distinct and an epoch-only bump counts
+as an upgrade; `rpm -ql` accepts the same `NAME.ARCH` form. Installonly
+packages (`kernel`, `kernel-core`, ...) keep several versions under one
+`NAME.ARCH`, and the driver's diff keys on the name, so each is one row of
+comma-joined versions: an unchanged kernel set compares equal, and an added
+or removed kernel registers as a change. `gpg-pubkey` entries (architecture
+`(none)`) are signing keys rather than packages and are dropped: importing a
+key during an upgrade would otherwise look like an upgraded package whose
+files cannot be listed.
+
+Service restarts use the shared package-diff path, like `archup`.
+
+Checks, using commands available under both dnf4 and dnf5:
+
+| Check | Severity |
+| --- | --- |
+| `dnf check`: unsatisfied dependencies, duplicates, obsoleted packages | fatal |
+| Reboot required (`dnf needs-restarting -r`, when the plugin is installed) | advisory |
+| Pending config merges (`.rpmnew`/`.rpmsave`/`.rpmorig` under `/etc`) | advisory |
+| Failed systemd units | fatal |
+
+`dnf check` is preferred over `rpm -Va --nofiles` because it also reports
+duplicate packages, the usual remains of an interrupted transaction.
+
+`check`, `needs-restarting`, and `repoquery --unneeded` run with
+`--disablerepo='*'`. dnf otherwise loads every enabled repository first, and a
+load failure (offline host, expired cache) exits 1, which `needs-restarting -r`
+also uses for "reboot needed". The cost is on dnf5: without repositories its
+`needs-restarting` checks only its built-in core-package list, not the
+`reboot_suggested` flags in repository advisories, so the "ok" message says
+advisories were not consulted. dnf4's check uses only the rpmdb. For the same
+reason `dnfup` probes `needs-restarting --help` first, since dnf exits 1 for
+an unknown command too, and reports reboot state as unknown when the plugin
+is missing rather than claiming a reboot.
+
+Not yet handled: dnf5 fails at once when another process (`dnf-automatic`,
+PackageKit) holds the rpm transaction lock, where dnf4 waits; and versionlocked
+or excluded packages are not listed the way `debup` lists held packages.
+
 ## Testing
 
 - `archup-test` covers the extracted shared hooks, AUR decisions, orphan
@@ -219,6 +292,9 @@ Checks:
 - `debup-test` mocks `apt-get`, `dpkg`, `dpkg-query`, and `systemctl` to cover
   the upgrade verb, default autoremove and its opt-out, each check, and
   `needrestart` preference.
+- `dnfup-test` mocks `dnf`, `rpm`, and `systemctl` to cover the upgrade and
+  autoremove policy, multilib, installonly, and signing-key snapshots, each
+  check, and the image-based, yum-only, and family guards.
 - `sysup-test` covers family detection from fixture `os-release` files,
   symlink-aware dispatch to the private backend, exact argument forwarding,
   portability constraints, and the installation layout.

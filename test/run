@@ -8,7 +8,7 @@ TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$TEST_DIR/.." && pwd)
 status=0
 
-for suite in sysup-test archup-test debup-test; do
+for suite in sysup-test archup-test debup-test dnfup-test; do
   bash "$TEST_DIR/$suite" || status=$?
 done
 

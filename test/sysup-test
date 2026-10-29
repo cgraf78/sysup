@@ -141,6 +141,33 @@ SYSUP_OS_ROOT="$os_root"
 _assert_eq "sysup detect: multi-token ID_LIKE resolves to Debian" \
   "debian" "$(sysup_os_family)"
 
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=fedora'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: Fedora by ID" "fedora" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=rocky' 'ID_LIKE="rhel centos fedora"'
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: RHEL rebuild by ID_LIKE" "fedora" "$(sysup_os_family)"
+
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=homegrown'
+: >"$os_root/etc/redhat-release"
+SYSUP_OS_ROOT="$os_root"
+_assert_eq "sysup detect: falls back to /etc/redhat-release" \
+  "fedora" "$(sysup_os_family)"
+
+# openSUSE is RPM-based but not dnf-based, so it must not match the Fedora row.
+os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=opensuse-tumbleweed' 'ID_LIKE="opensuse suse"'
+SYSUP_OS_ROOT="$os_root"
+set +e
+sysup_os_family >/dev/null
+status=$?
+set -e
+_assert_eq "sysup detect: openSUSE is not treated as Fedora" "1" "$status"
+
 # An unhelpful os-release must not defeat detection when the family marker file
 # is present.
 os_root=$(_sysup_os_root)
@@ -193,7 +220,7 @@ set -e
 _assert_eq "sysup detect: empty ID and ID_LIKE are unsupported" "1" "$status"
 
 os_root=$(_sysup_os_root)
-_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+_sysup_write_os_release "$os_root" 'ID=alpine'
 SYSUP_OS_ROOT="$os_root"
 set +e
 result=$(sysup_os_family)
@@ -214,10 +241,10 @@ export SYSUP_TEST_KERNEL=Linux
 _assert_eq "sysup detect: non-Linux kernel is unsupported" "1" "$status"
 
 os_root=$(_sysup_os_root)
-_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+_sysup_write_os_release "$os_root" 'ID=postmarketos' 'ID_LIKE=alpine'
 SYSUP_OS_ROOT="$os_root"
 _assert_eq "sysup detect: describes the host for error messages" \
-  "ID=fedora ID_LIKE=rhel" "$(sysup_os_description)"
+  "ID=postmarketos ID_LIKE=alpine" "$(sysup_os_description)"
 
 # A host with no os-release at all still has to produce a readable message.
 os_root=$(_sysup_os_root)
@@ -234,9 +261,9 @@ _assert_eq "sysup detect: os-release assignments do not leak into the caller" \
   "" "${ID:-}${NAME:-}"
 
 _assert_eq "sysup detect: supported families are reported for errors" \
-  "arch,debian" "$(sysup_supported_families)"
+  "arch,debian,fedora" "$(sysup_supported_families)"
 _assert_eq "sysup detect: family table maps each family to its backend" \
-  $'arch archup\ndebian debup' "$(sysup_family_commands)"
+  $'arch archup\ndebian debup\nfedora dnfup' "$(sysup_family_commands)"
 
 echo ""
 echo "=== sysup: family guard ==="
@@ -279,7 +306,7 @@ cp "$REPO_ROOT/lib/sysup/detect.sh" "$SYSUP_PROVIDER/lib/sysup/detect.sh"
 ln -s ../../provider/bin/sysup "$SYSUP_PUBLIC_BIN/sysup"
 
 SYSUP_DISPATCH_LOG="$SYSUP_FIXTURE/dispatch.log"
-for backend in archup debup; do
+for backend in archup debup dnfup; do
   cat >"$SYSUP_PROVIDER/lib/sysup/$backend" <<EOF
 #!/usr/bin/env bash
 {
@@ -313,6 +340,12 @@ _assert_eq "sysup dispatch: Ubuntu host runs debup" \
   "debup" "$(cat "$SYSUP_DISPATCH_LOG")"
 
 os_root=$(_sysup_os_root)
+_sysup_write_os_release "$os_root" 'ID=almalinux' 'ID_LIKE="rhel centos fedora"'
+_sysup_dispatch "$os_root" >/dev/null 2>&1
+_assert_eq "sysup dispatch: RHEL-family host runs dnfup" \
+  "dnfup" "$(cat "$SYSUP_DISPATCH_LOG")"
+
+os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=debian'
 _sysup_dispatch "$os_root" --check-only -- --extra >/dev/null 2>&1
 _assert_eq "sysup dispatch: forwards every argument to the backend" \
@@ -323,22 +356,22 @@ _assert_eq "sysup dispatch: preserves empty and shell-sensitive arguments" \
   "debup <> <two words> <*> <--> <tail>" "$(cat "$SYSUP_DISPATCH_LOG")"
 
 os_root=$(_sysup_os_root)
-_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+_sysup_write_os_release "$os_root" 'ID=alpine'
 set +e
 result=$(_sysup_dispatch "$os_root" 2>&1)
 status=$?
 set -e
 _assert_eq "sysup dispatch: unsupported host fails" "1" "$status"
-_assert_contains "sysup dispatch: names the detected host" "ID=fedora" "$result"
+_assert_contains "sysup dispatch: names the detected host" "ID=alpine" "$result"
 _assert_contains "sysup dispatch: lists the families it supports" \
-  "arch,debian" "$result"
+  "arch,debian,fedora" "$result"
 _assert_eq "sysup dispatch: unsupported host runs no backend" \
   "" "$(cat "$SYSUP_DISPATCH_LOG")"
 
 # --help has to work on a host sysup cannot upgrade, so it must not be gated
 # behind detection.
 os_root=$(_sysup_os_root)
-_sysup_write_os_release "$os_root" 'ID=fedora' 'ID_LIKE=rhel'
+_sysup_write_os_release "$os_root" 'ID=alpine'
 set +e
 result=$(_sysup_dispatch "$os_root" --help 2>&1)
 status=$?
@@ -350,6 +383,8 @@ _assert_contains "sysup dispatch: --help lists the Arch route from the table" \
   "  arch    -> archup" "$result"
 _assert_contains "sysup dispatch: --help lists the Debian route from the table" \
   "  debian  -> debup" "$result"
+_assert_contains "sysup dispatch: --help lists the Fedora route from the table" \
+  "  fedora  -> dnfup" "$result"
 
 os_root=$(_sysup_os_root)
 _sysup_write_os_release "$os_root" 'ID=debian'
@@ -379,7 +414,7 @@ _assert_contains "sysup dispatch: missing backend names what to install" \
 SYSUP_ABSOLUTE_BIN=$(_tmpdir)
 ln -s "$SYSUP_PROVIDER/bin/sysup" "$SYSUP_ABSOLUTE_BIN/sysup"
 os_root=$(_sysup_os_root)
-_sysup_write_os_release "$os_root" 'ID=fedora'
+_sysup_write_os_release "$os_root" 'ID=alpine'
 set +e
 result=$(SYSUP_OS_ROOT="$os_root" "$SYSUP_ABSOLUTE_BIN/sysup" 2>&1)
 status=$?
@@ -387,7 +422,7 @@ set -e
 _assert_eq "sysup dispatch: absolute install symlink loads provider detection" \
   "1" "$status"
 _assert_contains "sysup dispatch: absolute install symlink reports the host" \
-  "ID=fedora" "$result"
+  "ID=alpine" "$result"
 
 echo ""
 echo "=== sysup: installation layout ==="
@@ -440,7 +475,7 @@ else
 fi
 
 SYSUP_DIRECT_OS_ROOT=$(_sysup_os_root)
-_sysup_write_os_release "$SYSUP_DIRECT_OS_ROOT" 'ID=fedora'
+_sysup_write_os_release "$SYSUP_DIRECT_OS_ROOT" 'ID=alpine'
 set +e
 direct_dispatch_output=$(SYSUP_OS_ROOT="$SYSUP_DIRECT_OS_ROOT" \
   "$SYSUP_PREFIX/bin/sysup" 2>&1)
@@ -449,7 +484,7 @@ set -e
 _assert_eq "sysup install: direct link loads provider detection" \
   "1" "$direct_dispatch_status"
 _assert_contains "sysup install: direct link reports the detected host" \
-  "ID=fedora" "$direct_dispatch_output"
+  "ID=alpine" "$direct_dispatch_output"
 
 set +e
 PREFIX="$SYSUP_PREFIX" "$SYSUP_INSTALLER" >/dev/null 2>&1
@@ -500,7 +535,7 @@ _assert_eq "sysup install: curl link selects the managed checkout" \
   "$SYSUP_CURL_CHECKOUT/bin/sysup" \
   "$(readlink "$SYSUP_CURL_PREFIX/bin/sysup")"
 SYSUP_CURL_OS_ROOT=$(_sysup_os_root)
-_sysup_write_os_release "$SYSUP_CURL_OS_ROOT" 'ID=fedora'
+_sysup_write_os_release "$SYSUP_CURL_OS_ROOT" 'ID=alpine'
 set +e
 curl_dispatch_output=$(SYSUP_OS_ROOT="$SYSUP_CURL_OS_ROOT" \
   "$SYSUP_CURL_PREFIX/bin/sysup" 2>&1)
@@ -509,7 +544,7 @@ set -e
 _assert_eq "sysup install: curl link loads provider detection" \
   "1" "$curl_dispatch_status"
 _assert_contains "sysup install: curl link reports the detected host" \
-  "ID=fedora" "$curl_dispatch_output"
+  "ID=alpine" "$curl_dispatch_output"
 
 SYSUP_CUSTOM_BIN=$(_tmpdir)/commands
 BIN_DIR="$SYSUP_CUSTOM_BIN" "$SYSUP_INSTALLER_DELEGATE" >/dev/null
@@ -579,8 +614,12 @@ _assert_eq "sysup families: arch resolves to its label" \
   "Arch Linux" "$(sysup_family_label arch)"
 _assert_eq "sysup families: debian resolves to its label" \
   "Debian-based" "$(sysup_family_label debian)"
+_assert_eq "sysup families: fedora resolves to its backend" \
+  "dnfup" "$(sysup_family_command fedora)"
+_assert_eq "sysup families: fedora resolves to its label" \
+  "Fedora/RHEL-based" "$(sysup_family_label fedora)"
 set +e
-sysup_family_command fedora >/dev/null
+sysup_family_command alpine >/dev/null
 status=$?
 set -e
 _assert_eq "sysup families: an unknown family has no backend" "1" "$status"

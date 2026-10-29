@@ -3,12 +3,12 @@
 [![Tests](https://github.com/cgraf78/sysup/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/sysup/actions/workflows/test.yml?query=branch%3Amain)
 [![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
 [![Bash](https://img.shields.io/badge/bash-%3E%3D4.0-blue)](#requirements)
-[![Platform](https://img.shields.io/badge/platform-Arch%20%7C%20Debian%20%7C%20Ubuntu-lightgrey)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Arch%20%7C%20Debian%20%7C%20Ubuntu%20%7C%20Fedora-lightgrey)](#requirements)
 
-`sysup` is one command for upgrading Arch, Debian, and Ubuntu systems. It
-detects the host family, applies conservative package-manager policy, restarts
-services affected by the upgrade, and reports broken package or systemd state
-before returning.
+`sysup` is one command for upgrading Arch, Debian, Ubuntu, and Fedora/RHEL
+systems. It detects the host family, applies conservative package-manager
+policy, restarts services affected by the upgrade, and reports broken package
+or systemd state before returning.
 
 Tools like topgrade update everything on a machine (Homebrew, cargo, editor
 plugins). `sysup` does one thing, the OS package manager, plus the
@@ -54,9 +54,9 @@ provider-private `lib/sysup` tree. For example, a
 cgraf78/sysup  github
 ```
 
-Only `sysup` is a public command. The Arch and Debian implementations live
-under `lib/sysup` so their shared sequencing and package policy always update
-with the dispatcher.
+Only `sysup` is a public command. The Arch, Debian, and Fedora implementations
+live under `lib/sysup` so their shared sequencing and package policy always
+update with the dispatcher.
 
 ## Usage
 
@@ -111,6 +111,17 @@ It keeps locally modified conffiles, retries transient package-index failures,
 checks dpkg and apt integrity, reports pending conffile merges and reboot state,
 and prefers `needrestart` when it is installed.
 
+### Fedora and RHEL
+
+The Fedora backend covers Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, and
+other dnf-based RHEL derivatives. It runs `dnf upgrade --refresh -y`, then
+`dnf autoremove -y` after a successful upgrade. It never runs
+`dnf system-upgrade`, and it refuses rpm-ostree/bootc image-based hosts, which
+upgrade through `rpm-ostree upgrade` or `bootc upgrade` instead. It runs
+`dnf check`, reports `.rpmnew`/`.rpmsave`/`.rpmorig` files awaiting a merge,
+and reports reboot state through `dnf needs-restarting -r` when that plugin is
+installed. Services are restarted through the shared package-diff path.
+
 ## Failure and restart policy
 
 `sysup` snapshots package versions before and after mutation. Unused packages
@@ -121,8 +132,8 @@ applied upgrade may already require service restarts. The original package
 manager status retains precedence, while independent check and restart
 failures are also surfaced instead of short-circuiting one another.
 
-The shared Arch and Debian fallback restarts only active units owned by packages
-proven to have changed. When `needrestart` is available, Debian instead uses its
+The shared fallback (Arch, Fedora, and Debian without `needrestart`) restarts
+only active units owned by packages proven to have changed. When `needrestart` is available, Debian instead uses its
 runtime deleted-file analysis, which may restart another service affected by an
 upgraded library even when that service belongs to a different package. The
 shared fallback never restarts units whose restart would end a login or
@@ -148,8 +159,10 @@ transitions, and the host's normal package tools. The Arch path additionally use
 `file`, `id`, `ldd`, and `sort`; `yay` and `pacdiff` from `pacman-contrib` are
 optional. The Debian path uses `apt-get`,
 `apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
-optional. systemd integration is used when `systemctl` is available; recording
-deferred restarts also uses `install` and `mktemp`.
+optional. The Fedora path uses `dnf`, `rpm`, `find`, and `sort`; the
+`needs-restarting` plugin (dnf-plugins-core or dnf5-plugins) is optional.
+systemd integration is used when `systemctl` is available; recording deferred
+restarts also uses `install` and `mktemp`.
 
 The dispatcher and OS detection remain compatible with Bash 3.2 so an
 unsupported macOS host can still run `sysup --help` and receive a clear
