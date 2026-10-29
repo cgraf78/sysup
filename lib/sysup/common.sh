@@ -49,12 +49,29 @@ sysup_run_as_root() {
   sudo "$@"
 }
 
+# Set once sudo has been shown to need no password, so there is no credential
+# to keep warm.
+_SYSUP_SUDO_PASSWORDLESS=0
+
 # Prompt for sudo once up front so a long upgrade does not stall on a password
 # prompt buried in package manager output.
+#
+# Skip the prompt when sudo needs no password at all. `sudo -v` is the wrong
+# probe for that: under the default verifypw=all it asks for a password unless
+# every sudoers rule matching the user is NOPASSWD, so a user with a NOPASSWD
+# rule alongside a password rule (stock openSUSE ships `ALL ALL=(ALL) ALL`) is
+# prompted although no command they run needs it. `-k` makes this one probe
+# ignore a cached credential, so a recent `sudo` cannot pass for NOPASSWD and
+# leave a run to outlive its timestamp unrefreshed.
 sysup_warm_sudo() {
+  _SYSUP_SUDO_PASSWORDLESS=0
   ((EUID != 0)) || return 0
 
   sysup_need_cmds sudo || return
+  if sudo -n -k true 2>/dev/null; then
+    _SYSUP_SUDO_PASSWORDLESS=1
+    return 0
+  fi
   sudo -v
 }
 
@@ -81,6 +98,7 @@ sysup_start_sudo_keeper() {
   [[ "$SYSUP_SUDO_REFRESH" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
   [[ ! "$SYSUP_SUDO_REFRESH" =~ ^0+([.]0+)?$ ]] || return 0
   [[ -z "$_SYSUP_SUDO_KEEPER_PID" ]] || return 0
+  ((_SYSUP_SUDO_PASSWORDLESS == 0)) || return 0
 
   (
     sleeper=""
