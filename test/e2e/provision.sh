@@ -44,7 +44,7 @@ elif command -v dnf >/dev/null 2>&1; then
 elif command -v zypper >/dev/null 2>&1; then
   retry zypper --non-interactive refresh
   retry zypper --non-interactive install --no-recommends \
-    systemd systemd-sysvinit sudo procps findutils
+    systemd sudo procps findutils
 else
   printf 'provision: no supported package manager in this image\n' >&2
   exit 1

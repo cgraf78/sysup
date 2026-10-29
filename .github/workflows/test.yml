@@ -78,6 +78,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Unload the runner's unix-chkpwd AppArmor profile
+        # Ubuntu 24.04 runners attach this profile by path, so it also confines
+        # /usr/sbin/unix_chkpwd inside containers. It denies the helper DAC
+        # capabilities there, and PAM's account check then fails sudo for the
+        # non-root user on images whose pam_unix calls the helper (Rocky).
+        # Remove it by name through apparmorfs, so the step does not depend on
+        # which file under /etc/apparmor.d defines it.
+        run: |-
+          if sudo grep -q '^unix-chkpwd ' /sys/kernel/security/apparmor/profiles; then
+            printf 'unix-chkpwd' | sudo tee /sys/kernel/security/apparmor/.remove >/dev/null
+          fi
+
       - name: Run sysup end to end
         # Pass the image through the environment, never by interpolating it
         # into the script.
