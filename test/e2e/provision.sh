@@ -63,6 +63,19 @@ done
   exit 1
 }
 
+# A container has no virtual terminals or serial ports, so a getty on one
+# fails, restarts, and can reach its start limit at any point, including in the
+# middle of a run, where sysup would rightly report it as a failed unit; which
+# image and which moment depends on timing, so CI flaked across distributions.
+# Mask every getty unit systemd can start, templates included so no instance
+# runs. A /dev/null link is what `systemctl mask` writes, and it needs no
+# running systemd.
+install -d /etc/systemd/system
+for unit in getty@.service serial-getty@.service console-getty.service \
+  container-getty@.service; do
+  ln -sf /dev/null "/etc/systemd/system/$unit"
+done
+
 # A non-root operator, so the sudo path (including the credential keeper) runs
 # as it does on a workstation. NOPASSWD because CI has no one to type one.
 useradd --create-home --shell /bin/bash sysupci
