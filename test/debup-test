@@ -67,6 +67,7 @@ _debup_write_mock() {
 _debup_write_mock sudo <<'EOF'
 #!/usr/bin/env bash
 [[ "${1:-}" == "-v" ]] && exit 0
+[[ "${1:-}" != -n ]] || shift
 exec "$@"
 EOF
 
@@ -204,6 +205,14 @@ SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
 printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
 # shellcheck source=../lib/sysup/debup
 . "$REPO_ROOT/lib/sysup/debup"
+
+# Lock waits read a fixture process table, never the host's: by default no
+# process holds anything.
+SYSUP_PROC_ROOT=$(_tmpdir)
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_LISTS_LOCK="$(_tmpdir)/lists.lock"
+# shellcheck disable=SC2034 # read by the sourced common.sh under test.
+SYSUP_LOCK_POLL=0.1
 
 # Point the advisory checks at a fixture tree instead of the live system.
 DEBUP_FIXTURE_ETC=$(_tmpdir)
@@ -347,6 +356,47 @@ _assert_eq "debup update: stops after the configured attempt limit" \
   "3" "$(cat "$DEBUP_UPDATE_COUNT_FILE")"
 _assert_not_contains "debup update: never upgrades from stale indexes after retry exhaustion" \
   "upgrade -y" "$(cat "$DEBUP_APT_LOG")"
+
+# Holder detection needs a find with -lname, which BusyBox (the shared CI
+# matrix's Alpine leg) lacks; supported families all ship GNU findutils.
+if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
+  # A held lists lock is waited out and never spends a retry attempt.
+  _debup_reset
+  mkdir -p "$SYSUP_PROC_ROOT/4242/fd"
+  ln -s "$DEBUP_LISTS_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+  DEBUP_UPDATE_ATTEMPTS=1
+  (sleep 0.4 && rm -f "$SYSUP_PROC_ROOT/4242/fd/3") &
+  releaser=$!
+  set +e
+  result=$(debup_apt_update 2>&1)
+  status=$?
+  set -e
+  wait "$releaser"
+  _assert_eq "debup update: a held lists lock is waited out" "0" "$status"
+  _assert_contains "debup update: says it is waiting for the lists lock" \
+    "for the apt lists lock" "$result"
+  _assert_eq "debup update: the wait spends no attempt" \
+    "1" "$(cat "$DEBUP_UPDATE_COUNT_FILE")"
+
+  # A lock still held at the deadline fails without running apt-get.
+  _debup_reset
+  ln -s "$DEBUP_LISTS_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+  DEBUP_LOCK_TIMEOUT=1
+  set +e
+  result=$(debup_apt_update 2>&1)
+  status=$?
+  set -e
+  rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
+  DEBUP_LOCK_TIMEOUT=300
+  _assert_eq "debup update: a lock held past the deadline fails" "1" "$status"
+  _assert_contains "debup update: names the lock it gave up on" \
+    "the apt lists lock is still held" "$result"
+  _assert_eq "debup update: never runs apt-get against a held lock" \
+    "" "$(cat "$DEBUP_UPDATE_COUNT_FILE")"
+fi
 
 _debup_reset
 debup_apt_update >/dev/null 2>&1

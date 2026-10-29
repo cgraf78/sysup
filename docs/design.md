@@ -153,8 +153,9 @@ package-manager status.
 `SYSUP_LOCK_POLL` seconds, until no process has a package-manager lock file
 open. Holders are found through `/proc/<pid>/fd` links (read as root), not
 `/proc/locks`: the latter names files by device and inode, and on btrfs
-`stat()` reports a per-subvolume device that never matches it. Backends can use it
-where the package manager itself fails at once on a held lock.
+`stat()` reports a per-subvolume device that never matches it. Backends use it
+where the package manager itself fails at once on a held lock: `debup` before
+`apt-get update`.
 
 ### Deferred restarts
 
@@ -266,9 +267,11 @@ files only). A held package is still installed and can be upgraded on explicit
 request, so leaving it out would hide that upgrade from the restart step.
 
 `DPkg::Lock::Timeout` covers only the two dpkg locks, not the lists lock that
-`apt-get update` takes (Debian #1012173), so `update` gets its own bounded retry.
-`unattended-upgrades` routinely holds that lock on Debian-family hosts, and a collision
-must not abort the run. Note that `unattended-upgrades` itself is python-apt and
+`apt-get update` takes (Debian #1012173), so before each `update` attempt
+`debup` waits for `/var/lib/apt/lists/lock` to be free (shared lock waits,
+bounded by the same `DEBUP_LOCK_TIMEOUT`). `unattended-upgrades` routinely
+holds that lock on Debian-family hosts, and a collision must not abort the run
+or spend the bounded retry, which is kept for fetch failures. Note that `unattended-upgrades` itself is python-apt and
 does not run `apt-get`; the verb above is equivalent in effect, not identical in
 implementation.
 

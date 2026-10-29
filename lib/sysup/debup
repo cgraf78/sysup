@@ -32,9 +32,13 @@ DEBUP_UPGRADE_VERB=upgrade
 # lists lock instead, which has no wait, so that step is retried separately.
 DEBUP_LOCK_TIMEOUT="${DEBUP_LOCK_TIMEOUT:-300}"
 
-# Bounded retry for `apt-get update`, whose lists lock ignores the timeout above.
+# Bounded retry for `apt-get update` failures that are not lock contention:
+# a mirror or network hiccup during the fetch.
 DEBUP_UPDATE_ATTEMPTS="${DEBUP_UPDATE_ATTEMPTS:-5}"
 DEBUP_UPDATE_RETRY_DELAY="${DEBUP_UPDATE_RETRY_DELAY:-30}"
+
+# The lock `apt-get update` takes. Overridable for tests.
+DEBUP_LISTS_LOCK="${DEBUP_LISTS_LOCK:-/var/lib/apt/lists/lock}"
 
 # The needrestart command, resolved through PATH by default. Overridable so
 # tests can select a fixture, or point at a path that does not exist to
@@ -152,12 +156,16 @@ debup_held_packages() {
 }
 
 # `apt-get update` fails immediately on lock contention rather than waiting, and
-# unattended-upgrades holds that lock routinely on these hosts. Retry instead of
-# aborting a whole run over a collision that clears on its own.
+# unattended-upgrades holds that lock routinely on these hosts. Before each
+# attempt, wait for the lists lock to be free, up to the same timeout the dpkg
+# locks get, so a collision is waited out instead of spending the retries,
+# which are kept for fetch failures.
 debup_apt_update() {
   local attempt=1
 
   while :; do
+    sysup_wait_path_free "$DEBUP_LISTS_LOCK" "$DEBUP_LOCK_TIMEOUT" \
+      "the apt lists lock" || return 1
     # apt-get otherwise exits zero when one repository fails and stale indexes
     # are reused, which would turn a missed security update into a clean run.
     debup_apt_get -o APT::Update::Error-Mode=any update && return 0
