@@ -348,9 +348,14 @@ sysup_backend_preamble() {
 }
 
 # dpkg-query also lists packages that were removed but kept their config. Keep
-# packages whose desired state is installed, including unpacked/half-configured
-# states: a failed upgrade can already have replaced their files, and the
-# failure-recovery path still needs to discover and restart their services.
+# packages whose desired state is installed (i) or held (h), including
+# unpacked/half-configured states: a failed upgrade can already have replaced
+# their files, and the failure-recovery path still needs to discover and
+# restart their services. A held package is still installed and can still be
+# upgraded on request (--allow-change-held-packages), so dropping it would hide
+# that upgrade from the restart step. A current state of not-installed (n) or
+# config-files (c) has no files on disk, so it is not a package to diff; `apt-
+# mark hold` accepts packages that are not installed, which makes `hn` real.
 #
 # binary:Package, not Package: it appends the architecture for foreign-arch
 # packages. A bare name would collapse the two rows of a multi-arch pair into
@@ -358,7 +363,7 @@ sysup_backend_preamble() {
 sysup_backend_snapshot() {
   dpkg-query -W -f '${db:Status-Abbrev}\t${binary:Package}\t${Version}\n' 2>/dev/null |
     while IFS=$'\t' read -r state pkg version; do
-      [[ "$state" == i* ]] || continue
+      [[ "$state" == [ih]* && "$state" != ?[nc]* ]] || continue
       [[ -n "$pkg" ]] || continue
       printf '%s %s\n' "$pkg" "$version"
     done | sort
@@ -405,12 +410,17 @@ sysup_backend_autoremove() {
 # needrestart is the canonical Debian answer here: it inspects running processes
 # for deleted mappings rather than inferring from package contents, so it also
 # catches services linking an upgraded library they do not own.
+#
+# Its kernel and microcode checks announce a pending reboot through a debconf
+# note that waits for a keypress on a terminal. The noninteractive frontend
+# turns those notes into plain output instead; limiting the run to the library
+# check would drop the microcode hint, which nothing else reports.
 sysup_backend_restart_services() {
   local needrestart
 
   if needrestart="$(debup_needrestart_path)"; then
     sysup_log "restarting services reported by needrestart"
-    sysup_run_as_root "$needrestart" -r a
+    sysup_run_as_root env DEBIAN_FRONTEND=noninteractive "$needrestart" -r a
     return
   fi
 

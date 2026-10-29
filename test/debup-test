@@ -270,7 +270,7 @@ _debup_reset() {
 _debup_install_needrestart() {
   _debup_write_mock needrestart <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$DEBUP_NEEDRESTART_LOG"
+printf '%s DEBIAN_FRONTEND=%s\n' "$*" "${DEBIAN_FRONTEND:-unset}" >>"$DEBUP_NEEDRESTART_LOG"
 printf '%s' "$DEBUP_MOCK_NEEDRESTART_OUTPUT"
 exit "$DEBUP_MOCK_NEEDRESTART_STATUS"
 EOF
@@ -557,6 +557,21 @@ DEBUP_MOCK_INSTALLED=$'ii zsh 5.9\nii bash 5.2\nrc removed-pkg 1.0\niU unpacked-
 snapshot=$(sysup_backend_snapshot)
 _assert_eq "debup snapshot: keeps install-desired transitional packages for failure recovery" \
   $'bash 5.2\nunpacked-pkg 2.0\nzsh 5.9' "$snapshot"
+
+# apt-mark hold sets the desired state to h, so an installed held package is
+# `hi`. It is still installed and must stay in the snapshot.
+_debup_reset
+DEBUP_MOCK_INSTALLED=$'hi held-pkg 1.0\nii bash 5.2\npn purged-pkg 1.0\nhU held-unpacked 2.0'
+snapshot=$(sysup_backend_snapshot)
+_assert_eq "debup snapshot: keeps installed held packages and drops purged ones" \
+  $'bash 5.2\nheld-pkg 1.0\nheld-unpacked 2.0' "$snapshot"
+
+# Holds and install selections can name packages with nothing on disk.
+_debup_reset
+DEBUP_MOCK_INSTALLED=$'hn held-absent 1.0\nhc held-config 1.0\nin selected-absent 1.0\nic selected-config 1.0\nii bash 5.2'
+snapshot=$(sysup_backend_snapshot)
+_assert_eq "debup snapshot: drops selections that are not installed or only keep config" \
+  "bash 5.2" "$snapshot"
 # shellcheck disable=SC2016 # This assertion intentionally matches dpkg's literal format token.
 _assert_contains "debup snapshot: requests architecture-qualified package identities" \
   '${binary:Package}' "$(cat "$DEBUP_DPKG_QUERY_ARGS_LOG")"
@@ -613,6 +628,8 @@ needrestart_log=$(cat "$DEBUP_NEEDRESTART_LOG")
 systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
 _assert_contains "debup restart: prefers needrestart when installed" \
   "-r a" "$needrestart_log"
+_assert_contains "debup restart: needrestart cannot raise an interactive debconf prompt" \
+  "-r a DEBIAN_FRONTEND=noninteractive" "$needrestart_log"
 _assert_not_contains "debup restart: needrestart replaces the built-in restart" \
   "try-restart" "$systemctl_log"
 
@@ -659,6 +676,18 @@ _assert_contains "debup main: falls back to the built-in restart once needrestar
 systemctl_log=$(cat "$DEBUP_SYSTEMCTL_LOG")
 _assert_contains "debup main: restarts services for packages whose version changed" \
   "try-restart ssh.service" "$systemctl_log"
+
+# A held package upgraded on explicit request must still reach the restart
+# step through the package diff.
+_debup_reset
+DEBUP_MOCK_INSTALLED="hi held-daemon 1.0"
+DEBUP_MOCK_UPGRADED="hi held-daemon 2.0"
+DEBUP_MOCK_HOLDS="held-daemon"
+DEBUP_MOCK_PACKAGE_FILES=$'held-daemon /usr/lib/systemd/system/held-daemon.service'
+DEBUP_MOCK_ACTIVE_UNITS="held-daemon.service"
+_debup_main -- --allow-change-held-packages
+_assert_contains "debup main: restarts services of an upgraded held package (output: $DEBUP_RESULT)" \
+  "try-restart held-daemon.service" "$(cat "$DEBUP_SYSTEMCTL_LOG")"
 
 _debup_reset
 DEBUP_MOCK_INSTALLED=$'ii libdemo:amd64 1.0\nii libdemo:i386 1.0'
