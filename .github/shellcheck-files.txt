@@ -20,4 +20,5 @@ program	test/debup-test
 program	test/dnfup-test
 program	test/e2e/distro-run
 program	test/e2e/provision.sh
+program	test/e2e/sudo-test
 program	test/zypup-test

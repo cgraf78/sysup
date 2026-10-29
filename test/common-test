@@ -20,11 +20,11 @@ COMMON_SUDO_LOG="$(_tmpdir)/sudo.log"
 COMMON_UPGRADE_LOG="$(_tmpdir)/upgrade.log"
 export COMMON_SUDO_LOG COMMON_UPGRADE_LOG
 export COMMON_SUDO_REFRESH_STATUS=0
-# Whether the mock sudo runs commands without a password; 1 models a host
-# where it needs one, the case the keeper exists for.
-export COMMON_SUDO_NOPASSWD_STATUS=1
-# Whether `sudo -n` can run a command now; 1 models no cached credential.
+export COMMON_SUDO_WARM_STATUS=0
+export COMMON_SUDO_VALIDATE_STATUS=0
 export COMMON_SUDO_CACHED_STATUS=0
+COMMON_SUDO_ALERT_LOG="$(_tmpdir)/sudo-alert.log"
+export COMMON_SUDO_ALERT_LOG
 
 # sudo is a real executable so the keeper's background subshell, which has no
 # access to later function redefinitions, still reaches the mock.
@@ -32,10 +32,15 @@ cat >"$COMMON_MOCK_BIN/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$COMMON_SUDO_LOG"
 case "$*" in
-  -v) exit 0 ;;
+  -v) exit "$COMMON_SUDO_VALIDATE_STATUS" ;;
+  true) exit "$COMMON_SUDO_WARM_STATUS" ;;
   "-n -v") exit "$COMMON_SUDO_REFRESH_STATUS" ;;
-  "-n -k true") exit "$COMMON_SUDO_NOPASSWD_STATUS" ;;
   "-n true") exit "$COMMON_SUDO_CACHED_STATUS" ;;
+  "-n -k true")
+    # A refused command probe is an alert even with stderr redirected.
+    printf 'password is required\n' >>"$COMMON_SUDO_ALERT_LOG"
+    exit 1
+    ;;
 esac
 [[ "$1" != -n ]] || shift
 exec "$@"
@@ -82,8 +87,10 @@ _common_reset() {
   COMMON_UPGRADE_SECONDS=0
   COMMON_UPGRADE_STATUS=0
   COMMON_SUDO_REFRESH_STATUS=0
-  COMMON_SUDO_NOPASSWD_STATUS=1
+  COMMON_SUDO_WARM_STATUS=0
+  COMMON_SUDO_VALIDATE_STATUS=0
   COMMON_SUDO_CACHED_STATUS=0
+  : >"$COMMON_SUDO_ALERT_LOG"
   SYSUP_SUDO_REFRESH=60
 }
 
@@ -284,31 +291,43 @@ else
   _assert_eq "common keeper: --check-only never starts it" \
     "0" "$(_common_refresh_count)"
 
-  # A host where sudo needs a password: probe, then prompt once.
+  # Warming must use the real authentication path, without a deliberately
+  # refused noninteractive command that sudo can report to the administrator.
   _common_reset
   _common_main
   _assert_eq "common sudo: a password host succeeds" "0" "$COMMON_STATUS"
-  _assert_eq "common sudo: a password host probes, then prompts" \
-    $'-n -k true\n-v' "$(grep -E '^(-n -k true|-v)$' "$COMMON_SUDO_LOG")"
+  _assert_contains "common sudo: warms through an ordinary command" \
+    $'\ntrue\n' $'\n'"$(cat "$COMMON_SUDO_LOG")"$'\n'
+  _assert_eq "common sudo: warming causes no refused-command alert" \
+    "" "$(cat "$COMMON_SUDO_ALERT_LOG")"
 
-  # Passwordless sudo: no prompt, and no keeper, whose `sudo -n -v` would
-  # fail under verifypw=all and has no credential to keep warm anyway.
+  # Mixed PASSWD and NOPASSWD ALL policies can refuse sudo -v while allowing
+  # every actual command without a password. Warming must not validate there.
   _common_reset
-  COMMON_SUDO_NOPASSWD_STATUS=0
+  COMMON_SUDO_VALIDATE_STATUS=1
+  COMMON_SUDO_REFRESH_STATUS=1
   COMMON_UPGRADE_SECONDS=0.5
   # shellcheck disable=SC2034 # read by the sourced common.sh under test.
   SYSUP_SUDO_REFRESH=0.1
   _common_main
-  _assert_eq "common sudo: a passwordless host succeeds" "0" "$COMMON_STATUS"
-  _assert_not_contains "common sudo: a passwordless host is never prompted" \
+  _assert_eq "common sudo: mixed passwordless policy succeeds" "0" "$COMMON_STATUS"
+  _assert_not_contains "common sudo: mixed policy never prompts for validation" \
     $'\n-v\n' $'\n'"$(cat "$COMMON_SUDO_LOG")"$'\n'
-  _assert_eq "common sudo: a passwordless host starts no keeper" \
+  _assert_eq "common sudo: a refused validation stops the keeper" \
+    "1" "$(_common_refresh_count)"
+  _assert_eq "common sudo: mixed policy causes no refused-command alert" \
+    "" "$(cat "$COMMON_SUDO_ALERT_LOG")"
+
+  # A cancelled initial prompt must not reach the upgrade or start a keeper.
+  _common_reset
+  COMMON_SUDO_WARM_STATUS=1
+  _common_main
+  _assert_eq "common sudo: warming failure fails the run" "1" "$COMMON_STATUS"
+  _assert_eq "common sudo: warming failure skips the upgrade" \
+    "" "$(cat "$COMMON_UPGRADE_LOG")"
+  _assert_eq "common sudo: warming failure starts no keeper" \
     "0" "$(_common_refresh_count)"
 
-  # The probe must ignore a cached credential (-k); without it a recent
-  # sudo would pass for NOPASSWD and the run would go unrefreshed.
-  _assert_contains "common sudo: the probe ignores cached credentials" \
-    "-n -k true" "$(cat "$COMMON_SUDO_LOG")"
 fi
 
 echo ""

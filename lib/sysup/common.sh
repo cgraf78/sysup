@@ -65,30 +65,16 @@ sysup_scan_as_root() {
   "$@"
 }
 
-# Set once sudo has been shown to need no password, so there is no credential
-# to keep warm.
-_SYSUP_SUDO_PASSWORDLESS=0
-
-# Prompt for sudo once up front so a long upgrade does not stall on a password
-# prompt buried in package manager output.
-#
-# Skip the prompt when sudo needs no password at all. `sudo -v` is the wrong
-# probe for that: under the default verifypw=all it asks for a password unless
-# every sudoers rule matching the user is NOPASSWD, so a user with a NOPASSWD
-# rule alongside a password rule (stock openSUSE ships `ALL ALL=(ALL) ALL`) is
-# prompted although no command they run needs it. `-k` makes this one probe
-# ignore a cached credential, so a recent `sudo` cannot pass for NOPASSWD and
-# leave a run to outlive its timestamp unrefreshed.
+# Warm sudo with a real command: it prompts only if that command needs a
+# password, and refreshes cached credentials otherwise. A deliberately refused
+# `sudo -n -k true` can send a security email even with stderr redirected.
+# `sudo -v` alone is not equivalent: verifypw=all can require a password on
+# mixed PASSWD/NOPASSWD policies whose actual commands are passwordless.
 sysup_warm_sudo() {
-  _SYSUP_SUDO_PASSWORDLESS=0
   ((EUID != 0)) || return 0
 
   sysup_need_cmds sudo || return
-  if sudo -n -k true 2>/dev/null; then
-    _SYSUP_SUDO_PASSWORDLESS=1
-    return 0
-  fi
-  sudo -v
+  sudo true
 }
 
 # Seconds between sudo credential refreshes while a run is in progress; 0
@@ -106,7 +92,10 @@ _SYSUP_SUDO_KEEPER_PID=""
 # own once the parent shell is gone (checked every interval) or sudo refuses a
 # noninteractive refresh, so a run killed without cleanup cannot leave it
 # looping. No trap is installed in the caller: backends are sourceable, and
-# clobbering a caller's trap is worse than that bounded lag.
+# clobbering a caller's trap is worse than that bounded lag. Always start the
+# keeper after warming: successful commands cannot distinguish NOPASSWD from
+# cached credentials. Under mixed passwordless policies, validation may refuse;
+# `sudo -n -v` then exits without a refused-command alert or a prompt.
 sysup_start_sudo_keeper() {
   local parent="$BASHPID"
 
@@ -114,7 +103,6 @@ sysup_start_sudo_keeper() {
   [[ "$SYSUP_SUDO_REFRESH" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
   [[ ! "$SYSUP_SUDO_REFRESH" =~ ^0+([.]0+)?$ ]] || return 0
   [[ -z "$_SYSUP_SUDO_KEEPER_PID" ]] || return 0
-  ((_SYSUP_SUDO_PASSWORDLESS == 0)) || return 0
 
   (
     sleeper=""
