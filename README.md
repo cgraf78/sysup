@@ -80,9 +80,11 @@ instead of reaching the package manager.
 
 ### Arch
 
-The Arch backend reports foreign packages, upgrades with `yay -Syu --devel`
-when available or `pacman -Syu` otherwise, and scans foreign-package ELF files
-for missing shared libraries. After a successful upgrade it removes orphaned
+The Arch backend reports foreign packages and the packages `pacman.conf`
+ignores, waits for another pacman transaction to release the database lock,
+upgrades with `yay -Syu --devel` when available or `pacman -Syu` otherwise,
+fails the run when `pacman -Dk` finds the package database inconsistent, and
+scans foreign-package ELF files for missing shared libraries. After a successful upgrade it removes orphaned
 dependencies (`pacman -Qdtq`) with `pacman -Rn`, one layer at a time, so
 optional dependencies still count as required. It also reports `.pacnew` and
 `.pacsave` files that await manual review when `pacdiff` is available, and

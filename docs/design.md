@@ -71,7 +71,7 @@ Optional hooks, with defaults in `common.sh`:
 | Hook | Default | Override |
 | --- | --- | --- |
 | `sysup_backend_parse_arg <arg>` | unhandled (sysup rejects the argument with status 2) | `debup` adds `--full-upgrade` |
-| `sysup_backend_preamble` | no-op | `archup` lists foreign packages; `debup` lists held packages; `zypup` lists package locks |
+| `sysup_backend_preamble` | no-op | `archup` lists foreign packages and `IgnorePkg`/`IgnoreGroup` entries; `debup` lists held packages; `zypup` lists package locks |
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
 | `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded`; `zypup` only lists `zypper packages --unneeded`, in both modes |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
@@ -155,7 +155,7 @@ open. Holders are found through `/proc/<pid>/fd` links (read as root), not
 `/proc/locks`: the latter names files by device and inode, and on btrfs
 `stat()` reports a per-subvolume device that never matches it. Backends use it
 where the package manager itself fails at once on a held lock: `debup` before
-`apt-get update`.
+`apt-get update` and `archup` before the upgrade.
 
 ### Deferred restarts
 
@@ -204,6 +204,14 @@ checkout.
 
 ## `archup` behavior
 
+The preamble lists foreign packages and, from `pacman-conf`, the `IgnorePkg`
+and `IgnoreGroup` entries `-Syu` leaves alone, the Arch analogue of held
+packages; an unreadable `pacman.conf` is a warning. Before upgrading,
+`archup` waits for `/var/lib/pacman/db.lck` to be free (shared lock waits,
+`ARCHUP_LOCK_TIMEOUT`, default 300 seconds): libalpm holds that file open for
+a whole transaction and fails at once rather than waiting. A lock file left
+behind by a crashed run has no holder, so pacman's own error still reports it.
+
 Upgrade with `yay -Syu --devel`, or `pacman -Syu` when `yay` is absent, then
 rebuild installed AUR packages whose ELF files have missing libraries. As
 root, `yay` runs as the non-root user in `SYSUP_ARCH_USER` (else
@@ -227,6 +235,7 @@ Checks:
 
 | Check | Severity |
 | --- | --- |
+| Package database consistency (`pacman -Dk`) | fatal |
 | Missing shared libraries in foreign packages | fatal |
 | Pending `.pacnew`/`.pacsave` merges (`pacdiff --output`) | advisory |
 | Reboot required (`/usr/lib/modules/$(uname -r)/kernel` missing) | advisory |

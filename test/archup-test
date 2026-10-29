@@ -19,6 +19,13 @@ SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
 # shellcheck source=../lib/sysup/archup
 . "$REPO_ROOT/lib/sysup/archup"
 
+# Lock waits read a fixture process table, never the host's: by default no
+# process holds anything.
+SYSUP_PROC_ROOT=$(_tmpdir)
+ARCHUP_DB_LOCK="$(_tmpdir)/db.lck"
+# shellcheck disable=SC2034 # read by the sourced common.sh under test.
+SYSUP_LOCK_POLL=0.1
+
 echo "=== archup: conditional AUR rebuilds ==="
 
 _archup_mock_reset() {
@@ -64,6 +71,10 @@ _archup_mock_reset() {
   SYSUP_ARCH_USER=""
   SUDO_USER=""
   ARCHUP_PACMAN_FOREIGN_STATUS=0
+  ARCHUP_IGNORE_PKG=""
+  ARCHUP_IGNORE_GROUP=""
+  ARCHUP_PACMAN_CONF_STATUS=0
+  ARCHUP_DK_STATUS=0
   ARCHUP_PACMAN_FILES_STATUS=0
   ARCHUP_ORPHANS=()
   ARCHUP_ORPHANS_NEXT=()
@@ -196,6 +207,14 @@ pacman() {
       ;;
     -Syu)
       printf '%s\n' "$*" >>"$ARCHUP_PACMAN_COMMAND_LOG"
+      ;;
+    -Dk)
+      printf '%s\n' "$*" >>"$ARCHUP_PACMAN_COMMAND_LOG"
+      if ((ARCHUP_DK_STATUS != 0)); then
+        printf 'error: mock missing dependency for demo-pkg\n'
+        return "$ARCHUP_DK_STATUS"
+      fi
+      printf 'No database errors have been found!\n'
       ;;
     -Qdtq)
       # Real pacman exits 1 with no output when there are no orphans, and
@@ -378,12 +397,29 @@ modinfo() {
   printf '%s\n' "$ARCHUP_NVIDIA_INSTALLED_VERSION"
 }
 
+# shellcheck disable=SC2329 # Exercised indirectly by the archup preamble.
+pacman-conf() {
+  ((ARCHUP_PACMAN_CONF_STATUS == 0)) || return "$ARCHUP_PACMAN_CONF_STATUS"
+  case "$1" in
+    # pacman-conf prints one entry per line; the fixtures hold them
+    # space-separated.
+    IgnorePkg) [[ -z "$ARCHUP_IGNORE_PKG" ]] || tr ' ' '\n' <<<"$ARCHUP_IGNORE_PKG" ;;
+    IgnoreGroup) [[ -z "$ARCHUP_IGNORE_GROUP" ]] || tr ' ' '\n' <<<"$ARCHUP_IGNORE_GROUP" ;;
+    *)
+      printf 'unexpected pacman-conf args: %s\n' "$*" >&2
+      return 2
+      ;;
+  esac
+}
+
 # shellcheck disable=SC2329 # Exercised indirectly by the shared driver.
 sudo() {
   printf '%s\n' "$*" >>"$ARCHUP_SUDO_COMMAND_LOG"
   if [[ "${1:-}" == "-v" ]]; then
     return 0
   fi
+  # Non-prompting probes and lock scans (`sudo -n ...`) run like any command.
+  [[ "${1:-}" != -n ]] || shift
 
   if [[ "${1:-}" == "-u" ]]; then
     shift 2
@@ -1005,6 +1041,107 @@ set -e
 _assert_eq "archup foreign: exit 1 with an error line fails" "2" "$status"
 _assert_contains "archup foreign: the error line is shown" \
   "error: mock pacman foreign-package query failed" "$result"
+
+echo ""
+echo "=== archup: ignored packages ==="
+
+_archup_mock_reset
+ARCHUP_IGNORE_PKG="linux linux-headers"
+ARCHUP_IGNORE_GROUP="gnome"
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "archup ignored: counts packages and groups" \
+  "ignored packages (3)" "$result"
+_assert_contains "archup ignored: lists IgnorePkg entries" \
+  $'  linux\n  linux-headers' "$result"
+_assert_contains "archup ignored: marks IgnoreGroup entries" \
+  "  gnome (group)" "$result"
+
+_archup_mock_reset
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "archup ignored: none configured" \
+  $'ignored packages (0)\n  (none)' "$result"
+
+# Informational, like held packages elsewhere: an unreadable pacman.conf warns
+# but never stops the run.
+_archup_mock_reset
+ARCHUP_PACMAN_CONF_STATUS=1
+set +e
+result=$(sysup_backend_preamble 2>&1)
+status=$?
+set -e
+_assert_eq "archup ignored: a pacman-conf failure does not fail the preamble" \
+  "0" "$status"
+_assert_contains "archup ignored: a pacman-conf failure is reported" \
+  "could not read IgnorePkg/IgnoreGroup" "$result"
+
+echo ""
+echo "=== archup: package database check ==="
+
+_archup_mock_reset
+result=$(check_package_database 2>&1)
+_assert_contains "archup database: runs pacman -Dk" \
+  "-Dk" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+_assert_contains "archup database: shows pacman's verdict" \
+  "No database errors have been found!" "$result"
+
+_archup_mock_reset
+ARCHUP_DK_STATUS=1
+set +e
+result=$(sysup_backend_checks 2>&1)
+status=$?
+set -e
+_assert_eq "archup database: an inconsistent database fails the checks" \
+  "1" "$status"
+_assert_contains "archup database: the failure is actionable" \
+  "pacman -Dk reports an inconsistent package database" "$result"
+_assert_contains "archup database: later checks still run" \
+  "checking foreign packages for missing shared libraries" "$result"
+
+echo ""
+echo "=== archup: database lock wait ==="
+
+# Holder detection needs a find with -lname, which BusyBox (the shared CI
+# matrix's Alpine leg) lacks; supported families all ship GNU findutils.
+if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
+  mkdir -p "$SYSUP_PROC_ROOT/4242/fd"
+
+  # A held lock is waited out, then the upgrade proceeds.
+  _archup_mock_reset
+  ARCHUP_HAS_YAY=0
+  ln -s "$ARCHUP_DB_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  (sleep 0.4 && rm -f "$SYSUP_PROC_ROOT/4242/fd/3") &
+  releaser=$!
+  set +e
+  result=$(sysup_backend_upgrade 2>&1)
+  status=$?
+  set -e
+  wait "$releaser"
+  _assert_eq "archup lock: a held database lock is waited out" "0" "$status"
+  _assert_contains "archup lock: says what it waits for" \
+    "for the pacman database lock" "$result"
+  _assert_contains "archup lock: upgrades once the lock is free" \
+    "-Syu" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+  # A lock held past the deadline fails before any package manager runs.
+  _archup_mock_reset
+  ln -s "$ARCHUP_DB_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # read by the sourced archup under test.
+  ARCHUP_LOCK_TIMEOUT=1
+  set +e
+  result=$(sysup_backend_upgrade 2>&1)
+  status=$?
+  set -e
+  rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
+  # shellcheck disable=SC2034 # read by the sourced archup under test.
+  ARCHUP_LOCK_TIMEOUT=300
+  _assert_eq "archup lock: a lock held past the deadline fails" "1" "$status"
+  _assert_contains "archup lock: names the lock it gave up on" \
+    "the pacman database lock is still held" "$result"
+  _assert_eq "archup lock: runs no pacman against a held lock" \
+    "" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+  _assert_eq "archup lock: runs no yay against a held lock" \
+    "" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+fi
 
 echo ""
 echo "=== archup: AUR lookup failures ==="

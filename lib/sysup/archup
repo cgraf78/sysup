@@ -28,6 +28,13 @@ ARCHUP_ORPHAN_PASSES="${ARCHUP_ORPHAN_PASSES:-10}"
 # Overridable so tests never read the host's kernel state.
 ARCHUP_MODULES_ROOT="${ARCHUP_MODULES_ROOT:-/usr/lib/modules}"
 
+# libalpm holds this lock file open for the whole transaction, and pacman fails
+# at once rather than waiting when another one (a pamac or pacman run, an AUR
+# helper) holds it. Wait for it like the other backends wait for their package
+# manager's lock. Overridable for tests.
+ARCHUP_DB_LOCK="${ARCHUP_DB_LOCK:-/var/lib/pacman/db.lck}"
+ARCHUP_LOCK_TIMEOUT="${ARCHUP_LOCK_TIMEOUT:-300}"
+
 archup_is_root() {
   ((EUID == 0))
 }
@@ -148,13 +155,14 @@ then verify the failure modes most likely to leave services broken after the
 upgrade.
 
 Default flow:
-  1. report installed foreign packages
+  1. report installed foreign packages and packages pacman.conf ignores
   2. warm sudo credentials
   3. upgrade packages noninteractively with yay, or pacman when yay is absent
   4. rebuild installed AUR packages whose ELF files have missing libraries
   5. remove orphaned dependencies no installed package still requires,
      counting optional dependencies as required
-  6. check shared libraries, report pending .pacnew/.pacsave merges, and
+  6. check shared libraries and the package database (pacman -Dk), report
+     pending .pacnew/.pacsave merges, and
      report whether the running kernel needs a reboot
   7. restart active services shipped by packages upgraded or rebuilt in this run
   8. optionally restart failed enabled units with --restart-failed
@@ -567,12 +575,29 @@ report_reboot_required() {
 
 sysup_backend_require() {
   sysup_require_family arch || return
-  sysup_need_cmds pacman file ldd sort
+  sysup_need_cmds pacman pacman-conf file ldd sort
+}
+
+# Print pacman.conf's IgnorePkg entries, then each IgnoreGroup entry marked
+# `(group)`: the Arch analogue of held packages, which -Syu leaves at their
+# current version.
+ignored_packages() {
+  local -a packages=() groups=()
+  local listing group
+
+  listing=$(pacman-conf IgnorePkg) || return
+  [[ -z "$listing" ]] || mapfile -t packages <<<"$listing"
+  listing=$(pacman-conf IgnoreGroup) || return
+  [[ -z "$listing" ]] || mapfile -t groups <<<"$listing"
+  ((${#packages[@]} == 0)) || printf '%s\n' "${packages[@]}"
+  for group in "${groups[@]+"${groups[@]}"}"; do
+    printf '%s (group)\n' "$group"
+  done
 }
 
 sysup_backend_preamble() {
-  local -a packages=()
-  local package_listing
+  local -a packages=() ignored=()
+  local package_listing ignored_listing
 
   if ! package_listing="$(foreign_packages)"; then
     printf 'error: could not list foreign packages\n' >&2
@@ -587,6 +612,20 @@ sysup_backend_preamble() {
   else
     printf '  (none)\n'
   fi
+
+  # Informational, like the other backends' held-package lists: a failure to
+  # read pacman.conf is reported but does not stop the run.
+  if ! ignored_listing="$(ignored_packages)"; then
+    printf 'warning: could not read IgnorePkg/IgnoreGroup from pacman.conf\n' >&2
+    return 0
+  fi
+  [[ -z "$ignored_listing" ]] || mapfile -t ignored <<<"$ignored_listing"
+  sysup_log "ignored packages (${#ignored[@]})"
+  if ((${#ignored[@]})); then
+    printf '  %s\n' "${ignored[@]}"
+  else
+    printf '  (none)\n'
+  fi
 }
 
 sysup_backend_snapshot() {
@@ -597,9 +636,20 @@ sysup_backend_package_files() {
   pacman -Qlq "$1"
 }
 
+# Fatal, like dpkg --audit and dnf check: missing dependencies or conflicts in
+# the local database mean pacman itself no longer trusts the installed set.
+check_package_database() {
+  sysup_log "checking package database consistency"
+  if ! pacman -Dk; then
+    printf '\nerror: pacman -Dk reports an inconsistent package database; see its output above\n' >&2
+    return 1
+  fi
+}
+
 sysup_backend_checks() {
   local status=0
 
+  check_package_database || status=1
   scan_missing_libs || status=$?
   # Advisory: pending config merges and a pending reboot are expected output
   # from a successful upgrade, so neither changes the exit status.
@@ -696,6 +746,9 @@ sysup_backend_upgrade() {
   ARCHUP_CONFIRMATION_ARG="$confirmation_arg"
 
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
+
+  sysup_wait_path_free "$ARCHUP_DB_LOCK" "$ARCHUP_LOCK_TIMEOUT" \
+    "the pacman database lock" || return 1
 
   if ! command -v yay >/dev/null 2>&1; then
     sysup_log "yay not found; upgrading repository packages only"
