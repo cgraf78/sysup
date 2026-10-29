@@ -101,16 +101,21 @@ require extending the parser contract.
 2. `sysup_backend_require`, then `sysup_backend_preamble`.
 3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, remove
    unused packages, snapshot again, and diff to get the upgraded set.
-   Warming first probes `sudo -n -k true`; when sudo needs no password it
-   skips both the prompt and the keeper, since `sudo -v` prompts under the
-   default `verifypw=all` unless every matching sudoers rule is NOPASSWD
-   (stock openSUSE also grants `ALL ALL=(ALL) ALL`). Otherwise, once
-   `sudo` is warm, a background keeper refreshes it every
+   Warming runs `sudo true`, which prompts only when needed and refreshes
+   cached credentials. It avoids deliberately refusing a command with
+   `sudo -n -k true`, which can send a security email. It also avoids the
+   `sudo -v` prompt under mixed PASSWD/NOPASSWD policies with `verifypw=all`
+   (stock openSUSE also grants `ALL ALL=(ALL) ALL`). Every non-root update
+   starts a background keeper after successful warming, because a successful
+   command cannot distinguish passwordless policy from cached credentials.
+   The keeper refreshes sudo every
    `SYSUP_SUDO_REFRESH` seconds (default 60; 0 disables) until the run
    returns, so a long upgrade cannot leave the later steps at a password
    prompt. `sysup_main` stops and reaps it on every return path; it also
    exits on its own within one interval if the run dies without cleanup or
-   `sudo -n -v` is refused.
+   `sudo -n -v` is refused. Validation refusal is noninteractive and does not
+   produce a refused-command alert; on mixed passwordless policies the keeper
+   may stop at its first refresh, while actual commands remain passwordless.
    `sysup_backend_autoremove apply` runs only after a clean upgrade: after a
    partial failure the dependency graph may be mid-transition, so removal is
    skipped with a note. `--no-autoremove` calls it with `report` instead. It

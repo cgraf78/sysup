@@ -107,6 +107,8 @@ run() {
   endstep
 }
 
+run "real sudo authentication regressions" "$tag" env SYSUP_E2E_CONTAINER=1 \
+  /bin/bash /opt/sysup/test/e2e/sudo-test
 run "check-only as root" "$tag" /opt/sysup/bin/sysup --check-only
 run "upgrade as root" "$tag" /opt/sysup/bin/sysup
 run "upgrade as non-root through sudo" -u sysupci -w /home/sysupci "$tag" \

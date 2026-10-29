@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Exercise authentication against real sudo inside distro-run's disposable
+# container. Never run this fixture against a workstation's accounts/policy.
+
+set -euo pipefail
+export LC_ALL=C
+
+if [[ ${SYSUP_E2E_CONTAINER:-} != 1 || ! -x /sysup-init || $EUID != 0 ]]; then
+  printf 'sudo-test: run only inside the disposable distro-run container\n' >&2
+  exit 1
+fi
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+fixture=$(mktemp -d /tmp/sysup-sudo-test.XXXXXXXX)
+policy=/etc/sudoers.d/sysup-sudo-test
+account=sysupsudo
+created=0
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  rm -f "$policy"
+  if ((created)); then
+    userdel --remove "$account" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$fixture"
+  exit "$status"
+}
+if [[ -e $policy ]] || id "$account" >/dev/null 2>&1; then
+  printf 'sudo-test: synthetic fixture account or policy already exists\n' >&2
+  rm -rf "$fixture"
+  exit 1
+fi
+trap cleanup EXIT
+chmod 0755 "$fixture"
+useradd --create-home --shell /bin/bash "$account"
+created=1
+# This credential belongs only to the synthetic account in the throwaway
+# container; askpass supplies it so the real prompt path can run unattended.
+printf '%s:%s\n' "$account" sysup-fixture-password | chpasswd
+cat >"$fixture/askpass" <<'EOF'
+#!/usr/bin/env bash
+printf 'prompt\n' >>"$HOME/prompts"
+printf '%s\n' sysup-fixture-password
+EOF
+chmod 0755 "$fixture/askpass"
+
+cat >"$fixture/case" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$1
+scenario=$2
+export SUDO_ASKPASS=$3
+export HOME=/home/sysupsudo
+# Only add the fixture's password transport. All policy decisions, logging,
+# timestamp handling and command execution still belong to the real sudo.
+sudo() { command sudo -A "$@"; }
+# shellcheck source=../../lib/sysup/common.sh
+. "$repo/lib/sysup/common.sh"
+trap sysup_stop_sudo_keeper EXIT
+sudo -K
+: >"$HOME/prompts"
+case "$scenario" in
+  password)
+    sysup_warm_sudo
+    [[ $(wc -l <"$HOME/prompts") -eq 1 ]]
+    ;;
+  mixed)
+    sysup_warm_sudo
+    [[ ! -s $HOME/prompts ]]
+    ;;
+  cached)
+    sysup_warm_sudo
+    : >"$HOME/prompts"
+    sysup_warm_sudo
+    [[ ! -s $HOME/prompts ]]
+    ;;
+  keeper)
+    sysup_warm_sudo
+    SYSUP_SUDO_REFRESH=0.2
+    sysup_start_sudo_keeper
+    # The policy expires credentials after three seconds. Waiting twice
+    # that lifetime proves refreshes preserve access beyond initial warming.
+    sleep 6
+    sudo -n true
+    sysup_stop_sudo_keeper
+    sleep 6
+    # Validation refusal is intentionally safe: no command is attempted.
+    if sudo -n -v 2>/dev/null; then
+      printf 'sudo-test: credentials did not expire after stopping keeper\n' >&2
+      exit 1
+    fi
+    [[ $(wc -l <"$HOME/prompts") -eq 1 ]]
+    ;;
+esac
+EOF
+chmod 0755 "$fixture/case"
+
+for scenario in password cached mixed keeper; do
+  printf '\n=== real sudo: %s ===\n' "$scenario"
+  {
+    printf 'Defaults:%s logfile="%s/sudo.log", timestamp_type=global, verifypw=all, mail_badpass, !targetpw, !rootpw, !runaspw, !requiretty\n' \
+      "$account" "$fixture"
+    if [[ $scenario == keeper ]]; then
+      printf 'Defaults:%s timestamp_timeout=0.05\n' "$account"
+    fi
+    printf '%s ALL=(ALL) PASSWD: ALL\n' "$account"
+    if [[ $scenario == mixed ]]; then
+      printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$account"
+    fi
+  } >"$policy"
+  chmod 0440 "$policy"
+  visudo -cf "$policy"
+  : >"$fixture/sudo.log"
+  runuser -u "$account" -- /bin/bash "$fixture/case" "$repo" "$scenario" \
+    "$fixture/askpass"
+  if grep -q 'a password is required' "$fixture/sudo.log"; then
+    printf 'sudo-test: %s generated a refused-command security alert\n' "$scenario" >&2
+    cat "$fixture/sudo.log" >&2
+    exit 1
+  fi
+  printf 'PASS: %s completed without a refused-command alert\n' "$scenario"
+done
