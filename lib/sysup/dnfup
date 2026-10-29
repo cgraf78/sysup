@@ -296,9 +296,36 @@ dnfup_rpm_lock_path() {
   printf '%s\n' "$path"
 }
 
+# Return 0 when another process holds the rpm transaction lock, 1 otherwise.
+#
+# rpm keeps its lock file open for the life of a transaction set, after the
+# lock itself is released, so an open descriptor alone would make an idle
+# PackageKit or dnf5daemon look like a holder for as long as it runs. Held
+# means a process has the file open and /proc/locks shows a write lock on its
+# inode. The inode alone is compared: /proc/locks devices do not match stat()
+# on btrfs, and requiring an open descriptor too keeps an inode collision
+# with another subvolume's locked file from mattering. When /proc/locks
+# cannot be read, the open descriptor is taken as the holder.
+dnfup_rpm_lock_held() {
+  local path="$1" inode
+
+  sysup_path_in_use "$path" || return 1
+  # `ls -di` rather than `stat`, whose flags differ between GNU and BSD.
+  inode=$(ls -di "$path" 2>/dev/null) || return 1
+  inode="${inode%% *}"
+  [[ -r "$SYSUP_PROC_ROOT/locks" ]] || return 0
+  # Fields: id, type, mode, access, pid, major:minor:inode, start, end. A
+  # waiting request carries `->` after the id, which shifts its access field
+  # out of $4, so only granted write locks match.
+  awk -v inode="$inode" '
+    $4 == "WRITE" { n = split($6, dev, ":"); if (dev[n] == inode) found = 1 }
+    END { exit !found }
+  ' "$SYSUP_PROC_ROOT/locks"
+}
+
 sysup_backend_upgrade() {
   sysup_wait_path_free "$(dnfup_rpm_lock_path)" "$DNFUP_LOCK_TIMEOUT" \
-    "the rpm transaction lock" || return 1
+    "the rpm transaction lock" dnfup_rpm_lock_held || return 1
   dnfup_dnf upgrade --refresh -y "$@"
 }
 

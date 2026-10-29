@@ -184,18 +184,21 @@ sysup_path_in_use() {
 SYSUP_LOCK_POLL="${SYSUP_LOCK_POLL:-5}"
 
 # Wait up to `timeout` whole seconds for no process to hold `path`. `what`
-# names the lock in the one message printed when a wait begins. Returns 0 once
-# it is free and 1 if it is still held at the deadline. The deadline uses
-# bash's SECONDS clock so the poll interval may be fractional.
+# names the lock in the one message printed when a wait begins. `held`, a
+# command given the path, decides whether it is still held, for a package
+# manager whose lock file stays open after the lock is released; it defaults
+# to sysup_path_in_use. Returns 0 once it is free and 1 if it is still held at
+# the deadline. The deadline uses bash's SECONDS clock so the poll interval may
+# be fractional.
 sysup_wait_path_free() {
-  local path="$1" timeout="$2" what="$3" deadline
+  local path="$1" timeout="$2" what="$3" held="${4:-sysup_path_in_use}" deadline
 
-  sysup_path_in_use "$path" || return 0
+  "$held" "$path" || return 0
   printf 'waiting up to %ss for %s, held by another process\n' "$timeout" "$what" >&2
   deadline=$((SECONDS + timeout))
   while ((SECONDS < deadline)); do
     sleep "$SYSUP_LOCK_POLL"
-    sysup_path_in_use "$path" || return 0
+    "$held" "$path" || return 0
   done
   printf 'error: %s is still held after %ss\n' "$what" "$timeout" >&2
   return 1

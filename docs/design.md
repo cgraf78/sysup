@@ -341,7 +341,10 @@ Upgrade, as root:
 - Wait for the rpm transaction lock (`rpm --eval '%{_rpmlock_path}'`, falling
   back to `/var/lib/rpm/.rpm.lock`) with `sysup_wait_path_free`, up to
   `DNFUP_LOCK_TIMEOUT` seconds (default 300). dnf4 waits for it itself, but
-  dnf5 fails at once while `dnf-automatic` or PackageKit holds it.
+  dnf5 fails at once while `dnf-automatic` or PackageKit holds it. rpm
+  keeps the file open after releasing the lock, so it counts as held only
+  while `/proc/locks` also shows a write lock on its inode; an idle daemon
+  with the file open never delays the upgrade.
 - `dnf upgrade --refresh -y`, forwarding extra arguments. dnf never prompts
   about config files; it writes `.rpmnew`/`.rpmsave` instead, which the checks
   report. Fedora's default `best=False` lets dnf skip a package whose

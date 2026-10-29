@@ -213,6 +213,11 @@ SYSUP_PROC_ROOT=$(_tmpdir)
 DEBUP_LISTS_LOCK="$(_tmpdir)/lists.lock"
 # shellcheck disable=SC2034 # read by the sourced common.sh under test.
 SYSUP_LOCK_POLL=0.1
+# Cap every lock wait so a lock-detection regression fails in half a minute
+# instead of stalling the suite for the production default, while leaving
+# ample margin over the sub-second releases the wait tests model on slow CI.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+DEBUP_LOCK_TIMEOUT=30
 
 # Point the advisory checks at a fixture tree instead of the live system.
 DEBUP_FIXTURE_ETC=$(_tmpdir)
@@ -390,7 +395,7 @@ if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
   set -e
   rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
   # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
-  DEBUP_LOCK_TIMEOUT=300
+  DEBUP_LOCK_TIMEOUT=30
   _assert_eq "debup update: a lock held past the deadline fails" "1" "$status"
   _assert_contains "debup update: names the lock it gave up on" \
     "the apt lists lock is still held" "$result"
@@ -945,7 +950,7 @@ _assert_contains "debup main: keeps locally modified config files" \
 _assert_contains "debup main: prefers packaged defaults when there is no local edit" \
   "Dpkg::Options::=--force-confdef" "$apt_options"
 _assert_contains "debup main: waits for the dpkg lock" \
-  "DPkg::Lock::Timeout=300" "$apt_options"
+  "DPkg::Lock::Timeout=$DEBUP_LOCK_TIMEOUT" "$apt_options"
 _assert_contains "debup main: runs apt non-interactively" \
   "DEBIAN_FRONTEND=noninteractive" "$apt_env"
 _assert_contains "debup main: stops needrestart's apt hook from prompting" \

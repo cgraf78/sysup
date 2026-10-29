@@ -25,6 +25,11 @@ SYSUP_PROC_ROOT=$(_tmpdir)
 ARCHUP_DB_LOCK="$(_tmpdir)/db.lck"
 # shellcheck disable=SC2034 # read by the sourced common.sh under test.
 SYSUP_LOCK_POLL=0.1
+# Cap every lock wait so a lock-detection regression fails in half a minute
+# instead of stalling the suite for the production default, while leaving
+# ample margin over the sub-second releases the wait tests model on slow CI.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+ARCHUP_LOCK_TIMEOUT=30
 
 echo "=== archup: conditional AUR rebuilds ==="
 
@@ -1139,7 +1144,7 @@ if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
   set -e
   rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
   # shellcheck disable=SC2034 # read by the sourced archup under test.
-  ARCHUP_LOCK_TIMEOUT=300
+  ARCHUP_LOCK_TIMEOUT=30
   _assert_eq "archup lock: a lock held past the deadline fails" "1" "$status"
   _assert_contains "archup lock: names the lock it gave up on" \
     "the pacman database lock is still held" "$result"

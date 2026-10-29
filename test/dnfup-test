@@ -181,6 +181,11 @@ DNFUP_VERSIONLOCK_TOML="$DNFUP_PIN_DIR/versionlock.toml"
 SYSUP_PROC_ROOT=$(_tmpdir)
 # shellcheck disable=SC2034 # read by the sourced common.sh under test.
 SYSUP_LOCK_POLL=0.1
+# Cap every lock wait so a lock-detection regression fails in half a minute
+# instead of stalling the suite for the production default, while leaving
+# ample margin over the sub-second releases the wait tests model on slow CI.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+DNFUP_LOCK_TIMEOUT=30
 DNFUP_RPM_LOCK="$(_tmpdir)/.rpm.lock"
 
 # The suite does not run on a Fedora host, so neutralize the family guard the
@@ -645,10 +650,47 @@ _assert_eq "dnfup lock: an explicit path wins over rpm" \
 # matrix's Alpine leg) lacks; supported families all ship GNU findutils.
 if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
   mkdir -p "$SYSUP_PROC_ROOT/4242/fd"
+  : >"$DNFUP_RPM_LOCK"
+  rpm_lock_inode=$(ls -di "$DNFUP_RPM_LOCK")
+  rpm_lock_inode="${rpm_lock_inode%% *}"
+  # /proc/locks rows: a write lock on the rpm lock's inode, a read lock on it,
+  # and a request still waiting for it.
+  rpm_lock_write="1: POSIX  ADVISORY  WRITE 4242 00:2e:$rpm_lock_inode 0 EOF"
+  rpm_lock_read="2: POSIX  ADVISORY  READ 4242 00:2e:$rpm_lock_inode 0 EOF"
+  rpm_lock_waiter="1: -> POSIX  ADVISORY  WRITE 4243 00:2e:$rpm_lock_inode 0 EOF"
+  rpm_lock_other="3: POSIX  ADVISORY  WRITE 4242 00:2e:99999999 0 EOF"
+
+  # rpm keeps its lock file open after releasing the lock, so an open
+  # descriptor with no write lock is an idle process, not a holder.
+  _dnfup_reset
+  ln -s "$DNFUP_RPM_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  printf '%s\n%s\n' "$rpm_lock_read" "$rpm_lock_other" >"$SYSUP_PROC_ROOT/locks"
+  set +e
+  # shellcheck disable=SC2119 # an upgrade with no extra dnf arguments.
+  result=$(sysup_backend_upgrade 2>&1)
+  status=$?
+  set -e
+  _assert_eq "dnfup lock: an open but unlocked rpm lock file does not block" "0" "$status"
+  _assert_not_contains "dnfup lock: does not wait for an idle process" \
+    "waiting" "$result"
+  _assert_contains "dnfup lock: upgrades past an idle process" \
+    "upgrade --refresh -y" "$(cat "$DNFUP_DNF_LOG")"
+
+  printf '%s\n' "$rpm_lock_waiter" >"$SYSUP_PROC_ROOT/locks"
+  if dnfup_rpm_lock_held "$DNFUP_RPM_LOCK"; then status=0; else status=1; fi
+  _assert_eq "dnfup lock: a waiting request is not a holder" "1" "$status"
+  rm -f "$SYSUP_PROC_ROOT/locks"
+  if dnfup_rpm_lock_held "$DNFUP_RPM_LOCK"; then status=0; else status=1; fi
+  _assert_eq "dnfup lock: without /proc/locks an open descriptor is the holder" "0" "$status"
+  rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
+  printf '%s\n' "$rpm_lock_write" >"$SYSUP_PROC_ROOT/locks"
+  if dnfup_rpm_lock_held "$DNFUP_RPM_LOCK"; then status=0; else status=1; fi
+  _assert_eq "dnfup lock: a write lock with no open descriptor is not trusted" "1" "$status"
 
   # A held lock is waited out, then the upgrade proceeds.
   _dnfup_reset
   ln -s "$DNFUP_RPM_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  printf '%s\n' "$rpm_lock_write" >"$SYSUP_PROC_ROOT/locks"
   (sleep 0.4 && rm -f "$SYSUP_PROC_ROOT/4242/fd/3") &
   releaser=$!
   set +e
@@ -666,6 +708,7 @@ if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
   # A lock held past the deadline fails before dnf runs.
   _dnfup_reset
   ln -s "$DNFUP_RPM_LOCK" "$SYSUP_PROC_ROOT/4242/fd/3"
+  printf '%s\n' "$rpm_lock_write" >"$SYSUP_PROC_ROOT/locks"
   # shellcheck disable=SC2034 # read by the sourced dnfup under test.
   DNFUP_LOCK_TIMEOUT=1
   set +e
@@ -673,9 +716,9 @@ if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
   result=$(sysup_backend_upgrade 2>&1)
   status=$?
   set -e
-  rm -f "$SYSUP_PROC_ROOT/4242/fd/3"
+  rm -f "$SYSUP_PROC_ROOT/4242/fd/3" "$SYSUP_PROC_ROOT/locks"
   # shellcheck disable=SC2034 # read by the sourced dnfup under test.
-  DNFUP_LOCK_TIMEOUT=300
+  DNFUP_LOCK_TIMEOUT=30
   _assert_eq "dnfup lock: a lock held past the deadline fails" "1" "$status"
   _assert_contains "dnfup lock: names the lock it gave up on" \
     "the rpm transaction lock is still held" "$result"
