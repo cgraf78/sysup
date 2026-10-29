@@ -152,6 +152,9 @@ EOF
 export SYSUP_SOURCE_ONLY=1
 # Never read or write the host's deferred-restart state or boot identity.
 SYSUP_STATE_DIR="$(_tmpdir)/state"
+# Fake a running systemd: the host running the suite may have none.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+SYSUP_SYSTEMD_RUN_DIR="$(_tmpdir)"
 SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
 printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
 # shellcheck source=../lib/sysup/dnfup

@@ -16,3 +16,5 @@ program	test/common-test
 program	test/archup-test
 program	test/debup-test
 program	test/dnfup-test
+program	test/e2e/distro-run
+program	test/e2e/provision.sh

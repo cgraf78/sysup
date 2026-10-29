@@ -36,8 +36,14 @@ It runs real package managers as root, so tests must never reach one.
 - CI: `SYSUP_SKIP_SHELLCHECK=1 test/run` on the shared shell matrix (profile
   `base`), a separate ShellCheck job, and a `Stock macOS Bash 3.2` job that
   runs `PREFIX=$tmp /bin/bash install.sh` and then
-  `/bin/bash $tmp/bin/sysup --help`. A `Required` job gates the shell
-  matrix (including ShellCheck) and the Bash 3.2 job.
+  `/bin/bash $tmp/bin/sysup --help`. A `distros` matrix runs
+  `test/e2e/distro-run` once per supported family image. A `Required` job
+  gates the shell matrix (including ShellCheck), the Bash 3.2 job, and the
+  distro matrix.
+- End to end: `test/e2e/distro-run IMAGE` boots IMAGE with systemd as PID 1
+  and runs the real `sysup` as root and through sudo. It needs Docker, or
+  rootless Podman with `SYSUP_E2E_ENGINE=podman`, and is not part of
+  `test/run`.
 - The Bash 3.2 job covers only install and `--help`; it does not prove other
   dispatcher paths.
 

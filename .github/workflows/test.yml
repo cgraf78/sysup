@@ -53,23 +53,58 @@ jobs:
           help_output=$(/bin/bash "$install_prefix/bin/sysup" --help)
           [[ "$help_output" == *"Usage: sysup"* ]]
 
+  distros:
+    name: End to end (${{ matrix.image }})
+    # The unit suites mock every package manager; this runs the real sysup
+    # against the real package manager and systemd in each supported family.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - docker.io/library/debian:stable
+          - docker.io/library/ubuntu:latest
+          - docker.io/library/archlinux:latest
+          - docker.io/library/fedora:latest
+          - docker.io/rockylinux/rockylinux:9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
+        with:
+          persist-credentials: false
+
+      - name: Run sysup end to end
+        # Pass the image through the environment, never by interpolating it
+        # into the script.
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: test/e2e/distro-run "$IMAGE"
+
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, macos-bash32]
+    needs: [shell, macos-bash32, distros]
     runs-on: ubuntu-24.04
     env:
       SHELL_RESULT: ${{ needs.shell.result }}
       BASH32_RESULT: ${{ needs.macos-bash32.result }}
+      DISTROS_RESULT: ${{ needs.distros.result }}
     steps:
       - name: Require all Sysup compatibility checks
         shell: bash
         run: |-
           printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
           printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
+          printf 'Distribution end to end: %s\n' "$DISTROS_RESULT"
 
           test "$SHELL_RESULT" = success
           test "$BASH32_RESULT" = success
+          test "$DISTROS_RESULT" = success
 
   actions-sync:
     name: cgraf78/actions sync

@@ -155,8 +155,23 @@ instead of building packages as root.
 EOF
 }
 
+# Installed packages no sync repository provides (AUR and local builds), sorted.
+# Like orphan_packages, pacman exits 1 both when nothing matches (a host with
+# no AUR packages) and on a real error, so only an `error:` line under the C
+# locale marks the query as failed; warnings pass through to stderr.
 foreign_packages() {
-  pacman -Qqm | sort
+  local errors error_text output status=0
+
+  errors=$(mktemp) || return 2
+  output=$(LC_ALL=C pacman -Qqm 2>"$errors") || status=$?
+  error_text=$(<"$errors")
+  rm -f "$errors"
+  [[ -z "$error_text" ]] || printf '%s\n' "$error_text" >&2
+  if ((status > 1)) || { ((status == 1)) &&
+    { [[ -n "$output" ]] || [[ $'\n'"$error_text" == *$'\n'error:* ]]; }; }; then
+    return 2
+  fi
+  [[ -z "$output" ]] || printf '%s\n' "$output" | sort
 }
 
 aur_rebuild_targets() {

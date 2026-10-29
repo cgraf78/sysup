@@ -12,6 +12,9 @@ REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
 export SYSUP_SOURCE_ONLY=1
 # Never read or write the host's deferred-restart state or boot identity.
 SYSUP_STATE_DIR="$(_tmpdir)/state"
+# Fake a running systemd: the host running the suite may have none.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+SYSUP_SYSTEMD_RUN_DIR="$(_tmpdir)"
 SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
 # shellcheck source=../lib/sysup/archup
 . "$REPO_ROOT/lib/sysup/archup"
@@ -136,9 +139,11 @@ pacman() {
       ;;
     -Qqm)
       if ((ARCHUP_PACMAN_FOREIGN_STATUS != 0)); then
-        printf 'mock pacman foreign-package query failed\n' >&2
+        printf 'error: mock pacman foreign-package query failed\n' >&2
         return "$ARCHUP_PACMAN_FOREIGN_STATUS"
       fi
+      # Like real pacman, no foreign packages is a silent exit 1.
+      ((${#ARCHUP_PACKAGES[@]})) || return 1
       printf '%s\n' "${ARCHUP_PACKAGES[@]}"
       ;;
     -Qlq)
@@ -602,6 +607,45 @@ _assert_contains "archup scan: foreign-package query failure is actionable" \
   "could not list foreign packages" "$result"
 _assert_not_contains "archup scan: foreign-package query failure never claims an all-clear" \
   "ok: no missing shared libraries" "$result"
+
+echo ""
+echo "=== archup: hosts without foreign packages ==="
+
+# pacman -Qqm exits 1 with no output when nothing is foreign; that is an empty
+# list, not a failed query.
+_archup_mock_reset
+set +e
+result=$(foreign_packages 2>&1)
+status=$?
+set -e
+_assert_eq "archup foreign: none installed is success" "0" "$status"
+_assert_eq "archup foreign: none installed lists nothing" "" "$result"
+
+set +e
+result=$(sysup_backend_preamble 2>&1)
+status=$?
+set -e
+_assert_eq "archup foreign: preamble succeeds without AUR packages" "0" "$status"
+_assert_not_contains "archup foreign: preamble reports no query failure" \
+  "could not list foreign packages" "$result"
+
+set +e
+result=$(scan_missing_libs 2>&1)
+status=$?
+set -e
+_assert_eq "archup foreign: library scan succeeds without AUR packages" "0" "$status"
+
+# The same exit status with an error line is a real failure.
+_archup_mock_reset
+_archup_mock_add_package local-only 0 ok
+ARCHUP_PACMAN_FOREIGN_STATUS=1
+set +e
+result=$(foreign_packages 2>&1)
+status=$?
+set -e
+_assert_eq "archup foreign: exit 1 with an error line fails" "2" "$status"
+_assert_contains "archup foreign: the error line is shown" \
+  "error: mock pacman foreign-package query failed" "$result"
 
 echo ""
 echo "=== archup: AUR lookup failures ==="

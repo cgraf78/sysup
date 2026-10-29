@@ -150,7 +150,8 @@ including `--check-only`, repeats one stable stderr line,
 `reboot recommended: session-critical units may still run pre-upgrade code: ...`,
 until the host reboots or each unit is restarted or stopped. The reminder is
 advisory and never changes the exit status. Missing
-systemd is a supported no-op; an unreachable or failed systemd query is an
+systemd, or systemd installed but not running as the init system (a container
+or chroot), is a supported no-op; an unreachable or failed systemd query is an
 error rather than being mistaken for a healthy empty result.
 
 See [`docs/design.md`](docs/design.md) for the hook contract and detailed run
@@ -165,7 +166,8 @@ optional. The Debian path uses `apt-get`,
 `apt-mark`, `dpkg`, `dpkg-query`, `find`, `sed`, and `sort`; `needrestart` is
 optional. The Fedora path uses `dnf`, `rpm`, `find`, and `sort`; the
 `needs-restarting` plugin (dnf-plugins-core or dnf5-plugins) is optional.
-systemd integration is used when `systemctl` is available; recording deferred
+systemd integration is used when `systemctl` is available and systemd is the
+running init (`/run/systemd/system` exists); recording deferred
 restarts also uses `install` and `mktemp`.
 
 The dispatcher and OS detection remain compatible with Bash 3.2 so an
@@ -181,7 +183,9 @@ test/run
 ```
 
 The tests use command fixtures and temporary OS roots; they never invoke the
-live package manager. See [`test/README.md`](test/README.md) for suite ownership
+live package manager. Separately, `test/e2e/distro-run IMAGE` runs the real
+`sysup` inside a systemd container of each supported distribution; CI does this
+for every family. See [`test/README.md`](test/README.md) for suite ownership
 and [`lib/sysup/README.md`](lib/sysup/README.md) for the private backend
 boundary.
 

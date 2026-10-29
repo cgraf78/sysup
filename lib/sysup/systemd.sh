@@ -5,6 +5,20 @@
 # service on the old code, so an upgrade is not finished until the affected
 # units have been restarted and the unit state re-checked.
 
+# Directory that exists only while systemd is the running service manager;
+# testing it is how sd_booted(3) answers the same question. Overridable for
+# tests.
+SYSUP_SYSTEMD_RUN_DIR="${SYSUP_SYSTEMD_RUN_DIR:-/run/systemd/system}"
+
+# Return 0 when systemd is running and systemctl can reach it.
+#
+# An installed systemctl is not enough. Containers, chroots, and hosts booted
+# with another init ship the binary, and every query there fails, which the
+# callers would report as a broken host rather than one without systemd.
+sysup_systemd_running() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSUP_SYSTEMD_RUN_DIR" ]]
+}
+
 # Prints the failed-unit table. Returns non-zero when systemd could not be
 # queried at all, which the callers must not confuse with "nothing failed".
 sysup_failed_units() {
@@ -15,8 +29,8 @@ sysup_report_failed_units() {
 
   sysup_log "checking failed systemd units"
 
-  if ! command -v systemctl >/dev/null 2>&1; then
-    printf 'skipped: systemctl is not available\n'
+  if ! sysup_systemd_running; then
+    printf 'skipped: systemd is not running\n'
     return 0
   fi
 
@@ -54,8 +68,8 @@ sysup_restart_failed_units() {
   local failed unit state
   local units=()
 
-  if ! command -v systemctl >/dev/null 2>&1; then
-    printf 'skipped: systemctl is not available\n'
+  if ! sysup_systemd_running; then
+    printf 'skipped: systemd is not running\n'
     return 0
   fi
 
@@ -399,7 +413,7 @@ sysup_report_deferred_restarts() {
   local may_prune="${1:-0}" state listing line entry_boot unit total=0
   local -a pending=() units=()
 
-  command -v systemctl >/dev/null 2>&1 || return 0
+  sysup_systemd_running || return 0
   state="$(sysup_deferred_state_file)"
   [[ -e "$state" ]] || return 0
   listing="$(sysup_pending_deferred_restarts)" || return 0
@@ -443,8 +457,8 @@ sysup_restart_upgraded_services() {
     return 0
   fi
 
-  if ! command -v systemctl >/dev/null 2>&1; then
-    printf 'skipped: systemctl is not available\n'
+  if ! sysup_systemd_running; then
+    printf 'skipped: systemd is not running\n'
     return 0
   fi
 
