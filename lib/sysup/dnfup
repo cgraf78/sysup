@@ -27,6 +27,18 @@ _dnfup_lib_dir() {
 # fixture instead of the live system.
 DNFUP_OSTREE_BOOTED_FILE="${DNFUP_OSTREE_BOOTED_FILE:-/run/ostree-booted}"
 
+# Where packages are pinned: dnf.conf's [main] excludes, and the versionlock
+# list each dnf generation keeps (dnf4's plugin and dnf5's built-in command use
+# different files and formats). Overridable for tests.
+DNFUP_CONF="${DNFUP_CONF:-/etc/dnf/dnf.conf}"
+DNFUP_VERSIONLOCK_LIST="${DNFUP_VERSIONLOCK_LIST:-/etc/dnf/plugins/versionlock.list}"
+DNFUP_VERSIONLOCK_TOML="${DNFUP_VERSIONLOCK_TOML:-/etc/dnf/versionlock.toml}"
+
+# The rpm transaction lock. dnf4 waits for it, but dnf5 fails at once while
+# another transaction (dnf-automatic, PackageKit) holds it. Empty means ask rpm.
+DNFUP_RPM_LOCK="${DNFUP_RPM_LOCK:-}"
+DNFUP_LOCK_TIMEOUT="${DNFUP_LOCK_TIMEOUT:-300}"
+
 sysup_backend_usage() {
   cat <<'EOF'
 Usage: sysup [--no-autoremove] [--check-only]
@@ -37,13 +49,15 @@ Upgrade a Fedora or RHEL-family host within its installed release, then verify
 the failure modes most likely to leave services broken after the upgrade.
 
 Default flow:
-  1. warm sudo credentials
-  2. refresh metadata and upgrade packages noninteractively
-  3. remove packages no longer required
-  4. run dnf check, pending-config, and reboot-required checks
-  5. restart active services shipped by packages upgraded in this run
-  6. optionally restart failed enabled units with --restart-failed
-  7. report failed systemd units when systemd is available
+  1. report versionlocked and excluded packages
+  2. warm sudo credentials
+  3. wait for another rpm transaction to finish, then refresh metadata and
+     upgrade packages noninteractively
+  4. remove packages no longer required
+  5. run dnf check, pending-config, and reboot-required checks
+  6. restart active services shipped by packages upgraded in this run
+  7. optionally restart failed enabled units with --restart-failed
+  8. report failed systemd units when systemd is available
 
 Options:
 EOF
@@ -202,7 +216,116 @@ sysup_backend_autoremove() {
   dnfup_dnf autoremove -y
 }
 
+# Print the packages dnf will not upgrade, one per line, each marked with why:
+# `(versionlock)` or `(excluded)`. Reads the files directly: `dnf versionlock
+# list` needs a plugin on dnf4 and loads repositories, and an informational
+# list must not fail on either. Repository-level excludes are not covered.
+dnfup_pinned_packages() {
+  local line section="" item
+  local -a items=()
+
+  if [[ -e "$DNFUP_CONF" ]]; then
+    [[ -r "$DNFUP_CONF" ]] || return 1
+    # `exclude` is the old spelling of `excludepkgs`; both take a comma- or
+    # space-separated list, and only the [main] section applies globally.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*\[([^]]*)\] ]]; then
+        section="${BASH_REMATCH[1]}"
+        continue
+      fi
+      [[ "$section" == main ]] || continue
+      [[ "$line" =~ ^[[:space:]]*(excludepkgs|exclude)[[:space:]]*=(.*)$ ]] || continue
+      # read -a splits without globbing, so a `kernel*` pattern stays literal.
+      read -ra items <<<"${BASH_REMATCH[2]//,/ }"
+      for item in ${items[@]+"${items[@]}"}; do
+        printf '%s (excluded)\n' "$item"
+      done
+    done <"$DNFUP_CONF"
+  fi
+
+  # dnf4: one NEVRA pattern per line; a leading `!` marks an exclude entry.
+  if [[ -e "$DNFUP_VERSIONLOCK_LIST" ]]; then
+    [[ -r "$DNFUP_VERSIONLOCK_LIST" ]] || return 1
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="${line//[[:space:]]/}"
+      [[ -n "$line" ]] || continue
+      if [[ "$line" == '!'* ]]; then
+        printf '%s (excluded)\n' "${line#!}"
+      else
+        printf '%s (versionlock)\n' "$line"
+      fi
+    done <"$DNFUP_VERSIONLOCK_LIST"
+  fi
+
+  # dnf5: TOML with one `name = "..."` per [[packages]] table.
+  if [[ -e "$DNFUP_VERSIONLOCK_TOML" ]]; then
+    [[ -r "$DNFUP_VERSIONLOCK_TOML" ]] || return 1
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*name[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] || continue
+      printf '%s (versionlock)\n' "${BASH_REMATCH[1]}"
+    done <"$DNFUP_VERSIONLOCK_TOML"
+  fi
+}
+
+# Informational, like held packages elsewhere: an unreadable file is a warning
+# and never stops the run.
+sysup_backend_preamble() {
+  local -a pinned=()
+  local listing
+
+  if ! listing="$(dnfup_pinned_packages)"; then
+    printf 'warning: could not read the dnf exclude or versionlock configuration\n' >&2
+    return 0
+  fi
+  [[ -z "$listing" ]] || mapfile -t pinned <<<"$listing"
+  sysup_log "versionlocked and excluded packages (${#pinned[@]})"
+  if ((${#pinned[@]})); then
+    printf '  %s\n' "${pinned[@]}"
+  else
+    printf '  (none)\n'
+  fi
+}
+
+dnfup_rpm_lock_path() {
+  local path="$DNFUP_RPM_LOCK"
+
+  [[ -n "$path" ]] || path=$(rpm --eval '%{_rpmlock_path}' 2>/dev/null) || path=""
+  # An unexpanded macro comes back verbatim.
+  [[ -n "$path" && "$path" != *%* ]] || path=/var/lib/rpm/.rpm.lock
+  printf '%s\n' "$path"
+}
+
+# Return 0 when another process holds the rpm transaction lock, 1 otherwise.
+#
+# rpm keeps its lock file open for the life of a transaction set, after the
+# lock itself is released, so an open descriptor alone would make an idle
+# PackageKit or dnf5daemon look like a holder for as long as it runs. Held
+# means a process has the file open and /proc/locks shows a write lock on its
+# inode. The inode alone is compared: /proc/locks devices do not match stat()
+# on btrfs, and requiring an open descriptor too keeps an inode collision
+# with another subvolume's locked file from mattering. When /proc/locks
+# cannot be read, the open descriptor is taken as the holder.
+dnfup_rpm_lock_held() {
+  local path="$1" inode
+
+  sysup_path_in_use "$path" || return 1
+  # `ls -di` rather than `stat`, whose flags differ between GNU and BSD.
+  inode=$(ls -di "$path" 2>/dev/null) || return 1
+  inode="${inode%% *}"
+  [[ -r "$SYSUP_PROC_ROOT/locks" ]] || return 0
+  # Fields: id, type, mode, access, pid, major:minor:inode, start, end. A
+  # waiting request carries `->` after the id, which shifts its access field
+  # out of $4, so only granted write locks match.
+  awk -v inode="$inode" '
+    $4 == "WRITE" { n = split($6, dev, ":"); if (dev[n] == inode) found = 1 }
+    END { exit !found }
+  ' "$SYSUP_PROC_ROOT/locks"
+}
+
 sysup_backend_upgrade() {
+  sysup_wait_path_free "$(dnfup_rpm_lock_path)" "$DNFUP_LOCK_TIMEOUT" \
+    "the rpm transaction lock" dnfup_rpm_lock_held || return 1
   dnfup_dnf upgrade --refresh -y "$@"
 }
 
