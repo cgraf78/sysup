@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# distro-run IMAGE - run sysup end to end in a real distro container.
+#
+# The unit suites replace every package manager and systemctl with fixtures,
+# so they prove sysup agrees with its own mocks, not with apt, dnf, pacman, or
+# zypper. This boots IMAGE with systemd as PID 1 and runs the real command
+# against the real package manager and service manager:
+#
+#   1. --check-only as root
+#   2. a full upgrade as root (whatever the image is behind on)
+#   3. a full run as a non-root user through sudo
+#   4. --check-only again, which must still be clean afterwards
+#
+# Every step must exit 0. It needs Docker with privileged containers, which
+# GitHub's Ubuntu runners provide, or rootless Podman for local runs
+# (SYSUP_E2E_ENGINE=podman). It is not part of test/run.
+
+set -euo pipefail
+
+image="${1:?usage: distro-run IMAGE}"
+engine="${SYSUP_E2E_ENGINE:-docker}"
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# Per-invocation names, so concurrent runs on one Docker host cannot remove
+# each other's containers.
+tag="sysup-e2e-$$-$RANDOM"
+prep="$tag-prep"
+built="$tag:provisioned"
+status=0
+
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+cleanup() {
+  "$engine" rm -f "$tag" "$prep" >/dev/null 2>&1 || true
+  "$engine" rmi -f "$built" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+step() {
+  printf '\n::group::%s\n' "$*"
+}
+endstep() {
+  printf '::endgroup::\n'
+}
+
+step "provision $image"
+"$engine" run --name "$prep" \
+  -v "$repo/test/e2e/provision.sh:/provision.sh:ro" \
+  "$image" bash /provision.sh
+"$engine" commit "$prep" "$built" >/dev/null
+"$engine" rm "$prep" >/dev/null
+endstep
+
+step "boot systemd"
+# systemd as PID 1 needs a writable cgroup hierarchy and tmpfs /run. A private
+# cgroup namespace gives it its own subtree rather than the host's whole
+# hierarchy; --privileged makes that subtree writable under Docker. Podman
+# only sets up a systemd container itself when the command is named like
+# systemd, which /sysup-init is not, so ask for it explicitly.
+boot=(--privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock)
+if [[ "$engine" == podman ]]; then
+  boot+=(--systemd=always)
+fi
+"$engine" run -d --name "$tag" "${boot[@]}" \
+  -v "$repo:/src:ro" \
+  "$built" /sysup-init >/dev/null
+
+state=""
+for _ in $(seq 1 120); do
+  state=$("$engine" exec "$tag" systemctl is-system-running 2>/dev/null || true)
+  case "$state" in
+    running | degraded) break ;;
+  esac
+  sleep 1
+done
+printf 'system state: %s\n' "${state:-unknown}"
+case "$state" in
+  running | degraded) ;;
+  *)
+    "$engine" exec "$tag" journalctl -b --no-pager -n 100 || true
+    printf 'error: systemd did not finish booting in %s\n' "$image" >&2
+    exit 1
+    ;;
+esac
+
+# Units a container cannot run (hardware, consoles, remounts) fail at boot.
+# They predate sysup, so show them and clear them; a unit that fails after
+# the upgrade is then sysup's to report.
+"$engine" exec "$tag" systemctl --failed --no-pager --plain || true
+"$engine" exec "$tag" systemctl reset-failed
+
+# A private copy the non-root user can read.
+"$engine" exec "$tag" cp -a /src /opt/sysup
+"$engine" exec "$tag" chmod -R a+rX /opt/sysup
+endstep
+
+run() {
+  local label="$1" rc=0
+  shift
+
+  step "$label"
+  "$engine" exec "$@" || rc=$?
+  printf '%s: exit %s\n' "$label" "$rc"
+  if ((rc != 0)); then
+    "$engine" exec "$tag" systemctl --failed --no-pager --plain || true
+    "$engine" exec "$tag" journalctl -b --no-pager -n 60 || true
+    status=1
+  fi
+  endstep
+}
+
+run "check-only as root" "$tag" /opt/sysup/bin/sysup --check-only
+run "upgrade as root" "$tag" /opt/sysup/bin/sysup
+run "upgrade as non-root through sudo" -u sysupci -w /home/sysupci "$tag" \
+  /opt/sysup/bin/sysup
+run "check-only after upgrade" "$tag" /opt/sysup/bin/sysup --check-only
+
+if ((status != 0)); then
+  printf '\nerror: sysup end-to-end run failed on %s\n' "$image" >&2
+fi
+exit "$status"

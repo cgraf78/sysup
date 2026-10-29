@@ -314,6 +314,10 @@ or excluded packages are not listed the way `debup` lists held packages.
 - `dnfup-test` mocks `dnf`, `rpm`, and `systemctl` to cover the upgrade and
   autoremove policy, multilib, installonly, and signing-key snapshots, each
   check, and the image-based, yum-only, and family guards.
+- `test/e2e/distro-run` boots a stock image of each supported family with
+  systemd as PID 1 and runs the real `sysup` (check-only, upgrade as root,
+  upgrade through sudo, check-only again) against the real package manager.
+  It is the only test that does not mock them, and CI runs it per family.
 - `sysup-test` covers family detection from fixture `os-release` files,
   symlink-aware dispatch to the private backend, exact argument forwarding,
   portability constraints, and the installation layout.

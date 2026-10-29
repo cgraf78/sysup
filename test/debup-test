@@ -197,6 +197,9 @@ EOF
 export SYSUP_SOURCE_ONLY=1
 # Never read or write the host's deferred-restart state or boot identity.
 SYSUP_STATE_DIR="$(_tmpdir)/state"
+# Fake a running systemd: the host running the suite may have none.
+# shellcheck disable=SC2034 # read by the sourced backend under test.
+SYSUP_SYSTEMD_RUN_DIR="$(_tmpdir)"
 SYSUP_BOOT_ID_FILE="$(_tmpdir)/boot_id"
 printf 'boot-a\n' >"$SYSUP_BOOT_ID_FILE"
 # shellcheck source=../lib/sysup/debup
@@ -632,6 +635,31 @@ _assert_contains "debup restart: needrestart cannot raise an interactive debconf
   "-r a DEBIAN_FRONTEND=noninteractive" "$needrestart_log"
 _assert_not_contains "debup restart: needrestart replaces the built-in restart" \
   "try-restart" "$systemctl_log"
+
+echo ""
+echo "=== debup: no running systemd ==="
+
+# Containers and chroots ship systemctl without systemd running; every query
+# there fails. That is a host without systemd, not a broken one.
+_debup_reset
+saved_systemd_run_dir="$SYSUP_SYSTEMD_RUN_DIR"
+SYSUP_SYSTEMD_RUN_DIR="$(_tmpdir)/absent"
+DEBUP_MOCK_FAILED_UNITS="broken.service loaded failed failed broken"
+set +e
+result=$(sysup_report_failed_units 2>&1)
+status=$?
+set -e
+_assert_eq "debup no-systemd: failed-unit report succeeds" "0" "$status"
+_assert_contains "debup no-systemd: says systemd is not running" \
+  "skipped: systemd is not running" "$result"
+DEBUP_MOCK_PACKAGE_FILES=$'openssh-server /usr/lib/systemd/system/ssh.service'
+DEBUP_MOCK_ACTIVE_UNITS="ssh.service"
+result=$(sysup_restart_upgraded_services openssh-server 2>&1)
+_assert_contains "debup no-systemd: upgraded-service restarts are skipped" \
+  "skipped: systemd is not running" "$result"
+_assert_eq "debup no-systemd: no systemctl call is made" \
+  "" "$(cat "$DEBUP_SYSTEMCTL_LOG")"
+SYSUP_SYSTEMD_RUN_DIR="$saved_systemd_run_dir"
 
 echo ""
 echo "=== debup: full run ==="

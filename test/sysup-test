@@ -74,8 +74,8 @@ _assert_contains "sysup CI: publishes a stable Required check" \
   "name: Required" "$SYSUP_REQUIRED_JOB"
 _assert_contains "sysup CI: Required still reports prerequisite failures" \
   "if: \${{ always() }}" "$SYSUP_REQUIRED_JOB"
-_assert_contains "sysup CI: Required gates shared platforms and Bash 3.2" \
-  "needs: [shell, macos-bash32]" "$SYSUP_REQUIRED_JOB"
+_assert_contains "sysup CI: Required gates shared platforms, Bash 3.2, and distros" \
+  "needs: [shell, macos-bash32, distros]" "$SYSUP_REQUIRED_JOB"
 _assert_contains "sysup CI: Required reads the shared-platform result" \
   "SHELL_RESULT: \${{ needs.shell.result }}" "$SYSUP_REQUIRED_JOB"
 _assert_contains "sysup CI: Required reads the Bash 3.2 result" \
@@ -84,6 +84,10 @@ _assert_contains "sysup CI: Required enforces shared-platform success" \
   "test \"\$SHELL_RESULT\" = success" "$SYSUP_REQUIRED_JOB"
 _assert_contains "sysup CI: Required enforces Bash 3.2 success" \
   "test \"\$BASH32_RESULT\" = success" "$SYSUP_REQUIRED_JOB"
+_assert_contains "sysup CI: Required reads the distro end-to-end result" \
+  "DISTROS_RESULT: \${{ needs.distros.result }}" "$SYSUP_REQUIRED_JOB"
+_assert_contains "sysup CI: Required enforces distro end-to-end success" \
+  "test \"\$DISTROS_RESULT\" = success" "$SYSUP_REQUIRED_JOB"
 
 SYSUP_MOCK_BIN=$(_mock_bin)
 export PATH="$SYSUP_MOCK_BIN:$PATH"

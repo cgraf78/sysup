@@ -35,6 +35,24 @@ When ShellCheck is installed, the runner also lints every program listed in
 `.github/shellcheck-files.txt`. Shared CI sets `SYSUP_SKIP_SHELLCHECK=1` for the
 behavior matrix because a separate required inventory job runs the same lint.
 
+## End to end
+
+The suites above prove sysup agrees with its fixtures, not with the real tools.
+`e2e/distro-run IMAGE` closes that gap: `e2e/provision.sh` installs systemd,
+sudo, and sysup's tool dependencies into a stock distribution image (without
+upgrading anything else), and the runner boots it with systemd as PID 1. It
+then runs `sysup --check-only` and a full upgrade as root, a full run as a
+non-root user through sudo, and `--check-only` again; every step must exit 0.
+
+```bash
+test/e2e/distro-run docker.io/library/debian:stable
+SYSUP_E2E_ENGINE=podman test/e2e/distro-run docker.io/library/fedora:latest
+```
+
+CI runs it for each supported family in the `distros` job. Some advisory
+warnings are expected inside a container, such as needrestart being unable to
+determine the running kernel's state.
+
 Fixtures must stay generic and public: synthetic package/unit names, temporary
 paths, and distribution defaults only. Never add real hosts, accounts, or
 deployment details.
