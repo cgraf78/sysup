@@ -193,6 +193,23 @@ error rather than being mistaken for a healthy empty result.
 See [`docs/design.md`](docs/design.md) for the hook contract and detailed run
 ordering.
 
+## Pending updates
+
+`sysup --list-updates` prints pending repository updates as `name version`,
+one per line, using the package manager's current cached metadata. Empty output
+and exit status zero mean no updates; a query failure returns nonzero. Arch
+uses `pacman -Qu` and does not include AUR updates. Debian and Ubuntu use
+`apt list --upgradable`. The listing is currently available on these families;
+other supported upgrade families return an unsupported error.
+
+`sysup --refresh-updates` separately refreshes metadata with `pacman -Sy` or
+`apt-get update`; it never upgrades packages or restarts services. It needs root
+or sudo, and APT is configured to fail when any repository refresh fails.
+Refreshing Arch's shared package database without a full upgrade can make later
+individual package installs unsafe; use a full system upgrade before installing
+individual packages. Metadata can go stale after a refresh, so consumers should
+track freshness themselves. Neither command manages a monitoring cache.
+
 ## Requirements
 
 Upgrading a supported host requires Bash 4 or newer, `sudo` for privilege
