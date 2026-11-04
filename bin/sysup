@@ -59,6 +59,8 @@ EOF
   cat <<EOF
 
 On a supported host, --help also prints the selected backend's flags.
+  --list-updates     list cached pending updates (Arch and Debian)
+  --refresh-updates  refresh repository metadata only (Arch and Debian)
 EOF
 }
 
@@ -93,6 +95,19 @@ main() {
     printf 'supported families: %s\n' "$(sysup_supported_families)" >&2
     return 1
   fi
+
+  case "${1:-}" in
+    --list-updates | --refresh-updates)
+      if (($# != 1)); then
+        printf 'error: %s accepts no other arguments\n' "$1" >&2
+        return 2
+      fi
+      # shellcheck source=../lib/sysup/pending.sh
+      . "$_SYSUP_LIB_DIR/pending.sh"
+      sysup_pending "$family" "$1"
+      return $?
+      ;;
+  esac
 
   backend="$(sysup_family_command "$family")"
   if ! backend_path=$(resolve_backend "$backend"); then

@@ -9,11 +9,13 @@ program	lib/sysup/dnfup
 program	lib/sysup/zypup
 program	lib/sysup/common.sh
 program	lib/sysup/detect.sh
+program	lib/sysup/pending.sh
 program	lib/sysup/rpm.sh
 program	lib/sysup/systemd.sh
 program	test/run
 program	test/lib/test.sh
 program	test/sysup-test
+program	test/pending-test
 program	test/common-test
 program	test/archup-test
 program	test/debup-test

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
+. "$TEST_DIR/lib/test.sh"
+root=$(_tmpdir)
+mock=$(_mock_bin)
+mkdir -p "$root/etc"
+export SYSUP_OS_ROOT="$root" PATH="$mock:$PATH" TEST_LOG="$root/log"
+cat >"$mock/uname" <<'MOCK'
+#!/bin/bash
+printf 'Linux\n'
+MOCK
+cat >"$mock/pacman" <<'MOCK'
+#!/bin/bash
+printf '%s\n' "$*" >>"$TEST_LOG"
+case "$*" in
+  -Qu) printf '%s' "${MOCK_OUTPUT:-}"; printf '%s' "${MOCK_ERROR:-}" >&2; exit "${MOCK_STATUS:-0}" ;;
+  -Sy) exit "${MOCK_STATUS:-0}" ;;
+  *) exit 90 ;;
+esac
+MOCK
+cat >"$mock/sudo" <<'MOCK'
+#!/bin/bash
+exec "$@"
+MOCK
+cat >"$mock/apt" <<'MOCK'
+#!/bin/bash
+printf '%s\n' "$*" >>"$TEST_LOG"
+printf '%s' "${MOCK_OUTPUT:-}"
+printf '%s' "${MOCK_ERROR:-}" >&2
+exit "${MOCK_STATUS:-0}"
+MOCK
+cat >"$mock/apt-get" <<'MOCK'
+#!/bin/bash
+printf '%s\n' "$*" >>"$TEST_LOG"
+exit "${MOCK_STATUS:-0}"
+MOCK
+chmod +x "$mock"/*
+cmd="$REPO_ROOT/bin/sysup"
+printf 'ID=arch\n' >"$root/etc/os-release"
+output=$(MOCK_OUTPUT=$'alpha 1 -> 2\nbeta 3 -> 4\n' "$cmd" --list-updates)
+_assert_eq 'Arch lists package and new version' $'alpha 2\nbeta 4' "$output"
+status=0
+output=$(MOCK_STATUS=1 "$cmd" --list-updates) || status=$?
+_assert_eq 'Arch empty update list succeeds' 0 "$status"
+_assert_eq 'Arch empty update list is empty' '' "$output"
+status=0
+output=$(MOCK_STATUS=1 MOCK_ERROR='error: database unavailable' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Arch query errors fail' 1 "$status"
+_assert_eq 'Arch query errors publish no list' '' "$output"
+status=0
+MOCK_STATUS=2 "$cmd" --list-updates >/dev/null 2>&1 || status=$?
+_assert_eq 'Arch silent query failure is not empty success' 2 "$status"
+status=0
+output=$(MOCK_OUTPUT=$'alpha 1 -> 2\nmalformed\n' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Arch malformed listing fails' 1 "$status"
+_assert_eq 'Arch malformed listing publishes no partial list' '' "$output"
+status=0
+"$cmd" --list-updates --refresh-updates >/dev/null 2>&1 || status=$?
+_assert_eq 'listing rejects combined operations' 2 "$status"
+: >"$TEST_LOG"
+"$cmd" --refresh-updates
+_assert_eq 'Arch refresh does not upgrade packages' '-Sy' "$(cat "$TEST_LOG")"
+printf 'ID=debian\n' >"$root/etc/os-release"
+output=$(MOCK_OUTPUT=$'Listing...\nalpha/stable 2 amd64 [upgradable from: 1]\n' "$cmd" --list-updates)
+_assert_eq 'Debian lists package and new version' 'alpha 2' "$output"
+output=$(MOCK_OUTPUT=$'Listing...\n' "$cmd" --list-updates)
+_assert_eq 'Debian empty update list is empty' '' "$output"
+status=0
+output=$(MOCK_OUTPUT=$'Listing...\nalpha/stable 2 amd64\nmalformed\n' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Debian malformed listing fails' 1 "$status"
+_assert_eq 'Debian malformed listing publishes no partial list' '' "$output"
+status=0
+output=$(MOCK_STATUS=2 MOCK_OUTPUT='partial/stable 4 amd64' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Debian query errors fail' 2 "$status"
+_assert_eq 'Debian query failure publishes no partial list' '' "$output"
+: >"$TEST_LOG"
+"$cmd" --refresh-updates
+_assert_eq 'Debian refresh fails on repository errors' '-o APT::Update::Error-Mode=any update' "$(cat "$TEST_LOG")"
+status=0
+MOCK_STATUS=4 "$cmd" --refresh-updates >/dev/null 2>&1 || status=$?
+_assert_eq 'refresh preserves failure status' 4 "$status"
+printf 'ID=fedora\n' >"$root/etc/os-release"
+status=0
+"$cmd" --list-updates >/dev/null 2>&1 || status=$?
+_assert_eq 'unsupported listing fails' 1 "$status"
+status=0
+"$cmd" --refresh-updates >/dev/null 2>&1 || status=$?
+_assert_eq 'unsupported refresh fails' 1 "$status"
+_test_summary
