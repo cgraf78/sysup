@@ -5,7 +5,10 @@
 #
 # It installs only what booting systemd and running sysup need, and leaves
 # every other package at the image's version: pending updates are what the
-# real upgrade run exercises. It never upgrades the whole system.
+# real upgrade run exercises. It never upgrades the whole system, except on
+# Arch (see the pacman branch): a partial upgrade there is unsupported and
+# breaks on soname bumps, so Arch upgrades everything but one held-back
+# leaf package, which the sysup run then installs as its pending update.
 
 set -euo pipefail
 
@@ -21,6 +24,30 @@ retry() {
   return 1
 }
 
+# One installed package to leave behind for the sysup run: a leaf nothing
+# installed requires, outside the coupled base (systemd, glibc, openssl,
+# pacman, the kernel), whose hold-back still resolves the upgrade
+# transaction. Empty when nothing qualifies; the caller then upgrades
+# everything. At most ten candidates are tried so a pathological database
+# cannot stall provision.
+pick_holdback() {
+  local pkg required_by tried=0
+  pacman -Quq 2>/dev/null | while read -r pkg; do
+    ((tried += 1))
+    ((tried > 10)) && break
+    case $pkg in
+      systemd*|glibc|openssl|pacman|linux|dbus|mkinitcpio|base) continue ;;
+    esac
+    required_by=$(pacman -Qi "$pkg" 2>/dev/null | sed -n 's/^Required By *: *//p')
+    [[ $required_by == None ]] || continue
+    if pacman -Su --print --ignore "$pkg" \
+        systemd sudo file pacman-contrib >/dev/null 2>&1; then
+      printf '%s\n' "$pkg"
+      break
+    fi
+  done
+}
+
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   retry apt-get update
@@ -29,9 +56,23 @@ if command -v apt-get >/dev/null 2>&1; then
   retry apt-get install -y --no-install-recommends \
     systemd systemd-sysv dbus sudo needrestart procps findutils
 elif command -v pacman >/dev/null 2>&1; then
-  # -Sy without -u: refresh the sync database so these installs resolve, but
-  # leave the rest of the image behind for the sysup run to upgrade.
-  retry pacman -Sy --needed --noconfirm systemd sudo file pacman-contrib
+  # -Sy without -u is a partial upgrade, which Arch does not support: once a
+  # soname bump lands in the sync database (openssl 4.1.0, systemd 262.2),
+  # installing the newest systemd pulls in libraries the image's installed
+  # packages still link against, and the transaction cannot resolve. Upgrade
+  # the whole system instead, but hold back one safe leaf package so the
+  # sysup run still has a real pending update to install. A bad hold-back
+  # choice degrades to the plain full upgrade rather than failing provision.
+  retry pacman -Sy
+  holdback=$(pick_holdback)
+  if [[ -n $holdback ]]; then
+    printf 'provision: holding back %s for the sysup run\n' "$holdback"
+    retry pacman -Su --needed --noconfirm --ignore "$holdback" \
+      systemd sudo file pacman-contrib ||
+      retry pacman -Syu --needed --noconfirm systemd sudo file pacman-contrib
+  else
+    retry pacman -Syu --needed --noconfirm systemd sudo file pacman-contrib
+  fi
 elif command -v dnf >/dev/null 2>&1; then
   # The needs-restarting plugin lives in dnf5-plugins on dnf5 and in
   # dnf-plugins-core on dnf4.
