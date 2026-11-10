@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Exercise container provisioning with package-manager functions only.
+set -euo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib/test.sh
+source "$ROOT/test/lib/test.sh"
+
+LOG=$(_tmpfile)
+UPDATES=""
+LEAVES=""
+REJECT=""
+FAIL_HELD=0
+QUERY_STATUS=0
+LEAF_STATUS=0
+FULL_STATUS=0
+
+# Unexpected calls fail rather than reaching any host package manager.
+# shellcheck disable=SC2329 # exported fixture runs in the strict child shell
+pacman() {
+  printf '%s\n' "$*" >>"$LOG"
+  case "$1" in
+    -Sy) return 0 ;;
+    -Quq)
+      [[ -z $UPDATES ]] || printf '%s\n' "$UPDATES"
+      return "$QUERY_STATUS"
+      ;;
+    -Qqt)
+      [[ -z $LEAVES ]] || printf '%s\n' "$LEAVES"
+      return "$LEAF_STATUS"
+      ;;
+    -Su)
+      if [[ $2 == --print ]]; then
+        [[ " $REJECT " != *" $4 "* ]]
+      else
+        return "$FAIL_HELD"
+      fi
+      ;;
+    -Syu) return "$FULL_STATUS" ;;
+    *)
+      printf 'unexpected pacman call: %s\n' "$*" >&2
+      return 99
+      ;;
+  esac
+}
+# Exercise the real retry function without a 60-second failure delay.
+# shellcheck disable=SC2329 # exported fixture runs in the strict child shell
+sleep() { :; }
+
+reset() {
+  : >"$LOG"
+  UPDATES=""
+  LEAVES=""
+  REJECT=""
+  FAIL_HELD=0
+  QUERY_STATUS=0
+  LEAF_STATUS=0
+  FULL_STATUS=0
+}
+
+# Keep errexit active inside each invocation: wrapping the function call in
+# `if` or `||` would hide the fatal empty-query regression under test.
+run_arch() {
+  local status=0
+  # No host executables are reachable even if the source guard regresses.
+  # shellcheck disable=SC2016 # $1 expands in the strict child, not this shell
+  RESULT=$(PATH="$_SYSUP_TEST_TMP_ROOT" "$BASH" -euo pipefail -c 'source "$1"; provision_arch' bash \
+    "$ROOT/test/e2e/provision.sh" 2>&1) || status=$?
+  _assert_eq "$1: provisioning status" "${2:-0}" "$status"
+}
+export LOG UPDATES LEAVES REJECT FAIL_HELD QUERY_STATUS LEAF_STATUS FULL_STATUS
+export -f pacman sleep
+
+reset
+QUERY_STATUS=1
+run_arch 'empty update query'
+_assert_contains 'empty update query: runs full upgrade' \
+  '-Syu --needed --noconfirm systemd sudo file pacman-contrib' "$(cat "$LOG")"
+
+reset
+UPDATES=leaf
+LEAF_STATUS=1
+run_arch 'empty leaf query'
+_assert_contains 'empty leaf query: runs full upgrade' '-Syu --needed' "$(cat "$LOG")"
+_assert_not_contains 'empty leaf query: skips resolver probes' '--print' "$(cat "$LOG")"
+
+reset
+UPDATES=$'openssl\nsystemd-libs\nrequired-lib'
+LEAVES=$'openssl\nsystemd-libs'
+run_arch 'no eligible candidate'
+_assert_contains 'no eligible candidate: runs full upgrade' '-Syu --needed' "$(cat "$LOG")"
+_assert_not_contains 'no eligible candidate: skips resolver probes' '--print' "$(cat "$LOG")"
+
+reset
+UPDATES=$'file\nsudo\npacman-contrib'
+LEAVES=$UPDATES
+run_arch 'explicit install targets'
+_assert_not_contains 'explicit install targets: never held back' '--ignore' "$(cat "$LOG")"
+_assert_contains 'explicit install targets: runs full upgrade' '-Syu --needed' "$(cat "$LOG")"
+
+reset
+UPDATES=$'lib1\nlib2\nlib3\nlib4\nlib5\nlib6\nlib7\nlib8\nlib9\nlib10\nleaf'
+LEAVES=leaf
+run_arch 'late eligible candidate'
+_assert_contains 'late eligible candidate: reports successful holdback' \
+  'provision: holding back leaf for the sysup run' "$RESULT"
+_assert_contains 'late eligible candidate: holds back safe leaf' \
+  '-Su --needed --noconfirm --ignore leaf systemd sudo file pacman-contrib' "$(cat "$LOG")"
+_assert_not_contains 'late eligible candidate: keeps pending upgrade' '-Syu' "$(cat "$LOG")"
+
+reset
+UPDATES=$'coupled-leaf\nsafe-leaf'
+LEAVES=$UPDATES
+REJECT=coupled-leaf
+run_arch 'resolver rejects first leaf'
+_assert_contains 'resolver rejects first leaf: picks next candidate' \
+  '-Su --needed --noconfirm --ignore safe-leaf' "$(cat "$LOG")"
+
+reset
+UPDATES=leaf
+LEAVES=leaf
+REJECT=leaf
+run_arch 'all resolver probes fail'
+_assert_contains 'all resolver probes fail: runs full upgrade' '-Syu --needed' "$(cat "$LOG")"
+
+reset
+UPDATES=leaf
+LEAVES=leaf
+FAIL_HELD=1
+run_arch 'held transaction fails'
+_assert_contains 'held transaction fails: attempted held upgrade' \
+  '-Su --needed --noconfirm --ignore leaf' "$(cat "$LOG")"
+_assert_not_contains 'held transaction fails: never claims successful holdback' \
+  'provision: holding back' "$RESULT"
+_assert_contains 'held transaction fails: falls back to full upgrade' '-Syu --needed' "$(cat "$LOG")"
+
+reset
+UPDATES=$'leaf1\nleaf2\nleaf3\nleaf4\nleaf5\nleaf6\nleaf7\nleaf8\nleaf9\nleaf10\nleaf11'
+LEAVES=$UPDATES
+REJECT='leaf1 leaf2 leaf3 leaf4 leaf5 leaf6 leaf7 leaf8 leaf9 leaf10'
+run_arch 'resolver probe bound'
+_assert_contains 'resolver probe bound: tries tenth candidate' \
+  '-Su --print --ignore leaf10 ' "$(cat "$LOG")"
+_assert_not_contains 'resolver probe bound: skips eleventh candidate' \
+  '-Su --print --ignore leaf11 ' "$(cat "$LOG")"
+_assert_contains 'resolver probe bound: runs full upgrade' '-Syu --needed' "$(cat "$LOG")"
+
+reset
+QUERY_STATUS=1
+FULL_STATUS=23
+# retry's existing contract normalizes exhausted attempts to failure status 1.
+run_arch 'full upgrade fails' 1
+
+_test_summary

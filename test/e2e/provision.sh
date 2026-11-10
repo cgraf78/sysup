@@ -7,10 +7,8 @@
 # every other package at the image's version: pending updates are what the
 # real upgrade run exercises. It never upgrades the whole system, except on
 # Arch (see the pacman branch): a partial upgrade there is unsupported and
-# breaks on soname bumps, so Arch upgrades everything but one held-back
-# leaf package, which the sysup run then installs as its pending update.
-
-set -euo pipefail
+# breaks on soname bumps. Arch upgrades coupled packages together, leaving
+# one safe leaf update for the sysup run when available.
 
 # Mirror hiccups are the usual CI failure here, and they are transient.
 retry() {
@@ -24,29 +22,64 @@ retry() {
   return 1
 }
 
-# One installed package to leave behind for the sysup run: a leaf nothing
-# installed requires, outside the coupled base (systemd, glibc, openssl,
-# pacman, the kernel), whose hold-back still resolves the upgrade
-# transaction. Empty when nothing qualifies; the caller then upgrades
-# everything. At most ten candidates are tried so a pathological database
-# cannot stall provision.
+# Leave an unrequired update for sysup when the held-back transaction
+# resolves. Query names instead of parsing pacman's localized package info.
 pick_holdback() {
-  local pkg required_by tried=0
-  pacman -Quq 2>/dev/null | while read -r pkg; do
-    ((tried += 1))
-    ((tried > 10)) && break
+  local pkg updates leaves tried=0
+  # Pacman returns 1 for an empty query as well as errors. Either way, a
+  # full upgrade below is safe and supplies the authoritative failure status.
+  updates=$(pacman -Quq 2>/dev/null) || return 0
+  leaves=$(pacman -Qqt 2>/dev/null) || return 0
+  while IFS= read -r pkg; do
+    [[ -n $pkg ]] || continue
+    # Explicit install targets override --ignore and cannot be held back.
+    [[ " $* " != *" $pkg "* ]] || continue
     case $pkg in
-      systemd*|glibc|openssl|pacman|linux|dbus|mkinitcpio|base) continue ;;
+      systemd* | glibc | openssl | pacman | linux | dbus | mkinitcpio | base) continue ;;
     esac
-    required_by=$(pacman -Qi "$pkg" 2>/dev/null | sed -n 's/^Required By *: *//p')
-    [[ $required_by == None ]] || continue
+    [[ $'\n'"$leaves"$'\n' == *$'\n'"$pkg"$'\n'* ]] || continue
+    # Bound expensive resolver probes, not the package scan: the first ten
+    # outdated packages may all be coupled libraries with no safe holdback.
+    ((tried += 1))
     if pacman -Su --print --ignore "$pkg" \
-        systemd sudo file pacman-contrib >/dev/null 2>&1; then
+      "$@" >/dev/null 2>&1; then
       printf '%s\n' "$pkg"
-      break
+      return 0
     fi
-  done
+    ((tried < 10)) || break
+  done <<<"$updates"
+  return 0
 }
+
+# Refresh and provision Arch without leaving coupled packages out of date.
+provision_arch() {
+  local holdback
+  local packages=(systemd sudo file pacman-contrib)
+  # Refresh first, then upgrade all coupled packages together: partial Arch
+  # upgrades break on soname bumps. A rejected holdback falls back to the
+  # full transaction rather than making optional test coverage fatal.
+  retry pacman -Sy
+  holdback=$(pick_holdback "${packages[@]}")
+  if [[ -n $holdback ]]; then
+    if retry pacman -Su --needed --noconfirm --ignore "$holdback" \
+      "${packages[@]}"; then
+      printf 'provision: holding back %s for the sysup run\n' "$holdback"
+    else
+      retry pacman -Syu --needed --noconfirm "${packages[@]}"
+    fi
+  else
+    printf 'provision: no safe pending update; upgrading all packages\n'
+    retry pacman -Syu --needed --noconfirm "${packages[@]}"
+  fi
+}
+
+# The mock-only unit suite sources the same provisioning functions. Sourcing
+# must never configure the host; only executing this script enters setup.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  return 0
+fi
+
+set -euo pipefail
 
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
@@ -56,23 +89,7 @@ if command -v apt-get >/dev/null 2>&1; then
   retry apt-get install -y --no-install-recommends \
     systemd systemd-sysv dbus sudo needrestart procps findutils
 elif command -v pacman >/dev/null 2>&1; then
-  # -Sy without -u is a partial upgrade, which Arch does not support: once a
-  # soname bump lands in the sync database (openssl 4.1.0, systemd 262.2),
-  # installing the newest systemd pulls in libraries the image's installed
-  # packages still link against, and the transaction cannot resolve. Upgrade
-  # the whole system instead, but hold back one safe leaf package so the
-  # sysup run still has a real pending update to install. A bad hold-back
-  # choice degrades to the plain full upgrade rather than failing provision.
-  retry pacman -Sy
-  holdback=$(pick_holdback)
-  if [[ -n $holdback ]]; then
-    printf 'provision: holding back %s for the sysup run\n' "$holdback"
-    retry pacman -Su --needed --noconfirm --ignore "$holdback" \
-      systemd sudo file pacman-contrib ||
-      retry pacman -Syu --needed --noconfirm systemd sudo file pacman-contrib
-  else
-    retry pacman -Syu --needed --noconfirm systemd sudo file pacman-contrib
-  fi
+  provision_arch
 elif command -v dnf >/dev/null 2>&1; then
   # The needs-restarting plugin lives in dnf5-plugins on dnf5 and in
   # dnf-plugins-core on dnf4.
