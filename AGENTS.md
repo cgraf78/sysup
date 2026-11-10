@@ -17,8 +17,9 @@ reach one.
   vocabulary; `rpm.sh` the rpm database helpers `dnfup` and `zypup` share;
   `systemd.sh` affected units, failed units, and deferred restarts.
 - `docs/design.md`: the backend hook contract and run ordering.
-- `test/run` runs `sysup-test`, `common-test`, `archup-test`, `debup-test`,
-  `dnfup-test`, and `zypup-test`, each in its own Bash process;
+- `test/run` runs `provision-test`, `sysup-test`, `pending-test`, `common-test`,
+  `archup-test`, `debup-test`, `dnfup-test`, and `zypup-test`, each in its own
+  Bash process;
   `test/lib/test.sh` holds the assertions.
 - `support/install-checkout.sh`: the repo-owned install delegate.
 
