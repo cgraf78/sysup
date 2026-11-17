@@ -32,7 +32,13 @@ sysup_pending() {
     # Quiet simulation emits only pkgSimulate operations. Let APT's resolver
     # exclude phasing, holds and dependency-kept candidates instead of treating
     # every newer repository version as an update this host can apply.
-    debian) output=$(LC_ALL=C sysup_apt_upgrade apt-get --simulate --quiet=2 2>"$errors") || status=$? ;;
+    debian)
+      # APT otherwise adds a non-root notice on stdout even at quiet level 2.
+      # Keep that explanatory prose out of the operation stream; genuine query
+      # diagnostics still flow through stderr, and caller limits are documented.
+      output=$(LC_ALL=C sysup_apt_upgrade apt-get --simulate --quiet=2 \
+        -o APT::Get::Show-User-Simulation-Note=false 2>"$errors") || status=$?
+      ;;
   esac
   if ((status != 0)); then
     if [[ "$family" == arch && "$status" == 1 && ! -s "$errors" && -z "$output" ]]; then

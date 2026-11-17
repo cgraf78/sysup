@@ -38,6 +38,12 @@ printf '%s\n' "$*" >>"$TEST_LOG"
 case "$*" in
   '-o APT::Update::Error-Mode=any update') ;;
   '--with-new-pkgs upgrade --simulate --quiet=2')
+    # APT prints this on stdout for non-root callers, even with -qq.
+    [[ ${MOCK_USER_SIMULATION_NOTE:-0} != 1 ]] || printf 'NOTE: This is only a simulation!\n'
+    printf '%s' "${MOCK_OUTPUT:-}"
+    printf '%s' "${MOCK_ERROR:-}" >&2
+    ;;
+  '--with-new-pkgs upgrade --simulate --quiet=2 -o APT::Get::Show-User-Simulation-Note=false')
     printf '%s' "${MOCK_OUTPUT:-}"
     printf '%s' "${MOCK_ERROR:-}" >&2
     ;;
@@ -78,9 +84,13 @@ printf 'ID=debian\n' >"$root/etc/os-release"
 output=$(MOCK_OUTPUT='' "$cmd" --list-updates)
 _assert_eq 'Debian phased-only candidates are not actionable updates' '' "$output"
 _assert_eq 'Debian lists through a read-only normal-upgrade plan' \
-  '--with-new-pkgs upgrade --simulate --quiet=2' "$(cat "$TEST_LOG")"
+  '--with-new-pkgs upgrade --simulate --quiet=2 -o APT::Get::Show-User-Simulation-Note=false' "$(cat "$TEST_LOG")"
 output=$(MOCK_OUTPUT=$'Inst alpha [1] (2 Synthetic:stable [amd64])\nConf alpha (2 Synthetic:stable [amd64])\n' "$cmd" --list-updates)
 _assert_eq 'Debian lists an actionable upgrade once' 'alpha 2' "$output"
+status=0
+output=$(MOCK_USER_SIMULATION_NOTE=1 MOCK_OUTPUT='' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Debian non-root simulation notices do not invalidate the plan' 0 "$status"
+_assert_eq 'Debian non-root empty plan publishes no notice as inventory' '' "$output"
 output=$(MOCK_OUTPUT=$'Inst dependency (1 Synthetic:stable [all])\nConf dependency (1 Synthetic:stable [all])\n' "$cmd" --list-updates)
 _assert_eq 'Debian includes a newly required dependency' 'dependency 1' "$output"
 output=$(MOCK_OUTPUT=$'Inst alpha:i386 [1] (2 Synthetic:stable [i386])\n' "$cmd" --list-updates)
