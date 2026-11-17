@@ -3,6 +3,7 @@ program	bin/sysup
 program	install.sh
 program	scripts/checkout-installer.conf
 program	support/install-checkout.sh
+program	lib/sysup/apt.sh
 program	lib/sysup/archup
 program	lib/sysup/debup
 program	lib/sysup/dnfup

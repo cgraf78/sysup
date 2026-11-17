@@ -27,13 +27,28 @@ MOCK
 cat >"$mock/apt" <<'MOCK'
 #!/bin/bash
 printf '%s\n' "$*" >>"$TEST_LOG"
-printf '%s' "${MOCK_OUTPUT:-}"
-printf '%s' "${MOCK_ERROR:-}" >&2
-exit "${MOCK_STATUS:-0}"
+# The legacy listing deliberately disagrees with the resolver plan. Returning
+# this raw candidate would reintroduce phased/held-package false positives.
+printf '%s' "${MOCK_APT_OUTPUT-$'Listing...\nphased/stable 2 amd64 [upgradable from: 1]\n'}"
+exit 0
 MOCK
 cat >"$mock/apt-get" <<'MOCK'
 #!/bin/bash
 printf '%s\n' "$*" >>"$TEST_LOG"
+case "$*" in
+  '-o APT::Update::Error-Mode=any update') ;;
+  '--with-new-pkgs upgrade --simulate --quiet=2')
+    # APT prints this on stdout for non-root callers, even with -qq.
+    [[ ${MOCK_USER_SIMULATION_NOTE:-0} != 1 ]] || printf 'NOTE: This is only a simulation!\n'
+    printf '%s' "${MOCK_OUTPUT:-}"
+    printf '%s' "${MOCK_ERROR:-}" >&2
+    ;;
+  '--with-new-pkgs upgrade --simulate --quiet=2 -o APT::Get::Show-User-Simulation-Note=false')
+    printf '%s' "${MOCK_OUTPUT:-}"
+    printf '%s' "${MOCK_ERROR:-}" >&2
+    ;;
+  *) echo 'unexpected apt-get operation' >&2; exit 90 ;;
+esac
 exit "${MOCK_STATUS:-0}"
 MOCK
 chmod +x "$mock"/*
@@ -63,18 +78,46 @@ _assert_eq 'listing rejects combined operations' 2 "$status"
 "$cmd" --refresh-updates
 _assert_eq 'Arch refresh does not upgrade packages' '-Sy' "$(cat "$TEST_LOG")"
 printf 'ID=debian\n' >"$root/etc/os-release"
-output=$(MOCK_OUTPUT=$'Listing...\nalpha/stable 2 amd64 [upgradable from: 1]\n' "$cmd" --list-updates)
-_assert_eq 'Debian lists package and new version' 'alpha 2' "$output"
-output=$(MOCK_OUTPUT=$'Listing...\n' "$cmd" --list-updates)
-_assert_eq 'Debian empty update list is empty' '' "$output"
+# A newer cached version is not actionable while APT excludes it from the
+# normal transaction. This catches accidentally reverting to apt's raw list.
+: >"$TEST_LOG"
+output=$(MOCK_OUTPUT='' "$cmd" --list-updates)
+_assert_eq 'Debian phased-only candidates are not actionable updates' '' "$output"
+_assert_eq 'Debian lists through a read-only normal-upgrade plan' \
+  '--with-new-pkgs upgrade --simulate --quiet=2 -o APT::Get::Show-User-Simulation-Note=false' "$(cat "$TEST_LOG")"
+output=$(MOCK_OUTPUT=$'Inst alpha [1] (2 Synthetic:stable [amd64])\nConf alpha (2 Synthetic:stable [amd64])\n' "$cmd" --list-updates)
+_assert_eq 'Debian lists an actionable upgrade once' 'alpha 2' "$output"
 status=0
-output=$(MOCK_OUTPUT=$'Listing...\nalpha/stable 2 amd64\nmalformed\n' "$cmd" --list-updates 2>/dev/null) || status=$?
-_assert_eq 'Debian malformed listing fails' 1 "$status"
-_assert_eq 'Debian malformed listing publishes no partial list' '' "$output"
+output=$(MOCK_USER_SIMULATION_NOTE=1 MOCK_OUTPUT='' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Debian non-root simulation notices do not invalidate the plan' 0 "$status"
+_assert_eq 'Debian non-root empty plan publishes no notice as inventory' '' "$output"
+output=$(MOCK_OUTPUT=$'Inst dependency (1 Synthetic:stable [all])\nConf dependency (1 Synthetic:stable [all])\n' "$cmd" --list-updates)
+_assert_eq 'Debian includes a newly required dependency' 'dependency 1' "$output"
+output=$(MOCK_OUTPUT=$'Inst alpha:i386 [1] (2 Synthetic:stable [i386])\n' "$cmd" --list-updates)
+_assert_eq 'Debian preserves the foreign architecture' 'alpha:i386 2' "$output"
+output=$(MOCK_OUTPUT=$'Inst alpha [1:1] (2:3.4~rc1-2 Synthetic:stable [amd64])\n' "$cmd" --list-updates)
+_assert_eq 'Debian preserves epochs and version punctuation' 'alpha 2:3.4~rc1-2' "$output"
+output=$(MOCK_OUTPUT=$'Conf alpha (2 Synthetic:stable [amd64])\n' "$cmd" --list-updates)
+_assert_eq 'Debian configure-only work adds no update' '' "$output"
+output=$(MOCK_OUTPUT=$'Inst alpha [1] (2 Synthetic:stable [amd64]) []\nConf alpha (2 Synthetic:stable [amd64]) [dependency:amd64 ]\n' "$cmd" --list-updates)
+_assert_eq 'Debian accepts temporary simulation dependency annotations' 'alpha 2' "$output"
 status=0
-output=$(MOCK_STATUS=2 MOCK_OUTPUT='partial/stable 4 amd64' "$cmd" --list-updates 2>/dev/null) || status=$?
-_assert_eq 'Debian query errors fail' 2 "$status"
+output=$(MOCK_OUTPUT=$'Inst alpha [1] (2 Synthetic:stable [amd64])\nmalformed\n' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Debian malformed plan fails' 1 "$status"
+_assert_eq 'Debian malformed plan publishes no partial list' '' "$output"
+for malformed in 'Inst' 'Inst alpha' 'Inst alpha [1]' 'Inst alpha (2' 'Inst alpha [] (2 Synthetic [amd64])' 'Inst alpha [1] ( Synthetic [amd64])' 'Conf alpha' 'Conf alpha broken' 'Remv alpha [1]' 'Purg alpha [1]'; do
+  status=0
+  output=$(MOCK_OUTPUT="$malformed" "$cmd" --list-updates 2>/dev/null) || status=$?
+  _assert_eq "Debian rejects malformed or unsafe plan: $malformed" 1 "$status"
+  _assert_eq "Debian rejects plan without publishing: $malformed" '' "$output"
+done
+status=0
+output=$(MOCK_STATUS=100 MOCK_OUTPUT=$'Inst alpha [1] (2 Synthetic:stable [amd64])\n' MOCK_ERROR='resolver failed' "$cmd" --list-updates 2>/dev/null) || status=$?
+_assert_eq 'Debian query preserves the APT failure status' 100 "$status"
 _assert_eq 'Debian query failure publishes no partial list' '' "$output"
+output=$(MOCK_OUTPUT=$'Inst alpha [1] (2 Synthetic:stable [amd64])\n' MOCK_ERROR='advisory diagnostic' "$cmd" --list-updates 2>"$root/warnings")
+_assert_eq 'Debian success keeps its actionable inventory with a warning' 'alpha 2' "$output"
+_assert_eq 'Debian success preserves stderr diagnostics' 'advisory diagnostic' "$(cat "$root/warnings")"
 : >"$TEST_LOG"
 "$cmd" --refresh-updates
 _assert_eq 'Debian refresh fails on repository errors' '-o APT::Update::Error-Mode=any update' "$(cat "$TEST_LOG")"

@@ -7,6 +7,8 @@ implementation details that may change together.
 - `archup` supplies Arch, pacman, yay, AUR rebuild, and missing-library policy.
 - `debup` supplies Debian/Ubuntu, apt, dpkg, conffile, reboot, and needrestart
   policy.
+- `apt.sh` keeps Debian's default upgrade resolver policy shared between the
+  real transaction and read-only pending-update queries.
 - `dnfup` supplies Fedora/RHEL, dnf, and reboot policy.
 - `zypup` supplies openSUSE/SLES, zypper, package-lock, and reboot policy.
 - `rpm.sh` holds the rpm snapshot, package-file, and pending-conffile helpers
