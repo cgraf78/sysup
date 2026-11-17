@@ -198,9 +198,19 @@ ordering.
 `sysup --list-updates` prints pending repository updates as `name version`,
 one per line, using the package manager's current cached metadata. Empty output
 and exit status zero mean no updates; a query failure returns nonzero. Arch
-uses `pacman -Qu` and does not include AUR updates. Debian and Ubuntu use
-`apt list --upgradable`. The listing is currently available on these families;
-other supported upgrade families return an unsupported error.
+uses `pacman -Qu` and does not include AUR updates. Debian and Ubuntu simulate
+the normal `apt-get --with-new-pkgs upgrade` transaction and list packages it
+would install, including newly required dependencies. Phased updates, held
+packages and dependency-kept candidates are omitted until APT selects them.
+This preserves the host's phasing and pinning policy; it does not force phased
+updates or plan the optional `--full-upgrade` mode. The listing is currently
+available on these families; other supported upgrade families return an
+unsupported error.
+
+The APT query is read-only and takes no package-manager lock. It reflects the
+configuration and cached metadata visible to the caller; use the normal
+upgrade account for monitoring. Later metadata or package-state changes can
+change the transaction before it is applied.
 
 `sysup --refresh-updates` separately refreshes metadata with `pacman -Sy` or
 `apt-get update`; it never upgrades packages or restarts services. It needs root

@@ -19,6 +19,8 @@ _debup_lib_dir() {
 
 # shellcheck source=common.sh
 . "$(_debup_lib_dir)/common.sh"
+# shellcheck source=apt.sh
+. "$_SYSUP_LIB_DIR/apt.sh"
 
 # `upgrade --with-new-pkgs` installs new dependencies, so kernel ABI bumps and
 # renamed packages land, but never removes an installed package. `--full-upgrade`
@@ -441,7 +443,7 @@ sysup_backend_upgrade() {
   debup_apt_update || return
 
   if [[ "$DEBUP_UPGRADE_VERB" == upgrade ]]; then
-    debup_apt_get --with-new-pkgs upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
+    sysup_apt_upgrade debup_apt_get -y "${extra_args[@]+"${extra_args[@]}"}" || return
   else
     debup_apt_get full-upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
   fi

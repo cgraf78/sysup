@@ -1,6 +1,9 @@
 # shellcheck shell=bash
 # Repository metadata queries have no upgrade or service-management side effects.
 
+# shellcheck source=apt.sh
+. "${BASH_SOURCE[0]%/*}/apt.sh"
+
 sysup_pending() {
   local family="$1" action="$2" output status=0 errors parsed
   local -a elevated=()
@@ -26,7 +29,10 @@ sysup_pending() {
   errors=$(mktemp) || return 1
   case "$family" in
     arch) output=$(LC_ALL=C pacman -Qu 2>"$errors") || status=$? ;;
-    debian) output=$(LC_ALL=C apt list --upgradable 2>"$errors") || status=$? ;;
+    # Quiet simulation emits only pkgSimulate operations. Let APT's resolver
+    # exclude phasing, holds and dependency-kept candidates instead of treating
+    # every newer repository version as an update this host can apply.
+    debian) output=$(LC_ALL=C sysup_apt_upgrade apt-get --simulate --quiet=2 2>"$errors") || status=$? ;;
   esac
   if ((status != 0)); then
     if [[ "$family" == arch && "$status" == 1 && ! -s "$errors" && -z "$output" ]]; then
@@ -50,8 +56,28 @@ sysup_pending() {
       }
       ;;
     debian)
-      parsed=$(printf '%s\n' "$output" | awk 'NF == 0 || $0 == "Listing..." { next } $1 !~ /\// || NF < 2 { exit 1 } { split($1, p, "/"); print p[1], $2 }') || {
-        printf 'error: unrecognized apt update listing\n' >&2
+      # Inst/Conf are untranslated pkgSimulate records, not localized summaries.
+      # Their release description is opaque; APT can also append temporary
+      # dependency annotations. Only Inst contributes a package/version row.
+      parsed=$(printf '%s\n' "$output" | awk '
+        NF == 0 { next }
+        $1 != "Inst" && $1 != "Conf" { exit 1 }
+        {
+          if ($2 !~ /^[a-z0-9][a-z0-9+.-]*(:[a-z0-9][a-z0-9-]*)?$/) exit 1
+          candidate = $0
+          sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", candidate)
+          if ($1 == "Inst" && candidate ~ /^\[/) {
+            if (!sub(/^\[[^][[:space:]]+\][[:space:]]+/, "", candidate)) exit 1
+          }
+          if (candidate !~ /^\([^()[:space:]]+[[:space:]].*\)([[:space:]]+\[[^][]*\])*[[:space:]]*$/) exit 1
+          version = candidate
+          sub(/^\(/, "", version)
+          sub(/[[:space:]].*$/, "", version)
+          if (version ~ /[][]/) exit 1
+          if ($1 == "Inst") print $2, version
+        }
+      ') || {
+        printf 'error: unrecognized apt upgrade plan\n' >&2
         return 1
       }
       ;;
