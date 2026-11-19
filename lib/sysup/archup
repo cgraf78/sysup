@@ -110,7 +110,7 @@ archup_nvidia_version_valid() {
 # cannot start its replacement, so leave it running until the operator reloads
 # the modules or reboots.
 sysup_backend_check_service_restart() {
-  local unit="$1" installed loaded version_file
+  local unit="$1" installed loaded version_file modinfo_status=0
 
   [[ "$unit" == nvidia-persistenced.service ]] || return 0
   version_file="${ARCHUP_NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}"
@@ -131,8 +131,18 @@ sysup_backend_check_service_restart() {
       "$unit"
     return 2
   fi
-  if ! installed="$(modinfo -F version nvidia 2>/dev/null)" ||
-    ! archup_nvidia_version_valid "$installed"; then
+  # modinfo resolves against the running kernel's module tree, which a kernel
+  # upgrade removes, so the lookup fails whatever the new kernel ships. The
+  # running kernel can then never load an upgraded driver, so this is a
+  # deferral a reboot resolves, not an unknown.
+  installed="$(modinfo -F version nvidia 2>/dev/null)" || modinfo_status=$?
+  if ((modinfo_status != 0)) && archup_reboot_required; then
+    printf 'deferred: running kernel %s was replaced; reboot before restarting %s\n' \
+      "$(archup_running_kernel_release)" "$unit"
+    return 1
+  fi
+  # A failed modinfo fails closed even if it printed a plausible version.
+  if ((modinfo_status != 0)) || ! archup_nvidia_version_valid "$installed"; then
     printf 'warning: could not determine the installed NVIDIA driver version; preserving %s\n' \
       "$unit"
     return 2

@@ -75,7 +75,7 @@ Optional hooks, with defaults in `common.sh`:
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
 | `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded`; `zypup` only lists `zypper packages --unneeded`, in both modes |
 | `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
-| `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one, and reports it unverified when either version cannot be read |
+| `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one or the running kernel's module tree was replaced, and reports it unverified when either version cannot otherwise be read |
 | `sysup_backend_restart_services <pkg...>` | shared systemd restart | `debup` prefers `needrestart` |
 
 `sysup_backend_check_service_restart` returns 0 to allow a restart, 1 to defer
