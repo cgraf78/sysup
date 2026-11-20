@@ -106,9 +106,12 @@ when systemd and `systemd-inhibit` are available. If the inhibitor cannot be
 acquired, the run fails before changing packages.
 
 Output is buffered and printed at the end only when the run failed, packages
-changed (installed, removed, upgraded, or rebuilt), or the run reported a
-pending reboot, a config file awaiting a merge, a deferred service restart, a
-package apt kept back, or a warning. An excluded package that still has an
+changed (installed, removed, upgraded, or rebuilt), the run warned, or it
+reported a new pending reboot, config file awaiting a merge, deferred service
+restart, or package apt kept back. These standing notices count as new when
+the last cron run that was not `--check-only` did not report them, as kept in
+`/var/lib/sysup/cron-notices`, so one that persists mails once rather than
+every night. An excluded package that still has an
 update is listed too, but does not by itself make the run print. A run with
 nothing to report prints nothing. The last log is kept in
 the root-only `/var/lib/sysup/last-cron.log`, and `/var/lib/sysup/last-cron` holds
@@ -232,7 +235,10 @@ The shared fallback (Arch, Fedora, openSUSE, and Debian without
 only active units owned by packages proven to have changed. When `needrestart` is available, Debian instead uses its
 runtime deleted-file analysis, which may restart another service affected by an
 upgraded library even when that service belongs to a different package. The
-shared fallback never restarts units whose restart would end a login or
+shared fallback skips units systemd will not stop by hand and
+`RemainAfterExit` services with no process left (`libvirt-guests`,
+`systemd-fsck@`), which run no old code and whose restart would only replay
+their stop action. It never restarts units whose restart would end a login or
 graphical session (`user@`, `user-runtime-dir@`, gettys, display managers,
 `systemd-logind`, D-Bus, rescue shells), starting from `needrestart`'s
 session-related defaults; it

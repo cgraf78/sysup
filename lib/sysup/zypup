@@ -283,7 +283,7 @@ report_pending_state() {
 
   if zypup_reboot_required; then
     printf 'reboot required to complete this upgrade\n'
-    sysup_notice reboot-required 'reboot required to complete this upgrade'
+    sysup_notice reboot-required
   else
     reboot_status=$?
     if ((reboot_status == 1)); then

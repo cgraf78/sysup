@@ -436,14 +436,14 @@ sysup_report_deferred_restarts() {
   # changing their activation time, so this cannot be certain.
   printf 'reboot recommended: session-critical units may still run pre-upgrade code: %s; restart them manually or reboot\n' \
     "${units[*]}" >&2
-  sysup_notice deferred-restart "${units[*]}"
+  sysup_notice deferred-restart "${units[@]}"
 }
 
 sysup_restart_upgraded_services() {
   local -a units=()
   local -a active_units=()
   local -a session_units=()
-  local can_stop display_manager="" policy_output policy_status unit unit_listing
+  local can_stop display_manager="" policy_output policy_status sub_state tasks unit unit_listing
   local deferred_count=0 discovery_status=0
 
   if (($# == 0)); then
@@ -483,6 +483,17 @@ sysup_restart_upgraded_services() {
   # through one try-restart request makes an otherwise healthy upgrade noisy
   # and fails the restart batch. Ask systemd for the effective capability
   # instead of maintaining a release-sensitive list of special unit names.
+  #
+  # Among the stoppable ones, a service in SubState=exited (RemainAfterExit
+  # after its main process ended) with no task left runs no old code, so
+  # restarting it gains nothing and only replays its stop and start actions:
+  # libvirt-guests' stop shuts down every guest, and a systemd-fsck@ restart
+  # propagates to the mounts that Requires= it. needrestart, which maps
+  # running processes to units, never restarts these either. An exited unit
+  # whose cgroup still holds processes (a oneshot that backgrounded a daemon)
+  # is restarted as before. A running service with RemainAfterExit stays in
+  # SubState=running, and no socket, timer, or path unit has an exited
+  # substate.
   for unit in "${active_units[@]}"; do
     # Session safety is decided before systemd capability: a session unit
     # is deferred even when systemd would allow restarting it.
@@ -498,6 +509,18 @@ sysup_restart_upgraded_services() {
     fi
     case "$can_stop" in
       yes)
+        if ! sub_state="$(systemctl show --property=SubState --value -- "$unit")"; then
+          sysup_warn "could not determine whether $unit is still running"
+          discovery_status=1
+          continue
+        fi
+        if [[ "$sub_state" == exited ]]; then
+          # Best effort: without task accounting the count reads
+          # "[not set]", and the unit is treated as having no process.
+          tasks="$(systemctl show --property=TasksCurrent --value -- "$unit" 2>/dev/null)" ||
+            tasks=""
+          [[ "$tasks" =~ ^[1-9][0-9]*$ ]] || continue
+        fi
         if policy_output="$(sysup_backend_check_service_restart "$unit")"; then
           units+=("$unit")
           continue
@@ -525,7 +548,7 @@ sysup_restart_upgraded_services() {
     ((deferred_count += ${#session_units[@]}))
     printf 'deferred: session-critical units not restarted: %s\n' \
       "${session_units[*]}" >&2
-    sysup_notice deferred-restart "${session_units[*]}"
+    sysup_notice deferred-restart "${session_units[@]}"
     # Not reboot-only: some distributions' package scripts re-exec user
     # managers themselves, and a manual restart from outside the affected
     # sessions is enough for the rest.

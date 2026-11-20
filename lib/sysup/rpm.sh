@@ -82,7 +82,7 @@ sysup_rpm_report_pending_conffiles() {
   if ((${#conffiles[@]})); then
     printf '\nconfig files awaiting a manual merge:\n'
     printf '  %s\n' "${conffiles[@]}"
-    sysup_notice config-merge "${conffiles[*]}"
+    sysup_notice config-merge "${conffiles[@]}"
   fi
   if ((status != 0)); then
     sysup_warn 'could not completely scan for config files awaiting a manual merge'

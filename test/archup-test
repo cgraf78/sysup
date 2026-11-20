@@ -53,6 +53,11 @@ _archup_mock_reset() {
   ARCHUP_ACTIVE_UNITS=()
   ARCHUP_NON_RESTARTABLE_UNITS=""
   ARCHUP_NON_RESTARTABLE_AFTER_RELOAD_UNITS=""
+  # Active units with no process left (RemainAfterExit, SubState=exited).
+  ARCHUP_EXITED_UNITS=""
+  ARCHUP_SUBSTATE_QUERY_STATUS=0
+  # TasksCurrent per unit; unlisted units have none.
+  declare -gA ARCHUP_UNIT_TASKS=()
   ARCHUP_SYSTEMCTL_SHOW_STATUS=0
   ARCHUP_SYSTEMCTL_SHOW_MALFORMED=0
   ARCHUP_DISPLAY_MANAGER_ID="display-manager.service"
@@ -530,6 +535,22 @@ systemctl() {
           printf 'ActiveState=inactive\n'
         fi
         printf 'ActiveEnterTimestampMonotonic=%s\n' "${ARCHUP_ACTIVE_SINCE[$unit]:-100}"
+        return 0
+      fi
+      if [[ "$2" == --property=SubState ]]; then
+        if ((ARCHUP_SUBSTATE_QUERY_STATUS != 0)); then
+          printf 'Failed to get properties: Access denied\n' >&2
+          return "$ARCHUP_SUBSTATE_QUERY_STATUS"
+        fi
+        if [[ " $ARCHUP_EXITED_UNITS " == *" $unit "* ]]; then
+          printf 'exited\n'
+        else
+          printf 'running\n'
+        fi
+        return 0
+      fi
+      if [[ "$2" == --property=TasksCurrent ]]; then
+        printf '%s\n' "${ARCHUP_UNIT_TASKS[$unit]:-0}"
         return 0
       fi
       if ((ARCHUP_SYSTEMCTL_SHOW_MALFORMED != 0)); then
@@ -1516,6 +1537,71 @@ _assert_contains "archup restart: keeps active units that support manual restart
   "try-restart daemon.service" "$systemctl_commands"
 _assert_not_contains "archup restart: skips active units that refuse manual stop" \
   "dependency-only.service" "$systemctl_commands"
+
+_archup_mock_reset
+_archup_mock_add_package virt-manager-mock 1 ok
+_archup_mock_add_service virt-manager-mock guestd.service
+_archup_mock_add_service virt-manager-mock guests-shutdown.service
+_archup_mock_add_service virt-manager-mock fsck-mock@.service
+ARCHUP_ACTIVE_UNITS=(guestd.service guests-shutdown.service fsck-mock@dev-a.service)
+ARCHUP_EXITED_UNITS="guests-shutdown.service fsck-mock@dev-a.service"
+set +e
+result=$(sysup_restart_upgraded_services virt-manager-mock 2>&1)
+status=$?
+set -e
+systemctl_commands=$(cat "$ARCHUP_SYSTEMCTL_LOG")
+_assert_eq "archup restart: exited units do not fail the run" "0" "$status"
+_assert_contains "archup restart: running services are still restarted" \
+  "try-restart guestd.service" "$systemctl_commands"
+_assert_not_contains "archup restart: exited RemainAfterExit units are not restarted" \
+  "guests-shutdown.service" "$systemctl_commands"
+_assert_not_contains "archup restart: exited template instances are not restarted" \
+  "fsck-mock@dev-a.service" "$systemctl_commands"
+_assert_not_contains "archup restart: exited units are not reported as deferred" \
+  "deferred" "$result"
+_assert_eq "archup restart: exited units record no notice" "" "$(cat "$_SYSUP_NOTICE_FILE")"
+_assert_eq "archup restart: exited units are not recorded for a reminder" "no" \
+  "$([[ -e "$ARCHUP_STATE_FILE" ]] && echo yes || echo no)"
+
+_archup_mock_reset
+_archup_mock_add_package oneshot-only 1 ok
+_archup_mock_add_service oneshot-only setup-once.service
+ARCHUP_ACTIVE_UNITS=(setup-once.service)
+ARCHUP_EXITED_UNITS="setup-once.service"
+result=$(sysup_restart_upgraded_services oneshot-only 2>&1)
+_assert_not_contains "archup restart: only exited units means no restart request" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
+_assert_contains "archup restart: only exited units reports nothing to restart" \
+  "ok: no active services shipped by upgraded packages" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package leftover-manager 1 ok
+_archup_mock_add_service leftover-manager spawner.service
+_archup_mock_add_service leftover-manager untracked.service
+ARCHUP_ACTIVE_UNITS=(spawner.service untracked.service)
+ARCHUP_EXITED_UNITS="spawner.service untracked.service"
+ARCHUP_UNIT_TASKS=([spawner.service]=2 [untracked.service]="[not set]")
+sysup_restart_upgraded_services leftover-manager >/dev/null 2>&1
+systemctl_commands=$(cat "$ARCHUP_SYSTEMCTL_LOG")
+_assert_contains "archup restart: an exited unit with leftover processes is restarted" \
+  "try-restart spawner.service" "$systemctl_commands"
+_assert_not_contains "archup restart: an exited unit without task accounting is skipped" \
+  "untracked.service" "$systemctl_commands"
+
+_archup_mock_reset
+_archup_mock_add_package substate-manager 1 ok
+_archup_mock_add_service substate-manager unknown-state.service
+ARCHUP_ACTIVE_UNITS=(unknown-state.service)
+ARCHUP_SUBSTATE_QUERY_STATUS=4
+set +e
+result=$(sysup_restart_upgraded_services substate-manager 2>&1)
+status=$?
+set -e
+_assert_eq "archup restart: substate query failure leaves coverage unverified" "1" "$status"
+_assert_contains "archup restart: substate query failure names the skipped unit" \
+  "could not determine whether unknown-state.service is still running" "$result"
+_assert_not_contains "archup restart: substate query failure does not restart" \
+  "try-restart" "$(cat "$ARCHUP_SYSTEMCTL_LOG")"
 
 _archup_mock_reset
 _archup_mock_add_package changed-manager 1 ok
@@ -2954,7 +3040,7 @@ report_pending_pacman_configs >/dev/null 2>&1
 _assert_eq "archup notices: the reboot report text is unchanged" \
   $'\n==> checking whether a reboot is required\nreboot required to complete this upgrade' "$result"
 _assert_eq "archup notices: reboot and pacnew are recorded by kind" \
-  $'reboot-required\treboot required to complete this upgrade\nconfig-merge\t/etc/pacman.conf.pacnew' \
+  $'reboot-required\t\nconfig-merge\t/etc/pacman.conf.pacnew' \
   "$(cat "$_SYSUP_NOTICE_FILE")"
 
 _archup_mock_reset

@@ -46,21 +46,23 @@ sysup_log() {
 SYSUP_NOTICE_KINDS=(reboot-required config-merge deferred-restart
   excluded-pending kept-back warning)
 
-# Where notices are recorded, one "kind<TAB>message" line each. Empty means
+# Where notices are recorded, one "kind<TAB>subject" line each. Empty means
 # nothing records them, and sysup_notice only validates its kind. A file
 # rather than a shell array, because reports also run inside command
 # substitutions, whose variable assignments never reach the run.
 _SYSUP_NOTICE_FILE=""
 
-# Record a notice of `kind`. Prints nothing: each call site keeps printing its
-# own operator-facing text, so recording a notice never changes the output.
-# An unknown kind is a programming error and returns 2.
+# Record a notice of `kind` about each `subject`: the path, unit, or package
+# it concerns, or the message for a `warning`. With no subject (a pending
+# reboot) one line with an empty subject is recorded. Prints nothing: each
+# call site keeps printing its own operator-facing text, so recording a
+# notice never changes the output. An unknown kind is a programming error
+# and returns 2.
 #
 # Recording is advisory: a failed write must not fail the report around it.
 sysup_notice() {
-  local kind="$1" message known valid=0
+  local kind="$1" subject known valid=0
   shift
-  message="$*"
 
   for known in "${SYSUP_NOTICE_KINDS[@]}"; do
     [[ "$kind" != "$known" ]] || valid=1
@@ -70,9 +72,12 @@ sysup_notice() {
     return 2
   fi
   [[ -n "$_SYSUP_NOTICE_FILE" ]] || return 0
-  # One line per notice: fold embedded newlines so the record stays parsable.
-  printf '%s\t%s\n' "$kind" "${message//$'\n'/ }" >>"$_SYSUP_NOTICE_FILE" ||
-    true
+  (($#)) || set -- ""
+  # One line per subject: fold embedded newlines so the record stays parsable.
+  for subject in "$@"; do
+    printf '%s\t%s\n' "$kind" "${subject//$'\n'/ }" >>"$_SYSUP_NOTICE_FILE" ||
+      true
+  done
 }
 
 # Print `warning: <message>` on stderr and record it as a `warning` notice.
@@ -464,6 +469,11 @@ _SYSUP_INHIBIT_PID=""
 # Set by _sysup_run when the package snapshots before and after the upgrade
 # differ: any install, removal, or version change.
 _SYSUP_PACKAGES_CHANGED=0
+# Set by _sysup_run when a run that is not --check-only reaches its checks.
+# Only such a run replaces --cron's standing-notice baseline: a check-only
+# run, or one stopped earlier (a usage error, a failed snapshot or
+# inhibitor), saw only part of the host's state.
+_SYSUP_MUTATING_RUN=0
 
 # A function so tests can run --cron without being root.
 sysup_is_root() {
@@ -586,21 +596,68 @@ sysup_release_shutdown_inhibitor() {
   wait "$pid" 2>/dev/null || true
 }
 
+# Where --cron keeps the standing-notice keys of the last run that was not
+# --check-only.
+sysup_cron_notices_file() {
+  printf '%s/cron-notices\n' "$SYSUP_STATE_DIR"
+}
+
+# Print the standing notices in notice file "$1" as sorted, unique
+# `kind<TAB>subject` keys. Standing notices (a pending reboot, a merge, a
+# deferred restart, a kept-back package) stay true night after night until
+# someone acts. A warning is not one: it always mails. Nor is
+# excluded-pending, which never mails.
+sysup_cron_standing_notices() {
+  local kind subject
+
+  [[ -s "$1" ]] || return 0
+  while IFS=$'\t' read -r kind subject; do
+    case "$kind" in
+      warning | excluded-pending | "") ;;
+      *) printf '%s\t%s\n' "$kind" "$subject" ;;
+    esac
+  done <"$1" | LC_ALL=C sort -u
+}
+
 # Decide whether a finished --cron run prints its log. "$1" is the run's exit
-# status, "$2" yes/no for a package change, "$3" the notice file. Returns 0 to
-# print. A run that changed nothing and recorded nothing worth reading stays
-# silent, so cron mails only what needs attention; an excluded package with an
-# update is expected on every run while the exclusion stands, so it alone does
-# not mail.
+# status, "$2" yes/no for a package change, "$3" the notice file, "$4" the
+# previous run's standing-notice keys. Returns 0 to print. A failure, a
+# package change, or a warning always prints. Standing notices print only
+# when one is new since the previous run: otherwise a deliberately deferred
+# restart or a lingering .pacnew would mail the same report every night. A
+# missing or unreadable baseline is empty, so every standing notice is new.
 sysup_cron_should_report() {
-  local status="$1" changed="$2" notices="$3" kind
+  local status="$1" changed="$2" notices="$3" baseline="$4" kind key
+  local current known=$'\n'
 
   ((status == 0)) || return 0
   [[ "$changed" != yes ]] || return 0
   while IFS= read -r kind; do
-    [[ "$kind" == excluded-pending ]] || return 0
+    [[ "$kind" != warning ]] || return 0
   done < <(sysup_notice_kinds "$notices")
+
+  current="$(sysup_cron_standing_notices "$notices")"
+  [[ -n "$current" ]] || return 1
+  known+="$(cat -- "$baseline" 2>/dev/null)"$'\n'
+  while IFS= read -r key; do
+    [[ "$known" == *$'\n'"$key"$'\n'* ]] || return 0
+  done <<<"$current"
   return 1
+}
+
+# Replace the standing-notice baseline with notice file "$1"'s keys, by a
+# rename like the other --cron state.
+_sysup_cron_save_notices() {
+  local notices="$1" baseline tmp
+
+  baseline="$(sysup_cron_notices_file)"
+  install -d -m 0755 -- "$SYSUP_STATE_DIR" || return
+  tmp="$(mktemp "$SYSUP_STATE_DIR/.cron-notices.XXXXXX")" || return
+  if ! { sysup_cron_standing_notices "$notices" >"$tmp" &&
+    chmod -- 0644 "$tmp" && mv -f -- "$tmp" "$baseline"; }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 # Keep the last --cron log and a machine-readable status beside the deferred-
@@ -627,7 +684,8 @@ _sysup_cron_save_state() {
 
 # Run sysup unattended from root's crontab. Cron mails whatever a job prints,
 # so the run's output is buffered and printed only when it failed, changed
-# packages, or recorded a notice; a quiet night sends nothing.
+# packages, warned, or recorded a new standing notice; a quiet night sends
+# nothing.
 _sysup_cron() {
   local status=0 changed=no log="" notices=""
 
@@ -662,6 +720,7 @@ _sysup_cron() {
   fi
 
   _SYSUP_PACKAGES_CHANGED=0
+  _SYSUP_MUTATING_RUN=0
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
   _SYSUP_CRON=1
   _SYSUP_NOTICE_FILE="$notices"
@@ -674,12 +733,16 @@ _sysup_cron() {
   if ((_SYSUP_PACKAGES_CHANGED || ${#SYSUP_EXTRA_UPGRADED_PACKAGES[@]})); then
     changed=yes
   fi
-  if sysup_cron_should_report "$status" "$changed" "$notices"; then
+  if sysup_cron_should_report "$status" "$changed" "$notices" "$(sysup_cron_notices_file)"; then
     cat -- "$log"
   fi
   # Outside the buffer, so a failure to keep the record reaches cron mail.
   _sysup_cron_save_state "$log" "$status" "$changed" ||
     printf 'warning: could not record the last --cron run in %s\n' "$SYSUP_STATE_DIR" >&2
+  if ((_SYSUP_MUTATING_RUN)); then
+    _sysup_cron_save_notices "$notices" ||
+      printf 'warning: could not record standing notices in %s\n' "$SYSUP_STATE_DIR" >&2
+  fi
   rm -f -- "$log" "$notices"
   _sysup_cron_unlock
   return "$status"
@@ -924,6 +987,7 @@ _sysup_run() {
 
   # Every remaining step contributes to the exit status instead of
   # short-circuiting, so one run surfaces every problem it can see.
+  ((check_only)) || _SYSUP_MUTATING_RUN=1
   sysup_backend_checks "$check_only" || status=1
 
   # Nothing was upgraded under --check-only, so there is nothing to restart.
