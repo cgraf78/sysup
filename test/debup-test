@@ -1190,8 +1190,8 @@ _assert_contains "debup kept back: names packages a full-upgrade would still upg
   $'packages kept back (2)\n  held-lib\n  split-tool' "$result"
 _assert_not_contains "debup kept back: a new install is not kept back" \
   "fresh-dep" "$result"
-_assert_eq "debup kept back: records one kept-back notice" \
-  $'kept-back\theld-lib split-tool' "$(cat "$debup_notices")"
+_assert_eq "debup kept back: records one kept-back notice per package" \
+  $'kept-back\theld-lib\nkept-back\tsplit-tool' "$(cat "$debup_notices")"
 _assert_contains "debup kept back: asks the resolver by simulation" \
   "--simulate --quiet=2 full-upgrade" "$(cat "$DEBUP_APT_LOG")"
 

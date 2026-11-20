@@ -275,7 +275,7 @@ report_pending_state() {
 
   if debup_reboot_required; then
     printf 'reboot required to complete this upgrade\n'
-    sysup_notice reboot-required 'reboot required to complete this upgrade'
+    sysup_notice reboot-required
     if [[ -r "$DEBUP_REBOOT_REQUIRED_FILE.pkgs" ]]; then
       mapfile -t packages < <(sort -u "$DEBUP_REBOOT_REQUIRED_FILE.pkgs" 2>/dev/null || true)
       ((${#packages[@]} == 0)) || printf '  %s\n' "${packages[@]}"
@@ -296,7 +296,7 @@ report_pending_state() {
   if ((${#conffiles[@]})); then
     printf '\nconfig files awaiting a manual merge:\n'
     printf '  %s\n' "${conffiles[@]}"
-    sysup_notice config-merge "${conffiles[*]}"
+    sysup_notice config-merge "${conffiles[@]}"
   fi
   if ((conffile_status != 0)); then
     sysup_warn 'could not completely scan for config files awaiting a manual merge'
@@ -339,7 +339,7 @@ report_kept_back() {
   sysup_log "packages kept back (${#kept[@]})"
   printf '  %s\n' "${kept[@]}"
   printf '\nhint: sysup --full-upgrade lets apt upgrade them, removing packages if it must\n'
-  sysup_notice kept-back "${kept[*]}"
+  sysup_notice kept-back "${kept[@]}"
 }
 
 report_autoremovable() {
@@ -457,7 +457,7 @@ debup_report_pending_restarts() {
 
   sysup_log 'services still needing a restart'
   printf '  %s\n' "${services[@]}"
-  sysup_notice deferred-restart "${services[*]}"
+  sysup_notice deferred-restart "${services[@]}"
 }
 
 sysup_backend_checks() {

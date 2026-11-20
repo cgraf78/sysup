@@ -781,7 +781,7 @@ _SYSUP_NOTICE_FILE=""
 _assert_contains "dnfup notices: the reboot report text is unchanged" \
   "reboot required to complete this upgrade" "$result"
 _assert_eq "dnfup notices: reboot and rpmnew are recorded by kind" \
-  $'reboot-required\treboot required to complete this upgrade\nconfig-merge\t'"$DNFUP_FIXTURE_ETC/app.conf.rpmnew" \
+  $'reboot-required\t\nconfig-merge\t'"$DNFUP_FIXTURE_ETC/app.conf.rpmnew" \
   "$(cat "$dnfup_notices")"
 
 _test_summary

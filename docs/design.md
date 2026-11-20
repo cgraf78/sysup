@@ -105,8 +105,10 @@ clean upgrade.
 
 ### Notices
 
-`sysup_notice <kind> <message>` records a structured notice and prints
-nothing; each call site keeps printing its own text. `sysup_warn <message>`
+`sysup_notice <kind> [subject...]` records a structured notice and prints
+nothing; each call site keeps printing its own text. A subject is the path,
+unit, or package the notice is about (the message, for a `warning`);
+`reboot-required` has none. `sysup_warn <message>`
 prints `warning: <message>` on stderr and records a `warning` notice. The
 kinds, owned by `SYSUP_NOTICE_KINDS` in `common.sh`:
 
@@ -119,8 +121,9 @@ kinds, owned by `SYSUP_NOTICE_KINDS` in `common.sh`:
 | `kept-back` | `debup`: packages `upgrade --with-new-pkgs` left that a full-upgrade would upgrade |
 | `warning` | every `sysup_warn` |
 
-An unknown kind returns 2. Notices are appended, one `kind<TAB>message` line
-each, to the file in `_SYSUP_NOTICE_FILE`; a file rather than a shell array
+An unknown kind returns 2. Notices are appended, one `kind<TAB>subject` line
+per subject (one with an empty subject when there is none), to the file in
+`_SYSUP_NOTICE_FILE`; a file rather than a shell array
 because reports also run inside command substitutions. Outside `--cron`
 nothing sets it and notices are not kept. Policy reads kinds, never message
 text.
@@ -175,6 +178,11 @@ text.
    session-related entries in `needrestart`'s default `override_rc`, with its
    open-ended prefixes anchored to exact unit names. Deferred units are listed
    with a hint to restart them manually or reboot, and do not fail the run.
+   Of the rest, only units systemd reports `CanStop=yes` are restarted, and
+   a service in `SubState=exited` with no `TasksCurrent` (a
+   `RemainAfterExit` unit with no process left, such as `libvirt-guests` or
+   `systemd-fsck@`) is skipped without a deferral: it runs no old code, and
+   restarting it would replay its stop action.
 6. With `--restart-failed`, restart failed enabled units.
 7. Repeat the deferred-restart reminder (below).
 8. Report failed systemd units.
@@ -214,14 +222,22 @@ through `_sysup_cron`; with `--help` it prints help directly instead. In order:
    changing packages if the inhibitor cannot be acquired. The cron lock
    descriptor is closed for the watcher.
 5. The buffer is printed only when the exit status is non-zero, the package
-   snapshots differ, `SYSUP_EXTRA_UPGRADED_PACKAGES` is non-empty, or any
-   notice other than `excluded-pending` was recorded
-   (`sysup_cron_should_report`). An excluded package with an update is the
-   expected state while the exclusion stands, so it alone stays silent.
+   snapshots differ, `SYSUP_EXTRA_UPGRADED_PACKAGES` is non-empty, a
+   `warning` was recorded, or a standing notice is new
+   (`sysup_cron_should_report`). Standing notices are every other kind
+   except `excluded-pending`, keyed `kind<TAB>subject`; one is new when its
+   key is missing from `SYSUP_STATE_DIR/cron-notices`, the keys of the last
+   run that was not `--check-only` (missing or unreadable counts as empty).
+   A deliberately deferred restart or a lingering `.pacnew` therefore mails
+   once, not every night, and mails again if it is resolved and comes back.
+   An excluded package with an update is the expected state while the
+   exclusion stands, so it never mails by itself.
 6. The log is kept as root-only `SYSUP_STATE_DIR/last-cron.log`, and
    `SYSUP_STATE_DIR/last-cron` holds `time=<epoch>`, `status=<n>`, and
-   `changed=yes|no`, each replaced by a rename. A failure to write them is a
-   warning printed outside the buffer.
+   `changed=yes|no`. A run that is not `--check-only` and reached the checks
+   also replaces `SYSUP_STATE_DIR/cron-notices`. Each file is
+   replaced by a rename, and a failure to write one is a warning printed
+   outside the buffer.
 
 The exit status is the shared run's, unchanged.
 

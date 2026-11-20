@@ -95,8 +95,11 @@ sysup_backend_upgrade() {
   sleep "$COMMON_UPGRADE_SECONDS"
   [[ -z "$COMMON_UPGRADE_SNAPSHOT" ]] || printf '%s\n' "$COMMON_UPGRADE_SNAPSHOT" >"$COMMON_SNAPSHOT"
   for entry in "${COMMON_UPGRADE_NOTICES[@]+"${COMMON_UPGRADE_NOTICES[@]}"}"; do
+    # A `kind:subject` entry names its subject; a bare kind gets a fixed one.
     if [[ "$entry" == warning ]]; then
       sysup_warn "fake upgrade warning"
+    elif [[ "$entry" == *:* ]]; then
+      sysup_notice "${entry%%:*}" "${entry#*:}"
     else
       sysup_notice "$entry" "fake $entry"
     fi
@@ -514,16 +517,19 @@ echo "=== common: notices ==="
 
 notice_file=$(_tmpfile)
 _SYSUP_NOTICE_FILE="$notice_file"
-sysup_notice reboot-required 'reboot required'
-sysup_notice config-merge $'/etc/a.pacnew\n/etc/b.pacnew'
+sysup_notice reboot-required
+sysup_notice config-merge /etc/a.pacnew '/etc/my app.pacnew' $'/etc/x\n.pacnew'
 result=$(sysup_warn 'disk almost full' 2>&1)
 _assert_eq "common notices: sysup_warn prints the usual warning line" \
   "warning: disk almost full" "$result"
-_assert_eq "common notices: each notice is one kind<TAB>message line" \
-  $'reboot-required\treboot required\nconfig-merge\t/etc/a.pacnew /etc/b.pacnew\nwarning\tdisk almost full' \
+_assert_eq "common notices: each subject is one kind<TAB>subject line" \
+  $'reboot-required\t\nconfig-merge\t/etc/a.pacnew\nconfig-merge\t/etc/my app.pacnew\nconfig-merge\t/etc/x .pacnew\nwarning\tdisk almost full' \
   "$(cat "$notice_file")"
 _assert_eq "common notices: kinds are listed in order" \
-  $'reboot-required\nconfig-merge\nwarning' "$(sysup_notice_kinds "$notice_file")"
+  $'reboot-required\nconfig-merge\nconfig-merge\nconfig-merge\nwarning' "$(sysup_notice_kinds "$notice_file")"
+_assert_eq "common notices: standing keys leave out warnings, sorted and unique" \
+  $'config-merge\t/etc/a.pacnew\nconfig-merge\t/etc/my app.pacnew\nconfig-merge\t/etc/x .pacnew\nreboot-required\t' \
+  "$(sysup_cron_standing_notices "$notice_file")"
 set +e
 result=$(sysup_notice rebot-required 'typo' 2>&1)
 status=$?
@@ -721,6 +727,95 @@ _cron_reset
 COMMON_UPGRADE_NOTICES=(excluded-pending reboot-required)
 _common_main --cron
 _assert_contains "common cron: excluded-pending with another notice prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+
+# Standing notices mail only when the set gains a key since the last run
+# that was not --check-only.
+_cron_reset
+COMMON_UPGRADE_NOTICES=(deferred-restart:vpn.service config-merge:/etc/a.pacnew)
+_common_main --cron
+_assert_contains "common cron: first standing notices print the log" \
+  "upgrading system" "$COMMON_RESULT"
+_assert_eq "common cron: the standing notices are kept as kind<TAB>subject keys" \
+  $'config-merge\t/etc/a.pacnew\ndeferred-restart\tvpn.service' \
+  "$(cat "$SYSUP_STATE_DIR/cron-notices")"
+_common_main --cron
+_assert_eq "common cron: the same standing notices again stay silent" "" "$COMMON_RESULT"
+COMMON_UPGRADE_NOTICES=(config-merge:/etc/a.pacnew deferred-restart:vpn.service deferred-restart:vpn.service)
+_common_main --cron
+_assert_eq "common cron: order and repeats do not make a notice new" "" "$COMMON_RESULT"
+COMMON_UPGRADE_NOTICES=(deferred-restart:vpn.service)
+_common_main --cron
+_assert_eq "common cron: a resolved notice alone stays silent" "" "$COMMON_RESULT"
+COMMON_UPGRADE_NOTICES=(deferred-restart:vpn.service config-merge:/etc/a.pacnew)
+_common_main --cron
+_assert_contains "common cron: a resolved notice that reappears prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+COMMON_UPGRADE_NOTICES=(deferred-restart:vpn.service config-merge:/etc/a.pacnew deferred-restart:db.service)
+_common_main --cron
+_assert_contains "common cron: a new subject of a standing kind prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+COMMON_UPGRADE_NOTICES=(deferred-restart:vpn.service config-merge:/etc/a.pacnew deferred-restart:db.service reboot-required)
+_common_main --cron
+_assert_contains "common cron: a new standing kind prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+
+_cron_reset
+COMMON_UPGRADE_NOTICES=(reboot-required)
+_common_main --cron
+COMMON_UPGRADE_NOTICES=()
+_common_main --cron --check-only
+_assert_eq "common cron: a --check-only run keeps the baseline" \
+  $'reboot-required\tfake reboot-required' "$(cat "$SYSUP_STATE_DIR/cron-notices")"
+COMMON_UPGRADE_NOTICES=(reboot-required)
+_common_main --cron
+_assert_eq "common cron: after --check-only a known notice stays silent" "" "$COMMON_RESULT"
+
+_cron_reset
+COMMON_UPGRADE_NOTICES=(reboot-required:)
+_common_main --cron
+COMMON_INHIBIT_FAIL=1
+_common_main --cron
+_assert_eq "common cron: a run stopped before its checks keeps the baseline" \
+  $'reboot-required\t' "$(cat "$SYSUP_STATE_DIR/cron-notices")"
+COMMON_INHIBIT_FAIL=0
+_common_main --cron
+_assert_eq "common cron: a known subjectless notice stays silent" "" "$COMMON_RESULT"
+
+_cron_reset
+_common_main --cron --check-only
+if [[ ! -e "$SYSUP_STATE_DIR/cron-notices" ]]; then
+  _pass "common cron: a --check-only run writes no baseline"
+else
+  _fail "common cron: a --check-only run writes no baseline"
+fi
+
+_cron_reset
+COMMON_UPGRADE_NOTICES=(reboot-required)
+_common_main --cron
+COMMON_UPGRADE_STATUS=7
+_common_main --cron
+_assert_contains "common cron: a failure with known notices prints the log" \
+  "the system upgrade failed (status 7)" "$COMMON_RESULT"
+COMMON_UPGRADE_STATUS=0
+COMMON_UPGRADE_SNAPSHOT="base 2.0"
+_common_main --cron
+_assert_contains "common cron: a package change with known notices prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+COMMON_UPGRADE_SNAPSHOT=""
+COMMON_UPGRADE_NOTICES=(reboot-required warning)
+_common_main --cron
+_assert_contains "common cron: a warning with known notices prints the log" \
+  "fake upgrade warning" "$COMMON_RESULT"
+_common_main --cron
+_assert_contains "common cron: a repeated warning prints the log again" \
+  "fake upgrade warning" "$COMMON_RESULT"
+
+_cron_reset
+mkdir -p "$SYSUP_STATE_DIR/cron-notices"
+COMMON_UPGRADE_NOTICES=(reboot-required)
+_common_main --cron
+_assert_contains "common cron: an unreadable baseline counts as empty" \
   "upgrading system" "$COMMON_RESULT"
 
 _cron_reset
