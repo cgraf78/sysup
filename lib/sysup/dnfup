@@ -64,11 +64,9 @@ Default flow:
   8. report failed systemd units when systemd is available
 
 Options:
-  --exclude=PKG[,PKG...]          leave these packages (dnf globs allowed) at
-                                  their installed version for this run, via
-                                  dnf upgrade --exclude; repeatable. Unlike
-                                  arguments after --, it keeps automatic
-                                  cleanup.
+  --exclude=PKG[,PKG...]          exclude these packages (dnf globs allowed)
+                                  from dnf upgrade; repeatable. Autoremove
+                                  can still remove them if no longer needed.
 EOF
   sysup_usage_common_options
   cat <<'EOF'

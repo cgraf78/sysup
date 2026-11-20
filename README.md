@@ -69,8 +69,8 @@ Common options:
 - `--check-only` skips package changes and service restarts while running the
   verification checks;
 - `--cron` runs unattended from root's crontab (see below);
-- `--exclude=PKG[,PKG...]` leaves packages at their installed version for this
-  run, on Arch and Fedora; the other backends reject it with exit status 2;
+- `--exclude=PKG[,PKG...]` excludes packages from upgrade selection on Arch
+  and Fedora. The other backends reject it with exit status 2;
 - `--no-autoremove` lists packages no longer required instead of removing them;
 - `--no-restart-upgraded-services` leaves affected active services running;
 - `--restart-failed` restarts failed enabled systemd units after checks;
@@ -82,8 +82,9 @@ rejected with exit status 2, so a mistyped option fails before anything runs
 instead of reaching the package manager.
 
 `--exclude` takes its names in the same word, comma-separated, and may be
-repeated; names may be `*`/`?` globs. Unlike package-manager arguments after
-`--`, it keeps automatic cleanup.
+repeated; names may be `*`/`?` globs. It keeps automatic cleanup enabled.
+Arch also excludes those packages from orphan removal. Fedora's cleanup can
+still remove an excluded package when it is an unused dependency.
 
 ### Unattended runs
 
@@ -140,8 +141,11 @@ run `sbctl verify` and fail when a unified kernel image or boot loader under
 
 `--exclude` names reach `yay` or `pacman` as one `--ignore=a,b` argument.
 Explicit rebuild and orphan removal targets also skip those packages. The
-preamble lists them beside `pacman.conf`'s `IgnorePkg`. After the upgrade, excluded packages that the
-sync database still has updates for are listed.
+preamble lists them beside `pacman.conf`'s `IgnorePkg`. Cron mode makes
+pacman decline the prompt to install an ignored package when yay selects it
+as a dependency. Combining `--cron` and `--exclude` rejects a forwarded
+`--ask` override. After the upgrade, sysup lists any excluded packages that
+still have updates in the sync database.
 
 Package operations are noninteractive by default. Pass `--confirm` after `--`
 to restore package-manager prompts. Other custom package-manager arguments
@@ -174,9 +178,9 @@ packages no longer required. Neither step performs a release upgrade or edits
 APT sources.
 
 It keeps locally modified conffiles, retries transient package-index failures,
-lists packages the default upgrade kept back (those a full-upgrade would still
-upgrade), checks dpkg and apt integrity, reports pending conffile merges and
-reboot state, and prefers `needrestart` when it is installed.
+checks dpkg and apt integrity, reports pending conffile merges and reboot
+state, and prefers `needrestart` when installed. With the default upgrade
+arguments it also lists kept-back packages that a full-upgrade would install.
 
 ### Fedora and RHEL
 

@@ -314,8 +314,9 @@ and `IgnoreGroup` entries `-Syu` leaves alone, the Arch analogue of held
 packages; an unreadable `pacman.conf` is a warning. Before upgrading,
 `archup` waits for `/var/lib/pacman/db.lck` to be free (shared lock waits,
 `ARCHUP_LOCK_TIMEOUT`, default 300 seconds): libalpm holds that file open for
-a whole transaction and fails at once rather than waiting. A lock file left
-behind by a crashed run has no holder, so pacman's own error still reports it.
+a whole transaction and fails at once. Pacman reports a stale lock file as
+an error. Before invoking yay to upgrade or rebuild in cron mode, `archup`
+checks that the file is gone because yay waits indefinitely for it.
 
 Upgrade with `yay -Syu --devel`, or `pacman -Syu` when `yay` is absent, then
 rebuild installed AUR packages whose ELF files have missing libraries. As
@@ -336,8 +337,13 @@ and `keyboxd`, best effort: nothing else ends them for a service account.
 `pacman -Syu` fallback (yay applies it to AUR upgrades too). The AUR rebuild
 also passes `--ignore` for dependency resolution and drops explicit excluded
 targets. Orphan cleanup skips excluded packages while still removing other
-orphans. All three stages use pacman's glob matching. The preamble lists them
-in the ignored-packages section marked `(--exclude)`. After the upgrade, `pacman -Qu` against the
+orphans. All three stages use pacman's glob matching. Under `--cron`,
+`--ask=1` makes pacman decline the install-ignored-package prompt when yay
+selects an ignored dependency as an explicit target. A forwarded `--ask`
+value could override that answer, so the backend rejects it with status 2
+when both `--cron` and `--exclude` are set. The preamble lists
+exclusions in the ignored-packages section marked `(--exclude)`. After the
+upgrade, `pacman -Qu` against the
 just-synced database lists excluded packages that still have updates, each
 an `excluded-pending` notice; a failed query is a warning.
 
@@ -395,7 +401,8 @@ Upgrade, as root, with `DEBIAN_FRONTEND=noninteractive`:
   bumps land, but never removes a package. `--full-upgrade` opts into
   `full-upgrade`, which permits removals to resolve dependencies. Neither crosses
   an OS release.
-- after the default verb, an unprivileged `apt-get --simulate full-upgrade`,
+- after `upgrade` with no forwarded arguments, an unprivileged
+  `apt-get --simulate full-upgrade`,
   whose `Inst <pkg> [<installed>]` records (untranslated pkgSimulate output)
   name the packages the upgrade kept back; they are listed and recorded as a
   `kept-back` notice. Holds and phasing apply to full-upgrade too, so neither
@@ -630,7 +637,8 @@ which is reported as unknown rather than as a reboot.
   check, and the image-based, yum-only, and family guards.
 - `test/e2e/distro-run` boots a stock image of each supported family with
   systemd as PID 1 and runs the real `sysup` (check-only, upgrade as root,
-  upgrade through sudo, check-only again) against the real package manager.
+  upgrade through sudo, then cron check-only with status verification) against
+  the real package manager.
   It is the only test that does not mock them, and CI runs it per family.
 - `zypup-test` mocks `zypper`, `rpm`, `sudo`, and `systemctl` to cover the
   per-release verb, refresh ordering, lock timeout, informational exit codes,

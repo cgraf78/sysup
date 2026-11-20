@@ -1211,6 +1211,44 @@ if find "$SYSUP_PROC_ROOT" -maxdepth 0 -lname x >/dev/null 2>&1; then
     "" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
 fi
 
+_archup_mock_reset
+ARCHUP_IS_ROOT=1
+SYSUP_ARCH_USER=aurbuild
+# shellcheck disable=SC2034 # Read by the sourced backend.
+_SYSUP_CRON=1
+: >"$ARCHUP_DB_LOCK"
+status=0
+result=$(sysup_backend_upgrade 2>&1) || status=$?
+_assert_eq "archup lock: unattended yay rejects a leftover lock file" "1" "$status"
+_assert_contains "archup lock: identifies the leftover lock file" \
+  "pacman database lock $ARCHUP_DB_LOCK is still present" "$result"
+_assert_eq "archup lock: does not launch yay while the file remains" \
+  "" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+if [[ -f "$ARCHUP_DB_LOCK" ]]; then
+  _pass "archup lock: leaves the lock file for the operator to investigate"
+else
+  _fail "archup lock: leaves the lock file for the operator to investigate"
+fi
+rm -f "$ARCHUP_DB_LOCK"
+
+_archup_mock_reset
+_archup_mock_add_package broken-tool 1 broken
+result=$(
+  # shellcheck disable=SC2329 # Invoked by the sourced backend.
+  broken_foreign_packages() {
+    : >"$ARCHUP_DB_LOCK"
+    printf '%s\n' broken-tool
+  }
+  status=0
+  _SYSUP_CRON=1 sysup_backend_upgrade 2>&1 || status=$?
+  printf 'upgrade_status=%s\nrebuilds=%s\n' "$status" "${#SYSUP_EXTRA_UPGRADED_PACKAGES[@]}"
+)
+_assert_contains "archup lock: fails when a lock appears before an unattended rebuild" \
+  "upgrade_status=1" "$result"
+_assert_contains "archup lock: blocked rebuilds are not marked as attempted" \
+  "rebuilds=0" "$result"
+rm -f "$ARCHUP_DB_LOCK"
+
 echo ""
 echo "=== archup: AUR lookup failures ==="
 
@@ -2511,6 +2549,39 @@ sysup_backend_exclude kernel-pkg
 sysup_backend_upgrade >/dev/null 2>&1
 _assert_eq "archup exclude: the pacman fallback gets --ignore too" \
   "-Syu --ignore=kernel-pkg --noconfirm" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package broken-tool 1 broken
+sysup_backend_exclude kernel-pkg
+_SYSUP_CRON=1 sysup_backend_upgrade >/dev/null 2>&1
+yay_commands=$(cat "$ARCHUP_YAY_COMMAND_LOG")
+_assert_contains "archup exclude: unattended yay declines ignored explicit targets during upgrade" \
+  "-Syu --devel --ignore=kernel-pkg --ask=1" "$yay_commands"
+_assert_contains "archup exclude: unattended yay also declines ignored rebuild dependencies" \
+  "--answerclean All --ignore=kernel-pkg --ask=1" "$yay_commands"
+
+_archup_mock_reset
+ARCHUP_HAS_YAY=0
+sysup_backend_exclude kernel-pkg
+_SYSUP_CRON=1 sysup_backend_upgrade >/dev/null 2>&1
+_assert_eq "archup exclude: unattended pacman also declines ignored explicit targets" \
+  "-Syu --ignore=kernel-pkg --ask=1 --noconfirm" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+for ask_arg in --ask=0 --ask; do
+  _archup_mock_reset
+  sysup_backend_exclude kernel-pkg
+  case "$ask_arg" in
+    --ask) args=(--ask 0) ;;
+    *) args=("$ask_arg") ;;
+  esac
+  status=0
+  result=$(_SYSUP_CRON=1 sysup_backend_upgrade "${args[@]}" 2>&1) || status=$?
+  _assert_eq "archup exclude: cron rejects a forwarded $ask_arg override" "2" "$status"
+  _assert_contains "archup exclude: explains why $ask_arg was rejected" \
+    "--ask cannot be forwarded with --cron and --exclude" "$result"
+  _assert_eq "archup exclude: a forwarded $ask_arg override starts no transaction" \
+    "" "$(cat "$ARCHUP_YAY_COMMAND_LOG" "$ARCHUP_PACMAN_COMMAND_LOG")"
+done
 
 _archup_mock_reset
 _archup_mock_add_package steady-pkg 1 ok 1.0
