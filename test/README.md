@@ -7,26 +7,35 @@ functions and shell state from reaching another.
 
 - `sysup-test` covers OS detection, family guards, exact argv dispatch, help and
   error behavior, Bash 3.2 constraints, shdeps-style relative and absolute
-  symlinks, and the manual installation layout.
+  symlinks, the manual installation layout, and the guard that every library
+  is sourced at load time rather than lazily.
 - `common-test` covers the shared driver with a fake backend: rejection of
-  unknown arguments, the sudo keeper's refresh and shutdown (normal return,
-  failed upgrade, revoked credentials, and a parent that dies without
-  cleanup), and package-manager lock detection and waits.
+  unknown arguments, `--exclude` parsing and the default rejection, notice
+  recording, the sudo keeper's refresh and shutdown (normal return, failed
+  upgrade, revoked credentials, and a parent that dies without cleanup),
+  package-manager lock detection and waits, and `--cron`: the root check, a
+  scheduled shutdown, a busy lock held by a background process, the shutdown
+  inhibitor (a fake `systemd-inhibit`), stdin, each condition that prints the
+  buffer, a silent no-op, and the state files.
 - `archup-test` covers package-manager argument policy, AUR membership and
   rebuild decisions, orphan removal, missing-library failures, package
   snapshots, service restarts, persistent deferred-restart reminders, partial
-  failures, caller trap preservation, and failed units.
+  failures, caller trap preservation, failed units, `--ignore` and rebuild
+  filtering for `--exclude`, excluded-pending updates, failed install hooks,
+  build-user gpg agent cleanup, and `sbctl verify` fixtures (including the
+  ignored `vmlinuz`).
 - `debup-test` covers apt/dpkg policy, retries, autoremove, integrity and
   advisory checks, multiarch snapshots, needrestart, check-only behavior,
-  partial upgrades, family refusal, service restarts, and failed units.
+  partial upgrades, family refusal, service restarts, failed units, kept-back
+  packages, and the `--exclude` rejection.
 - `dnfup-test` covers dnf/rpm policy, versionlocked and excluded packages,
-  the rpm lock wait, autoremove and its report, multilib,
+  `--exclude`, the rpm lock wait, autoremove and its report, multilib,
   installonly, and signing-key snapshots, image-based and yum-only refusal,
   partial upgrades, each check, check-only behavior, and family refusal.
 - `zypup-test` covers the per-release upgrade verb, refresh ordering, the zypp
   lock timeout, zypper's informational exit codes, the unneeded-package
   listing that never removes, package locks, each check, transactional-host
-  and family refusal, and check-only behavior.
+  and family refusal, check-only behavior, and the `--exclude` rejection.
 - `lib/test.sh` provides only the assertions and guarded temporary directories
   these suites need. It is intentionally independent of dotfiles.
 

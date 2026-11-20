@@ -668,4 +668,66 @@ status=$?
 set -e
 _assert_eq "sysup families: an unknown family has no backend" "1" "$status"
 
+echo ""
+echo "=== sysup: library files are read before the first mutation ==="
+
+# `dot update` and shdeps replace a checkout in place while a long upgrade
+# runs. git replaces files by unlink and rename, so an open file stays the old
+# version, but a file looked up by path later would be the new one, mixed
+# with the old code already loaded. Every library is therefore sourced at the
+# top level, while the backend loads, and nothing resolves a library path
+# from inside a function. Indentation marks a line inside a function or
+# block in these files. Host data such as os-release may still be sourced
+# later; only sysup's own library locations are flagged.
+_sysup_lazy_library_lines() {
+  local file="$1" line
+
+  while IFS= read -r line; do
+    case "$line" in
+      [[:space:]]*) ;;
+      *) continue ;;
+    esac
+    if [[ "$line" == *_SYSUP_LIB_DIR* ||
+      "$line" =~ _(lib|common)_dir\) ||
+      "$line" =~ ^[[:space:]]+(\.|source)[[:space:]].*(BASH_SOURCE|\.sh) ]]; then
+      printf '%s\n' "$line"
+    fi
+  done <"$file"
+}
+
+lazy_sources_scanned=0
+for library_file in archup debup dnfup zypup common.sh detect.sh systemd.sh apt.sh rpm.sh; do
+  library_path="$REPO_ROOT/lib/sysup/$library_file"
+  _assert_eq "sysup libraries: $library_file sources and locates libraries only at load time" \
+    "" "$(_sysup_lazy_library_lines "$library_path")"
+  if grep -Eq '^(\.|source) ' "$library_path"; then
+    lazy_sources_scanned=$((lazy_sources_scanned + 1))
+  fi
+done
+# The scan must actually see the top-level source lines it guards.
+_assert_eq "sysup libraries: the scan found the backends' and libraries' source lines" \
+  "5" "$lazy_sources_scanned"
+
+# The guard's own detector, on a fixture: a library sourced lazily inside a
+# function is what it exists to reject.
+lazy_fixture=$(_tmpfile)
+cat >"$lazy_fixture" <<'EOF'
+. "$_SYSUP_LIB_DIR/common.sh"
+late_helper() {
+  . "$_SYSUP_LIB_DIR/rpm.sh"
+}
+EOF
+_assert_contains "sysup libraries: the detector flags a lazy source" \
+  'rpm.sh' "$(_sysup_lazy_library_lines "$lazy_fixture")"
+_assert_not_contains "sysup libraries: the detector allows a top-level source" \
+  'common.sh' "$(_sysup_lazy_library_lines "$lazy_fixture")"
+
+# Bash reads a script as it runs, so the backend's call into the driver must
+# be its last statement: nothing after it may be parsed from a replaced file.
+for backend_file in archup debup dnfup zypup; do
+  _assert_eq "sysup libraries: $backend_file ends with its sysup_main call" \
+    $'if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then\n  sysup_main "$@"\nfi' \
+    "$(grep -v '^[[:space:]]*$' "$REPO_ROOT/lib/sysup/$backend_file" | tail -n 3)"
+done
+
 _test_summary

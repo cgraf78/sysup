@@ -132,8 +132,7 @@ sysup_service_units_for_packages() {
   for pkg in "$@"; do
     if ! listing="$(sysup_backend_package_files "$pkg" 2>&1)"; then
       printf '%s\n' "$listing" >&2
-      printf 'warning: could not list files owned by %s; its services will not be restarted\n' \
-        "$pkg" >&2
+      sysup_warn "could not list files owned by $pkg; its services will not be restarted"
       status=1
       continue
     fi
@@ -311,8 +310,7 @@ sysup_pending_deferred_restarts() {
   state="$(sysup_deferred_state_file)"
   [[ -e "$state" ]] || return 0
   if [[ ! -r "$state" ]]; then
-    printf 'warning: could not read %s; deferred service restarts are unverified\n' \
-      "$state" >&2
+    sysup_warn "could not read $state; deferred service restarts are unverified"
     return 1
   fi
   boot="$(sysup_boot_id)" || boot=""
@@ -398,17 +396,16 @@ sysup_record_deferred_restarts() {
   done
 
   if ! sysup_write_deferred_state "${entries[@]}"; then
-    printf 'warning: could not record deferred restarts in %s; later runs will not repeat this reminder\n' \
-      "$SYSUP_STATE_DIR" >&2
+    sysup_warn "could not record deferred restarts in $SYSUP_STATE_DIR; later runs will not repeat this reminder"
     return 1
   fi
 }
 
-# Remind on every run while deferred units still run pre-upgrade code. The
-# single "reboot recommended:" line on stderr is a stable marker automation can
-# match. Like debup's reboot-required report it is advisory and never changes
-# the exit status. With $1 = 1 the run also prunes spent entries; --check-only
-# passes 0 and leaves the host untouched.
+# Remind on every run while deferred units still run pre-upgrade code, with
+# one "reboot recommended:" line on stderr and a `deferred-restart` notice for
+# automation. Like debup's reboot-required report it is advisory and never
+# changes the exit status. With $1 = 1 the run also prunes spent entries;
+# --check-only passes 0 and leaves the host untouched.
 sysup_report_deferred_restarts() {
   local may_prune="${1:-0}" state listing line entry_boot unit total=0
   local -a pending=() units=()
@@ -427,7 +424,7 @@ sysup_report_deferred_restarts() {
   done <"$state"
   if ((may_prune && ${#pending[@]} != total)); then
     sysup_write_deferred_state "${pending[@]+"${pending[@]}"}" ||
-      printf 'warning: could not prune spent entries from %s\n' "$state" >&2
+      sysup_warn "could not prune spent entries from $state"
   fi
 
   ((${#pending[@]})) || return 0
@@ -439,6 +436,7 @@ sysup_report_deferred_restarts() {
   # changing their activation time, so this cannot be certain.
   printf 'reboot recommended: session-critical units may still run pre-upgrade code: %s; restart them manually or reboot\n' \
     "${units[*]}" >&2
+  sysup_notice deferred-restart "${units[*]}"
 }
 
 sysup_restart_upgraded_services() {
@@ -494,8 +492,7 @@ sysup_restart_upgraded_services() {
       continue
     fi
     if ! can_stop="$(systemctl show --property=CanStop --value -- "$unit")"; then
-      printf 'warning: could not determine whether %s supports manual restart\n' \
-        "$unit" >&2
+      sysup_warn "could not determine whether $unit supports manual restart"
       discovery_status=1
       continue
     fi
@@ -510,14 +507,14 @@ sysup_restart_upgraded_services() {
         [[ -z "$policy_output" ]] || printf '%s\n' "$policy_output" >&2
         if ((policy_status == 1)); then
           ((deferred_count += 1))
+          sysup_notice deferred-restart "$unit"
         else
           discovery_status=1
         fi
         ;;
       no) ;;
       *)
-        printf 'warning: could not determine whether %s supports manual restart\n' \
-          "$unit" >&2
+        sysup_warn "could not determine whether $unit supports manual restart"
         discovery_status=1
         ;;
     esac
@@ -528,6 +525,7 @@ sysup_restart_upgraded_services() {
     ((deferred_count += ${#session_units[@]}))
     printf 'deferred: session-critical units not restarted: %s\n' \
       "${session_units[*]}" >&2
+    sysup_notice deferred-restart "${session_units[*]}"
     # Not reboot-only: some distributions' package scripts re-exec user
     # managers themselves, and a manual restart from outside the affected
     # sessions is enough for the rest.

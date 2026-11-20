@@ -61,6 +61,9 @@ EOF
 On a supported host, --help also prints the selected backend's flags.
   --list-updates     list cached pending updates (Arch and Debian)
   --refresh-updates  refresh repository metadata only (Arch and Debian)
+  --cron             unattended upgrade for root's crontab; prints only when
+                     something changed, failed, or needs attention
+  --exclude=PKG,...  leave packages out of this upgrade (Arch and Fedora)
 EOF
 }
 

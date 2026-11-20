@@ -35,6 +35,26 @@ ARCHUP_MODULES_ROOT="${ARCHUP_MODULES_ROOT:-/usr/lib/modules}"
 ARCHUP_DB_LOCK="${ARCHUP_DB_LOCK:-/var/lib/pacman/db.lck}"
 ARCHUP_LOCK_TIMEOUT="${ARCHUP_LOCK_TIMEOUT:-300}"
 
+# Packages this run leaves at their installed version (--exclude), as given;
+# pacman treats each as a glob, like an IgnorePkg entry.
+ARCHUP_EXCLUDES=()
+
+# The dedicated build user to clean up after a cron run.
+ARCHUP_BUILD_USER=""
+
+# A file collecting the package manager's stderr during the upgrade, so a
+# failed install hook can be detected after a transaction pacman still calls
+# successful. Empty outside the upgrade.
+ARCHUP_PM_ERRORS=""
+
+# What pacman prints when an install scriptlet or an ALPM hook (mkinitcpio, a
+# UKI generator, sbctl's signing hook) exits non-zero. The transaction still
+# completes and pacman still exits 0, so this line is the only signal that the
+# initramfs or UKI may not have been rebuilt or signed. It is matched as a
+# whole line in pacman's English wording: a translated message locale hides
+# it, and then only the sbctl verification in the checks remains.
+ARCHUP_HOOK_ERROR_LINES=('error: command failed to execute correctly')
+
 archup_is_root() {
   ((EUID == 0))
 }
@@ -79,7 +99,60 @@ archup_prepare_yay() {
   # yay must build as the owning user, but its nested pacman invocation still
   # needs that user's sudo credential. Warming it through the same terminal
   # makes an interactive root shell safe and makes unattended cron fail closed.
-  sudo -u "$user" -H -- sudo -v
+  sudo -u "$user" -H -- sudo -v || return
+  if ((_SYSUP_CRON)) && [[ -n "${SYSUP_ARCH_USER:-}" ]]; then
+    ARCHUP_BUILD_USER="$user"
+  fi
+}
+
+# yay's PGP signature checks start gpg-agent (and keyboxd) as the build user,
+# and nothing stops them afterwards: a build service account has no login
+# session whose end would. Stop them once the yay steps are done. Best effort:
+# a missing gpgconf or an agent already gone is not a failed upgrade. Manual
+# runs and cron runs falling back to SUDO_USER preserve the user's agents.
+archup_stop_build_agents() {
+  local user="$ARCHUP_BUILD_USER"
+
+  [[ -n "$user" ]] || return 0
+  ARCHUP_BUILD_USER=""
+  command -v gpgconf >/dev/null 2>&1 || return 0
+  sudo -u "$user" -H -- gpgconf --kill all >/dev/null 2>&1 || true
+}
+
+# Run a package-manager command with its stderr also copied to
+# ARCHUP_PM_ERRORS, keeping the command in this shell and its output live.
+# Wait for the copier so the hook check sees complete output. Use an explicit
+# background job because Bash before 4.4 cannot wait on process substitution.
+archup_run_captured() {
+  local status=0 copier pipe
+
+  if [[ -z "$ARCHUP_PM_ERRORS" ]]; then
+    "$@"
+    return
+  fi
+  pipe="${ARCHUP_PM_ERRORS%/*}/stderr.fifo"
+  tee -a -- "$ARCHUP_PM_ERRORS" <"$pipe" >&2 &
+  copier=$!
+  "$@" 2>"$pipe" || status=$?
+  wait "$copier" || sysup_warn 'could not capture package-manager errors'
+  return "$status"
+}
+
+# Return 0 when the captured package-manager stderr holds a hook or scriptlet
+# failure line. pacman colors its prefixes when stdout is a terminal, even on
+# stderr, so SGR sequences are stripped before the whole-line match.
+archup_hook_failed() {
+  local wanted
+  local -a patterns=()
+
+  [[ -n "$ARCHUP_PM_ERRORS" && -s "$ARCHUP_PM_ERRORS" ]] || return 1
+  for wanted in "${ARCHUP_HOOK_ERROR_LINES[@]}"; do
+    patterns+=(-e "$wanted")
+  done
+  # Not grep -q: exiting at the first match would SIGPIPE sed, and pipefail
+  # would turn the match into a failure.
+  sed $'s/\033\\[[0-9;]*m//g; s/\r$//' "$ARCHUP_PM_ERRORS" |
+    grep -Fx "${patterns[@]}" >/dev/null
 }
 
 archup_run_yay() {
@@ -105,6 +178,14 @@ archup_nvidia_version_valid() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+)+$ ]]
 }
 
+# Report that the "$1" (loaded or installed) NVIDIA driver version is unknown,
+# so unit "$2" keeps running. Printed on stdout like the rest of the restart
+# policy hook's output, which the shared restart path shows the operator.
+_archup_nvidia_unverified() {
+  printf 'warning: could not determine the %s NVIDIA driver version; preserving %s\n' "$1" "$2"
+  sysup_notice warning "could not determine the $1 NVIDIA driver version; preserving $2"
+}
+
 # nvidia-persistenced links against the upgraded userspace library. Restarting
 # it while the previous kernel module remains loaded stops a healthy daemon and
 # cannot start its replacement, so leave it running until the operator reloads
@@ -116,19 +197,16 @@ sysup_backend_check_service_restart() {
   version_file="${ARCHUP_NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}"
   [[ -e "$version_file" ]] || return 0
   if [[ ! -r "$version_file" ]]; then
-    printf 'warning: could not determine the loaded NVIDIA driver version; preserving %s\n' \
-      "$unit"
+    _archup_nvidia_unverified loaded "$unit"
     return 2
   fi
 
   loaded="$(archup_loaded_nvidia_version)" || {
-    printf 'warning: could not determine the loaded NVIDIA driver version; preserving %s\n' \
-      "$unit"
+    _archup_nvidia_unverified loaded "$unit"
     return 2
   }
   if ! archup_nvidia_version_valid "$loaded"; then
-    printf 'warning: could not determine the loaded NVIDIA driver version; preserving %s\n' \
-      "$unit"
+    _archup_nvidia_unverified loaded "$unit"
     return 2
   fi
   # modinfo resolves against the running kernel's module tree, which a kernel
@@ -143,8 +221,7 @@ sysup_backend_check_service_restart() {
   fi
   # A failed modinfo fails closed even if it printed a plausible version.
   if ((modinfo_status != 0)) || ! archup_nvidia_version_valid "$installed"; then
-    printf 'warning: could not determine the installed NVIDIA driver version; preserving %s\n' \
-      "$unit"
+    _archup_nvidia_unverified installed "$unit"
     return 2
   fi
   [[ "$loaded" == "$installed" ]] && return 0
@@ -156,7 +233,8 @@ sysup_backend_check_service_restart() {
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: sysup [--no-autoremove] [--check-only]
+Usage: sysup [--no-autoremove] [--check-only] [--cron]
+             [--exclude=PKG[,PKG...]]
              [--no-restart-upgraded-services] [--restart-failed]
              [-- yay/pacman args...]
 
@@ -165,13 +243,16 @@ then verify the failure modes most likely to leave services broken after the
 upgrade.
 
 Default flow:
-  1. report installed foreign packages and packages pacman.conf ignores
+  1. report installed foreign packages and packages pacman.conf or
+     --exclude ignores
   2. warm sudo credentials
-  3. upgrade packages noninteractively with yay, or pacman when yay is absent
+  3. upgrade packages noninteractively with yay, or pacman when yay is absent;
+     a failed install hook (mkinitcpio, UKI, signing) fails the upgrade
   4. rebuild installed AUR packages whose ELF files have missing libraries
   5. remove orphaned dependencies no installed package still requires,
      counting optional dependencies as required
-  6. check shared libraries and the package database (pacman -Dk), report
+  6. check shared libraries and the package database (pacman -Dk), verify
+     boot-chain Secure Boot signatures when sbctl is installed, report
      pending .pacnew/.pacsave merges, and
      report whether the running kernel needs a reboot
   7. restart active services shipped by packages upgraded or rebuilt in this run
@@ -179,6 +260,13 @@ Default flow:
   9. report failed systemd units when systemd is available
 
 Options:
+  --exclude=PKG[,PKG...]          leave these packages (globs allowed) at their
+                                  installed version for this run, through
+                                  --ignore, and skip rebuilding or removing them;
+                                  repeatable. Unlike arguments after --, it
+                                  keeps automatic cleanup. Excluded packages
+                                  that still have updates are listed after
+                                  the upgrade.
 EOF
   sysup_usage_common_options
   cat <<'EOF'
@@ -188,12 +276,12 @@ invocations, or to the pacman fallback. Package installation is noninteractive
 by default; pass --confirm after -- to restore package-manager prompts.
 
 When invoked as root, yay runs as the non-root user named by SYSUP_ARCH_USER,
-or by SUDO_USER when SYSUP_ARCH_USER is unset. The user must be able to
-authenticate sudo interactively; unattended root AUR upgrades fail closed
-instead of building packages as root. With yay installed, SYSUP_ARCH_USER
+or by SUDO_USER when SYSUP_ARCH_USER is unset. An unattended AUR build account
+must be able to validate sudo without a password. With yay installed, SYSUP_ARCH_USER
 naming root or a missing user is an error. When neither variable names a
 non-root user, AUR packages are skipped with a warning and pacman upgrades
-repository packages only.
+repository packages only. After the yay steps in a --cron run with
+SYSUP_ARCH_USER set, gpgconf --kill all stops the build account's agents.
 EOF
 }
 
@@ -229,8 +317,7 @@ aur_rebuild_targets() {
     fi
 
     ((lookup_status == 1)) && continue
-    printf 'warning: could not verify whether %s can be rebuilt from AUR; skipped automatic rebuild\n' \
-      "$pkg" >&2
+    sysup_warn "could not verify whether $pkg can be rebuilt from AUR; skipped automatic rebuild"
     status=2
   done
 
@@ -280,7 +367,7 @@ warn_non_aur_foreign_packages() {
   local missing_found=0 unverified_found=0
 
   if ! packages="$(foreign_packages)"; then
-    printf 'warning: could not list foreign packages; AUR membership is unverified\n' >&2
+    sysup_warn 'could not list foreign packages; AUR membership is unverified'
     return 0
   fi
 
@@ -492,7 +579,7 @@ scan_missing_libs() {
   esac
 }
 
-# Print orphans: packages installed as dependencies that nothing requires.
+# Print removable orphans: non-excluded dependencies that nothing requires.
 #
 # A single -t still counts optional dependencies as required, so an optdepend
 # the operator relies on is never treated as unused. pacman exits 1 both when
@@ -500,7 +587,7 @@ scan_missing_libs() {
 # unrecognized pacman.conf directive, say) on any run, so only an `error:`
 # line under the C locale marks the query as failed.
 orphan_packages() {
-  local errors error_text output status=0
+  local errors error_text output pkg status=0
 
   errors=$(mktemp) || return 2
   output=$(LC_ALL=C pacman -Qdtq 2>"$errors") || status=$?
@@ -511,7 +598,12 @@ orphan_packages() {
     { [[ -n "$output" ]] || [[ $'\n'"$error_text" == *$'\n'error:* ]]; }; }; then
     return 2
   fi
-  [[ -z "$output" ]] || printf '%s\n' "$output"
+  # An exclusion applies even when pacman reports the package as an orphan.
+  # Filter every query, including after a removal exposes another layer.
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    archup_excluded "$pkg" || printf '%s\n' "$pkg"
+  done <<<"$output"
 }
 
 report_pending_pacman_configs() {
@@ -520,17 +612,18 @@ report_pending_pacman_configs() {
 
   sysup_log "checking for pending package configuration"
   if ! command -v pacdiff >/dev/null 2>&1; then
-    printf 'warning: could not scan for config files awaiting a manual merge; install pacman-contrib\n' >&2
+    sysup_warn 'could not scan for config files awaiting a manual merge; install pacman-contrib'
     return 0
   fi
   if ! listing=$(sysup_scan_as_root pacdiff --output); then
-    printf 'warning: could not scan for config files awaiting a manual merge\n' >&2
+    sysup_warn 'could not scan for config files awaiting a manual merge'
     return 0
   fi
   if [[ -n "$listing" ]]; then
     mapfile -t configs <<<"$listing"
     printf 'config files awaiting a manual merge:\n'
     printf '  %s\n' "${configs[@]}"
+    sysup_notice config-merge "${configs[*]}"
   else
     printf 'ok: no config files awaiting a manual merge\n'
   fi
@@ -570,11 +663,13 @@ report_reboot_required() {
   sysup_log "checking whether a reboot is required"
   archup_reboot_required || status=$?
   case "$status" in
-    0) printf 'reboot required to complete this upgrade\n' ;;
+    0)
+      printf 'reboot required to complete this upgrade\n'
+      sysup_notice reboot-required 'reboot required to complete this upgrade'
+      ;;
     1) printf 'ok: no reboot required\n' ;;
     *)
-      printf 'warning: could not determine whether a reboot is required; the running kernel release or %s is unavailable\n' \
-        "$ARCHUP_MODULES_ROOT" >&2
+      sysup_warn "could not determine whether a reboot is required; the running kernel release or $ARCHUP_MODULES_ROOT is unavailable"
       ;;
   esac
 }
@@ -607,7 +702,7 @@ ignored_packages() {
 
 sysup_backend_preamble() {
   local -a packages=() ignored=()
-  local package_listing ignored_listing
+  local package_listing ignored_listing pkg
 
   if ! package_listing="$(foreign_packages)"; then
     printf 'error: could not list foreign packages\n' >&2
@@ -626,10 +721,16 @@ sysup_backend_preamble() {
   # Informational, like the other backends' held-package lists: a failure to
   # read pacman.conf is reported but does not stop the run.
   if ! ignored_listing="$(ignored_packages)"; then
-    printf 'warning: could not read IgnorePkg/IgnoreGroup from pacman.conf\n' >&2
-    return 0
+    sysup_warn 'could not read IgnorePkg/IgnoreGroup from pacman.conf'
+    ((${#ARCHUP_EXCLUDES[@]})) || return 0
+    ignored_listing=""
   fi
   [[ -z "$ignored_listing" ]] || mapfile -t ignored <<<"$ignored_listing"
+  # This run's --exclude names extend IgnorePkg for one run, so list them
+  # with it.
+  for pkg in "${ARCHUP_EXCLUDES[@]+"${ARCHUP_EXCLUDES[@]}"}"; do
+    ignored+=("$pkg (--exclude)")
+  done
   sysup_log "ignored packages (${#ignored[@]})"
   if ((${#ignored[@]})); then
     printf '  %s\n' "${ignored[@]}"
@@ -656,11 +757,79 @@ check_package_database() {
   fi
 }
 
+# `sbctl verify` result lines: a check or cross mark (or the equivalent ASCII
+# marker with SBCTL_UNICODE=0), the path, and its signature verdict.
+ARCHUP_SBCTL_RESULT_RE='^(✓|✗|✔|✘|\[[+-]\]) (/.+) is (not )?signed$'
+
+# Read `sbctl verify` output on stdin and print each boot-chain file it reports
+# unsigned. Require at least one boot-chain verdict before reporting success,
+# since an unsigned plain vmlinuz alone says nothing about the boot chain.
+archup_sbctl_unsigned() {
+  local cleaned line path seen=0
+
+  cleaned="$(sed $'s/\033\\[[0-9;]*m//g; s/\r$//')" || return 1
+  while IFS= read -r line; do
+    [[ "$line" =~ $ARCHUP_SBCTL_RESULT_RE ]] || continue
+    path="${BASH_REMATCH[2]}"
+    archup_boot_chain_file "$path" || continue
+    seen=1
+    [[ -z "${BASH_REMATCH[3]}" ]] || printf '%s\n' "$path"
+  done <<<"$cleaned"
+  ((seen))
+}
+
+# Return 0 when "$1" is an EFI binary the firmware executes on the way to the
+# kernel: a unified kernel image in EFI/Linux, systemd-boot in EFI/systemd,
+# or the fallback loader in EFI/BOOT. An unsigned one stops a Secure Boot
+# host from booting. The ESP may be mounted at /boot, /efi, or /boot/efi, and
+# FAT ignores case, so only the tail of the path is compared, case-folded.
+# /boot/vmlinuz-* is never part of this chain on a UKI host (the UKI embeds
+# its own kernel), so sbctl reporting it unsigned is expected and ignored.
+archup_boot_chain_file() {
+  case "${1,,}" in
+    */efi/linux/*.efi | */efi/systemd/systemd-boot*.efi | */efi/boot/boot*.efi) return 0 ;;
+  esac
+  return 1
+}
+
+# Fatal when sbctl tracks a boot-chain EFI binary that is no longer signed:
+# the upgrade replaced it (a new UKI, a systemd-boot update) and signing did
+# not follow, and the next boot would fail Secure Boot. Runs only where sbctl
+# is installed. Runs through sysup_scan_as_root because sbctl needs root to
+# read its keys and the ESP; an unprivileged --check-only run cannot verify
+# and says so instead of prompting.
+check_boot_signatures() {
+  local output listing status=0
+  local -a unsigned=()
+
+  command -v sbctl >/dev/null 2>&1 || return 0
+  sysup_log "checking Secure Boot signatures of boot-chain EFI images"
+  output="$(sysup_scan_as_root sbctl verify 2>&1)" || status=$?
+  if ! listing="$(archup_sbctl_unsigned <<<"$output")"; then
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    sysup_warn "could not verify Secure Boot signatures; sbctl verify reported no boot-chain results (status $status)"
+    return 0
+  fi
+  if [[ -n "$listing" ]]; then
+    mapfile -t unsigned <<<"$listing"
+    printf '%s\n' "$output"
+    printf '\nerror: sbctl reports unsigned boot-chain EFI images; verify Secure Boot before rebooting:\n' >&2
+    printf '  %s\n' "${unsigned[@]}" >&2
+    return 1
+  fi
+  if ((status != 0)); then
+    sysup_warn "sbctl verify exited with status $status; Secure Boot signatures are only partly verified"
+    return 0
+  fi
+  printf 'ok: sbctl reports the checked boot-chain EFI images signed\n'
+}
+
 sysup_backend_checks() {
   local status=0
 
   check_package_database || status=1
   scan_missing_libs || status=$?
+  check_boot_signatures || status=1
   # Advisory: pending config merges and a pending reboot are expected output
   # from a successful upgrade, so neither changes the exit status.
   report_pending_pacman_configs
@@ -688,7 +857,7 @@ sysup_backend_autoremove() {
     # Only a removal that cannot run fails the run; a listing is advisory,
     # matching debup's report.
     if [[ "$mode" == report ]]; then
-      printf 'warning: could not list orphaned packages\n' >&2
+      sysup_warn 'could not list orphaned packages'
       return 0
     fi
     printf 'error: could not list orphaned packages\n' >&2
@@ -734,11 +903,106 @@ sysup_backend_autoremove() {
   return 1
 }
 
+# pacman and yay take --exclude names through --ignore, as one comma-joined
+# token. yay applies it to AUR upgrades too.
+sysup_backend_exclude() {
+  ARCHUP_EXCLUDES=("$@")
+}
+
+# Return 0 when package "$1" matches an --exclude name. Each name is a glob,
+# as pacman treats --ignore entries.
+archup_excluded() {
+  local pattern
+
+  for pattern in "${ARCHUP_EXCLUDES[@]+"${ARCHUP_EXCLUDES[@]}"}"; do
+    # shellcheck disable=SC2053 # deliberately unquoted: a glob match.
+    [[ "$1" == $pattern ]] && return 0
+  done
+  return 1
+}
+
+# Print "<name> <installed> -> <available>" for each excluded package the sync
+# databases offer a newer version of. They were synced by this run's -Syu, so
+# no network access is needed. Like foreign_packages, pacman exits 1 both for
+# "nothing to upgrade" and on errors, so only an `error:` line marks failure.
+# pacman appends " [ignored]" to IgnorePkg entries, so a fifth field is
+# accepted; anything else unexpected fails rather than guessing.
+archup_excluded_pending() {
+  local errors error_text output status=0 name old arrow new marker
+
+  errors=$(mktemp) || return 2
+  output=$(LC_ALL=C pacman -Qu 2>"$errors") || status=$?
+  error_text=$(<"$errors")
+  rm -f "$errors"
+  [[ -z "$error_text" ]] || printf '%s\n' "$error_text" >&2
+  if ((status > 1)) || { ((status == 1)) &&
+    { [[ -n "$output" ]] || [[ $'\n'"$error_text" == *$'\n'error:* ]]; }; }; then
+    return 2
+  fi
+  while read -r name old arrow new marker _; do
+    [[ -n "${name:-}" ]] || continue
+    [[ "${arrow:-}" == '->' && -n "${new:-}" ]] || return 2
+    [[ -z "${marker:-}" || "$marker" == '[ignored]' ]] || return 2
+    archup_excluded "$name" || continue
+    printf '%s %s -> %s\n' "$name" "$old" "$new"
+  done <<<"$output"
+}
+
+# Name the excluded packages that still have updates, so a standing exclusion
+# never hides how far behind they fall. Each is an `excluded-pending` notice,
+# which --cron alone does not mail about: it is the expected state while the
+# exclusion stands. Advisory: a failed query is a warning.
+report_excluded_pending() {
+  local listing line
+  local -a pending=()
+
+  ((${#ARCHUP_EXCLUDES[@]})) || return 0
+  if ! listing="$(archup_excluded_pending)"; then
+    sysup_warn 'could not list pending updates for excluded packages'
+    return 0
+  fi
+  [[ -n "$listing" ]] || return 0
+  mapfile -t pending <<<"$listing"
+  sysup_log "excluded packages with pending updates (${#pending[@]})"
+  printf '  %s\n' "${pending[@]}"
+  for line in "${pending[@]}"; do
+    sysup_notice excluded-pending "$line"
+  done
+}
+
+# Run the upgrade, then the steps that judge it as a whole: build-user
+# cleanup, failed install hooks, and excluded packages left behind.
+#
+# A failed hook (an initramfs or UKI that was not rebuilt, an image sbctl did
+# not sign) fails the upgrade even though pacman exited 0: the boot chain may
+# be broken, and like any failed upgrade it skips automatic cleanup.
 sysup_backend_upgrade() {
-  local confirmation_arg=--noconfirm arg
-  local -a upgrade_args=()
+  local status=0 capture
+
+  capture=$(mktemp -d) || return
+  if ! mkfifo -m 0600 -- "$capture/stderr.fifo"; then
+    rmdir -- "$capture"
+    return 1
+  fi
+  ARCHUP_PM_ERRORS="$capture/stderr.log"
+  archup_upgrade "$@" || status=$?
+  archup_stop_build_agents
+  if archup_hook_failed; then
+    printf '\nerror: an install script or package hook failed during the upgrade (pacman: "command failed to execute correctly"); the initramfs, unified kernel image, or Secure Boot signatures may be stale\n' >&2
+    ((status != 0)) || status=1
+  fi
+  rm -f -- "$ARCHUP_PM_ERRORS" "$capture/stderr.fifo"
+  rmdir -- "$capture"
+  ARCHUP_PM_ERRORS=""
+  report_excluded_pending
+  return "$status"
+}
+
+archup_upgrade() {
+  local confirmation_arg=--noconfirm arg pkg
+  local -a upgrade_args=() ignore_args=()
   local -a yay_install_args=()
-  local -a broken_packages=()
+  local -a broken_packages=() excluded_broken=()
   local -a rebuild_targets=()
   local broken_output="" rebuild_output=""
   local scan_status=0 rebuild_status=0 repo_only=0
@@ -754,6 +1018,14 @@ sysup_backend_upgrade() {
   done
   upgrade_args=("$confirmation_arg" "${upgrade_args[@]}")
   ARCHUP_CONFIRMATION_ARG="$confirmation_arg"
+  # Pass --ignore to the upgrade and rebuild so yay also sees these exclusions
+  # when resolving dependencies. The explicit rebuild targets are filtered below.
+  if ((${#ARCHUP_EXCLUDES[@]})); then
+    ignore_args=("--ignore=$(
+      IFS=,
+      printf '%s' "${ARCHUP_EXCLUDES[*]}"
+    )")
+  fi
 
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
 
@@ -768,12 +1040,13 @@ sysup_backend_upgrade() {
     # must never build as root. Failing the whole run would leave repository
     # packages (and their security fixes) unapplied as well, so upgrade those
     # and say plainly that AUR packages were left alone.
-    printf 'warning: running as root with no non-root AUR user (set SYSUP_ARCH_USER); skipping AUR packages because yay must not build as root\n' >&2
+    sysup_warn 'running as root with no non-root AUR user (set SYSUP_ARCH_USER); skipping AUR packages because yay must not build as root'
     sysup_log "upgrading repository packages only"
     repo_only=1
   fi
   if ((repo_only)); then
-    sysup_run_as_root pacman -Syu "${upgrade_args[@]}"
+    archup_run_captured sysup_run_as_root pacman -Syu \
+      "${ignore_args[@]+"${ignore_args[@]}"}" "${upgrade_args[@]}"
     return
   fi
 
@@ -789,20 +1062,34 @@ sysup_backend_upgrade() {
   fi
 
   archup_prepare_yay || return
-  archup_run_yay -Syu --devel \
-    "${yay_install_args[@]+"${yay_install_args[@]}"}" "${upgrade_args[@]}" || return
+  archup_run_captured archup_run_yay -Syu --devel \
+    "${yay_install_args[@]+"${yay_install_args[@]}"}" \
+    "${ignore_args[@]+"${ignore_args[@]}"}" "${upgrade_args[@]}" || return
 
   broken_output="$(broken_foreign_packages)" || scan_status=$?
   if ((scan_status != 0)); then
-    printf 'warning: automatic AUR rebuild scan was incomplete; continuing to post-upgrade checks\n' >&2
+    sysup_warn 'automatic AUR rebuild scan was incomplete; continuing to post-upgrade checks'
     warn_non_aur_foreign_packages
     return 0
   fi
+  # An excluded package stays as installed, so it is not rebuilt either; the
+  # missing-library check still reports it.
   if [[ -n "$broken_output" ]]; then
-    mapfile -t broken_packages <<<"$broken_output"
+    while IFS= read -r pkg; do
+      if archup_excluded "$pkg"; then
+        excluded_broken+=("$pkg")
+      else
+        broken_packages+=("$pkg")
+      fi
+    done <<<"$broken_output"
+  fi
+  if ((${#excluded_broken[@]})); then
+    printf 'note: not rebuilding excluded packages with missing libraries: %s\n' \
+      "${excluded_broken[*]}"
   fi
   if ((${#broken_packages[@]} == 0)); then
-    sysup_log "no broken foreign package libraries found after upgrade"
+    ((${#excluded_broken[@]})) ||
+      sysup_log "no broken foreign package libraries found after upgrade"
     warn_non_aur_foreign_packages
     return
   fi
@@ -819,8 +1106,9 @@ sysup_backend_upgrade() {
     # driver's best-effort failure path restarts any service that did change.
     # Restarting an untouched active service is the safe conservative case.
     SYSUP_EXTRA_UPGRADED_PACKAGES+=("${rebuild_targets[@]}")
-    archup_run_yay -S --aur --rebuild --redownload --answerclean All \
+    archup_run_captured archup_run_yay -S --aur --rebuild --redownload --answerclean All \
       "${yay_install_args[@]+"${yay_install_args[@]}"}" \
+      "${ignore_args[@]+"${ignore_args[@]}"}" \
       "${upgrade_args[@]}" "${rebuild_targets[@]}" || return
   elif ((rebuild_status == 0)); then
     sysup_log "broken foreign packages are not available in AUR"
