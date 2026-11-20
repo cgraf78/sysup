@@ -9,7 +9,7 @@
 #   1. --check-only as root
 #   2. a full upgrade as root (whatever the image is behind on)
 #   3. a full run as a non-root user through sudo
-#   4. --check-only again, which must still be clean afterwards
+#   4. --cron --check-only, which must record success and no package changes
 #
 # Every step must exit 0. It needs Docker with privileged containers, which
 # GitHub's Ubuntu runners provide, or rootless Podman for local runs

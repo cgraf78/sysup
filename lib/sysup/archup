@@ -167,6 +167,17 @@ archup_run_yay() {
   sudo -u "$user" -H -- yay "$@"
 }
 
+# Unlike pacman, yay waits for db.lck to disappear even when no process has
+# it open. Check before each unattended mutation so a stale file cannot leave
+# sysup indefinitely holding its cron lock and shutdown inhibitor.
+archup_check_yay_lock() {
+  if ((_SYSUP_CRON)) && [[ -e "$ARCHUP_DB_LOCK" ]]; then
+    printf 'error: pacman database lock %s is still present; verify no package manager is running and investigate the lock before retrying\n' \
+      "$ARCHUP_DB_LOCK" >&2
+    return 1
+  fi
+}
+
 archup_loaded_nvidia_version() {
   local version_file="${ARCHUP_NVIDIA_VERSION_FILE:-/proc/driver/nvidia/version}"
 
@@ -260,12 +271,13 @@ Default flow:
   9. report failed systemd units when systemd is available
 
 Options:
-  --exclude=PKG[,PKG...]          leave these packages (globs allowed) at their
-                                  installed version for this run, through
-                                  --ignore, and skip rebuilding or removing them;
-                                  repeatable. Unlike arguments after --, it
-                                  keeps automatic cleanup. Excluded packages
-                                  that still have updates are listed after
+  --exclude=PKG[,PKG...]          filter these packages with --ignore (globs
+                                  allowed), and skip rebuilding or removing
+                                  them. Repeatable. Automatic cleanup still
+                                  runs for other packages. In cron mode,
+                                  pacman declines ignored dependency targets
+                                  and sysup rejects a forwarded --ask override.
+                                  Pending excluded updates are listed after
                                   the upgrade.
 EOF
   sysup_usage_common_options
@@ -1013,6 +1025,13 @@ archup_upgrade() {
   for arg in "$@"; do
     case "$arg" in
       --confirm | --noconfirm) confirmation_arg="$arg" ;;
+      --ask | --ask=*)
+        if ((_SYSUP_CRON && ${#ARCHUP_EXCLUDES[@]})); then
+          printf 'error: --ask cannot be forwarded with --cron and --exclude\n' >&2
+          return 2
+        fi
+        upgrade_args+=("$arg")
+        ;;
       *) upgrade_args+=("$arg") ;;
     esac
   done
@@ -1025,6 +1044,12 @@ archup_upgrade() {
       IFS=,
       printf '%s' "${ARCHUP_EXCLUDES[*]}"
     )")
+    if ((_SYSUP_CRON)); then
+      # yay can pass an ignored dependency as an explicit pacman target.
+      # Flip only ALPM_QUESTION_INSTALL_IGNOREPKG (bit 1) so pacman's
+      # unattended answer to that question is no.
+      ignore_args+=(--ask=1)
+    fi
   fi
 
   SYSUP_EXTRA_UPGRADED_PACKAGES=()
@@ -1062,6 +1087,7 @@ archup_upgrade() {
   fi
 
   archup_prepare_yay || return
+  archup_check_yay_lock || return
   archup_run_captured archup_run_yay -Syu --devel \
     "${yay_install_args[@]+"${yay_install_args[@]}"}" \
     "${ignore_args[@]+"${ignore_args[@]}"}" "${upgrade_args[@]}" || return
@@ -1099,6 +1125,7 @@ archup_upgrade() {
     mapfile -t rebuild_targets <<<"$rebuild_output"
   fi
   if ((${#rebuild_targets[@]})); then
+    archup_check_yay_lock || return
     sysup_log "rebuilding broken AUR packages (${#rebuild_targets[@]})"
     printf '  %s\n' "${rebuild_targets[@]}"
     # yay can install one target and fail later (another target or a hook).

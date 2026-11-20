@@ -516,7 +516,11 @@ sysup_backend_upgrade() {
 
   if [[ "$DEBUP_UPGRADE_VERB" == upgrade ]]; then
     sysup_apt_upgrade debup_apt_get -y "${extra_args[@]+"${extra_args[@]}"}" || return
-    report_kept_back
+    # Forwarded options may change APT's root or prevent installation. In
+    # either case default-host updates say nothing about what was kept back.
+    if ((${#extra_args[@]} == 0)); then
+      report_kept_back
+    fi
   else
     debup_apt_get full-upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
   fi

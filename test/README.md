@@ -56,7 +56,8 @@ The suites above prove sysup agrees with its fixtures, not with the real tools.
 sudo, and sysup's tool dependencies into a stock distribution image (without
 upgrading anything else), and the runner boots it with systemd as PID 1. It
 then runs `sysup --check-only` and a full upgrade as root, a full run as a
-non-root user through sudo, and `--check-only` again; every step must exit 0.
+non-root user through sudo, and `--cron --check-only`. The last run must
+record `status=0` and `changed=no` and write a log. Every step must exit 0.
 
 ```bash
 test/e2e/distro-run docker.io/library/debian:stable
