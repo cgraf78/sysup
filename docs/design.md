@@ -45,7 +45,8 @@ lib/sysup/
   zypup        private openSUSE/SLES backend
   detect.sh    OS family vocabulary and detection
   rpm.sh       rpm snapshot, package files, and conffile scan for dnfup/zypup
-  common.sh    logging, privilege, package-diff, and the shared run driver
+  common.sh    logging, notices, privilege, package-diff, the shared run
+               driver, and unattended --cron runs
   systemd.sh   failed units and service restarts for upgraded packages
 ```
 
@@ -71,10 +72,11 @@ Optional hooks, with defaults in `common.sh`:
 | Hook | Default | Override |
 | --- | --- | --- |
 | `sysup_backend_parse_arg <arg>` | unhandled (sysup rejects the argument with status 2) | `debup` adds `--full-upgrade` |
+| `sysup_backend_exclude <pkg...>` | reject with status 2 (`debup`, `zypup`) | `archup` passes `--ignore=a,b` to the upgrade and skips rebuilding excluded packages; `dnfup` passes `--exclude=a,b` |
 | `sysup_backend_preamble` | no-op | `archup` lists foreign packages and `IgnorePkg`/`IgnoreGroup` entries; `debup` lists held packages; `dnfup` lists versionlocked and excluded packages; `zypup` lists package locks |
 | `sysup_backend_autoremove_safe <args...>` | allow no forwarded arguments | `archup` also allows `--confirm` and `--noconfirm` |
 | `sysup_backend_autoremove <apply\|report>` | no-op | `archup` removes `pacman -Qdtq` orphans; `debup` runs `apt-get --purge autoremove`; `dnfup` runs `dnf autoremove -y` and reports `dnf repoquery --unneeded`; `zypup` only lists `zypper packages --unneeded`, in both modes |
-| `sysup_backend_checks` | no-op | family-specific post-upgrade verification |
+| `sysup_backend_checks <check-only>` | no-op | family-specific verification; `1` when no upgrade was requested, otherwise `0` |
 | `sysup_backend_check_service_restart <unit>` | allow every restart | `archup` defers `nvidia-persistenced` while the loaded NVIDIA driver differs from the installed one or the running kernel's module tree was replaced, and reports it unverified when either version cannot otherwise be read |
 | `sysup_backend_restart_services <pkg...>` | shared systemd restart | `debup` prefers `needrestart` |
 
@@ -89,15 +91,47 @@ Backends set `SYSUP_BACKEND_NAME` for user-facing messages and may append to
 `SYSUP_EXTRA_UPGRADED_PACKAGES` for packages a version diff cannot detect
 (`archup` rebuilds AUR packages at an unchanged version).
 
-Hooks take single-token flags only. A flag needing its own argument would
-require extending the parser contract.
+Flags are single tokens. A flag that needs a value carries it in the same
+token after `=` (`--exclude=a,b`); a separate value word would require
+extending the parser contract.
+
+`sysup_backend_exclude` receives every `--exclude` name once, before
+`sysup_backend_require` and anything else runs. The driver validates the
+names (package-name characters plus the `*` and `?` globs, never a leading
+`-`), and an empty name, a stray comma, or a bare `--exclude` is a usage
+error. Exclusions never travel through the `--` arguments, so
+`sysup_backend_autoremove_safe` still sees none and cleanup still runs after a
+clean upgrade.
+
+### Notices
+
+`sysup_notice <kind> <message>` records a structured notice and prints
+nothing; each call site keeps printing its own text. `sysup_warn <message>`
+prints `warning: <message>` on stderr and records a `warning` notice. The
+kinds, owned by `SYSUP_NOTICE_KINDS` in `common.sh`:
+
+| Kind | Recorded for |
+| --- | --- |
+| `reboot-required` | each backend's reboot-required report |
+| `config-merge` | pending `.pacnew`/`.pacsave`, `.rpmnew`/`.rpmsave`/`.rpmorig`, and `.dpkg-dist`/`.dpkg-new`/`.ucf-dist` files |
+| `deferred-restart` | a restart deferred by the shared path or a backend's restart policy, and every deferred-restart reminder |
+| `excluded-pending` | `archup`: an excluded package the sync database still has an update for |
+| `kept-back` | `debup`: packages `upgrade --with-new-pkgs` left that a full-upgrade would upgrade |
+| `warning` | every `sysup_warn` |
+
+An unknown kind returns 2. Notices are appended, one `kind<TAB>message` line
+each, to the file in `_SYSUP_NOTICE_FILE`; a file rather than a shell array
+because reports also run inside command substitutions. Outside `--cron`
+nothing sets it and notices are not kept. Policy reads kinds, never message
+text.
 
 ### Run sequence
 
 1. Parse shared flags. Arguments after `--` go to the package manager; any
    other argument the backend does not claim is rejected with status 2
    before anything runs, so a mistyped option cannot reach the package
-   manager.
+   manager. `--cron` is taken out first by `sysup_main` (below), and
+   `--exclude` names go to `sysup_backend_exclude`.
 2. `sysup_backend_require`, then `sysup_backend_preamble`.
 3. Unless `--check-only`: snapshot packages, warm `sudo`, upgrade, remove
    unused packages, snapshot again, and diff to get the upgraded set.
@@ -124,8 +158,11 @@ require extending the parser contract.
    longer list its files. Its failure fails the run without skipping later
    steps. Custom package-manager arguments skip cleanup because they can
    select non-install modes or another package database; only Arch confirmation
-   flags are safe to share with removal.
-4. `sysup_backend_checks`.
+   flags are safe to share with removal. Under `--cron`, the upgrade and the
+   removal run under a shutdown inhibitor. Any difference between the two
+   snapshots (an install, a removal, or a version change) marks the run as
+   having changed packages.
+4. `sysup_backend_checks <check-only>`.
 5. Restart affected services unless `--no-restart-upgraded-services`. The
    shared fallback maps upgraded package files to active units; Debian instead
    prefers `needrestart`'s runtime deleted-file analysis when available, which
@@ -151,6 +188,54 @@ failure: an upgrade can install some packages before returning nonzero. The
 driver re-snapshots best-effort, restarts services for anything it can prove
 changed, reports unverified discovery explicitly, and preserves the original
 package-manager status.
+
+### Unattended runs (`--cron`)
+
+`sysup_main` removes `--cron` from the words before `--` and runs the rest
+through `_sysup_cron`; with `--help` it prints help directly instead. In order:
+
+1. Non-root (`sysup_is_root`, replaceable for tests) exits 2 before anything
+   else runs.
+2. When `SYSUP_SHUTDOWN_SCHEDULED_FILE` (`/run/systemd/shutdown/scheduled`)
+   exists, it prints one line and exits 0.
+3. It creates `SYSUP_RUN_DIR` (`/run/sysup`, 0755, refused when it or the
+   lock is a symlink) and takes `flock -n` on `cron.lock`. When another run
+   holds it, it prints one line and exits 75 (`EX_TEMPFAIL`). The lock is
+   best effort: only `--cron` runs take it, and children inherit its
+   descriptor. A normal exit explicitly unlocks it, but if sysup is killed,
+   a child can hold the lock until it exits. The package managers' own locks
+   still guard against overlap with an interactive run.
+4. The shared run executes with stdin from `/dev/null` and stdout and stderr
+   buffered in one file under the run directory. When systemd is running and
+   `systemd-inhibit` exists, the upgrade and the removal step run under
+   `systemd-inhibit --what=shutdown --who=sysup --mode=block`. It wraps a
+   watcher that signals when the inhibitor is held and exits within seconds
+   of the sysup shell. The upgrade waits for that signal and fails before
+   changing packages if the inhibitor cannot be acquired. The cron lock
+   descriptor is closed for the watcher.
+5. The buffer is printed only when the exit status is non-zero, the package
+   snapshots differ, `SYSUP_EXTRA_UPGRADED_PACKAGES` is non-empty, or any
+   notice other than `excluded-pending` was recorded
+   (`sysup_cron_should_report`). An excluded package with an update is the
+   expected state while the exclusion stands, so it alone stays silent.
+6. The log is kept as root-only `SYSUP_STATE_DIR/last-cron.log`, and
+   `SYSUP_STATE_DIR/last-cron` holds `time=<epoch>`, `status=<n>`, and
+   `changed=yes|no`, each replaced by a rename. A failure to write them is a
+   warning printed outside the buffer.
+
+The exit status is the shared run's, unchanged.
+
+### Library loading and in-place updates
+
+An install can be replaced while a run is in progress: shdeps or `dot update`
+pulling a new checkout during a long AUR build. git and shdeps replace files
+by unlink and rename, so a running bash keeps reading the file it opened.
+`sysup` therefore relies on an invariant instead of copying itself to a
+snapshot: every library file is sourced at the top level while the backend
+loads, before the first mutation; no function sources a library or resolves
+a library path later; and each backend's `sysup_main` call is its last
+statement, so bash parses nothing after it from a replaced file.
+`sysup-test` fails when a backend or library breaks this.
 
 ### Lock waits
 
@@ -189,7 +274,8 @@ record. Each line holds the kernel `boot_id`, the unit, and the unit's
 deferred but not recorded: it is a oneshot with no code left running.
 
 Every run reads the record, including `--check-only`, and prints one
-`reboot recommended: ...` line on stderr while any entry still applies. An
+`reboot recommended: ...` line on stderr, with a `deferred-restart` notice,
+while any entry still applies. An
 entry is spent once `boot_id` changes, the unit is inactive or failed (stopped
 or removed), or its activation timestamp changes (restarted manually).
 Transient states such as `reloading` still count as running. When
@@ -241,7 +327,28 @@ any package manager starts. When
 no user is named at all (both unset, or `SUDO_USER=root` from sudo in a
 root shell),
 `archup` warns that AUR packages are skipped and upgrades repository packages
-with `pacman -Syu` rather than failing the whole upgrade.
+with `pacman -Syu` rather than failing the whole upgrade. After the yay steps
+of a cron run with an explicit `SYSUP_ARCH_USER`,
+`sudo -u <user> -H -- gpgconf --kill all` stops the build user's `gpg-agent`
+and `keyboxd`, best effort: nothing else ends them for a service account.
+
+`--exclude` names become one `--ignore=a,b` argument to `yay -Syu` or the
+`pacman -Syu` fallback (yay applies it to AUR upgrades too). The AUR rebuild
+also passes `--ignore` for dependency resolution and drops explicit excluded
+targets. Orphan cleanup skips excluded packages while still removing other
+orphans. All three stages use pacman's glob matching. The preamble lists them
+in the ignored-packages section marked `(--exclude)`. After the upgrade, `pacman -Qu` against the
+just-synced database lists excluded packages that still have updates, each
+an `excluded-pending` notice; a failed query is a warning.
+
+pacman exits 0 when an install scriptlet or ALPM hook fails. The upgrade's
+stderr is therefore copied (through `tee`, keeping it live and the command in
+the running shell) and matched, color sequences stripped, against the whole
+line `error: command failed to execute correctly`; a match fails the upgrade
+step and so also skips cleanup. Other `error:` lines, such as a mirror
+failing over to the next, do not match. The match uses pacman's English
+wording, so a translated message locale hides it and only the sbctl check
+below remains.
 
 The missing-library scan runs `file -N -r -0 -f -` once per foreign package,
 feeding names on stdin so a large package cannot exceed the argument limit.
@@ -256,6 +363,7 @@ Checks:
 | --- | --- |
 | Package database consistency (`pacman -Dk`) | fatal |
 | Missing shared libraries in foreign packages | fatal |
+| Unsigned boot-chain EFI images (`sbctl verify`, when installed) | fatal; unverifiable is advisory |
 | Pending `.pacnew`/`.pacsave` merges (`pacdiff --output`) | advisory |
 | Reboot required (`/usr/lib/modules/$(uname -r)/kernel` missing) | advisory |
 | Failed systemd units | fatal |
@@ -268,6 +376,16 @@ remain in it. A missing modules root (a container running the host's kernel) or 
 unavailable or empty release reports reboot state as unknown rather than
 required.
 
+The Secure Boot check runs `sbctl verify` through `sysup_scan_as_root` (sbctl
+needs root) and reads only its verdict lines, `✓ <path> is signed` and
+`✗ <path> is not signed`. An unsigned path ending in `EFI/Linux/*.efi`,
+`EFI/systemd/*.efi`, or `EFI/BOOT/*.efi`, compared case-folded because the ESP
+is FAT and may be mounted at `/boot`, `/efi`, or `/boot/efi`, fails the run:
+the firmware would refuse to boot it. Other unsigned files are ignored, in
+particular `/boot/vmlinuz-*`, which a UKI host never boots directly. Output
+with no verdict line (an unprivileged run, a changed format) is a warning
+rather than "all signed".
+
 ## `debup` behavior
 
 Upgrade, as root, with `DEBIAN_FRONTEND=noninteractive`:
@@ -277,6 +395,11 @@ Upgrade, as root, with `DEBIAN_FRONTEND=noninteractive`:
   bumps land, but never removes a package. `--full-upgrade` opts into
   `full-upgrade`, which permits removals to resolve dependencies. Neither crosses
   an OS release.
+- after the default verb, an unprivileged `apt-get --simulate full-upgrade`,
+  whose `Inst <pkg> [<installed>]` records (untranslated pkgSimulate output)
+  name the packages the upgrade kept back; they are listed and recorded as a
+  `kept-back` notice. Holds and phasing apply to full-upgrade too, so neither
+  shows up. A failed query is a warning.
 - `apt-get autoclean -y`, advisory — a failure to reclaim the cache must not
   cancel the checks and restarts that make the upgrade safe.
 - `apt-get --purge autoremove -y`, through the shared autoremove step above;
@@ -288,6 +411,9 @@ replaces a locally modified config file. `NEEDRESTART_MODE=l` keeps
 itself afterward with `needrestart -r a` under the noninteractive debconf
 frontend, so its kernel and microcode pending-reboot notices print instead of
 waiting for a keypress on a terminal.
+In cron mode, a batch, list-only scan after automatic restarts records any
+services that still need a restart. Cron check-only runs do the same scan
+without restarting any services.
 
 The package snapshot keeps rows whose dpkg desired state is install (`i`) or
 hold (`h`) and whose current state is not `n` (not installed) or `c` (config
@@ -350,7 +476,9 @@ Upgrade, as root:
   keeps the file open after releasing the lock, so it counts as held only
   while `/proc/locks` also shows a write lock on its inode; an idle daemon
   with the file open never delays the upgrade.
-- `dnf upgrade --refresh -y`, forwarding extra arguments. dnf never prompts
+- `dnf upgrade --refresh -y`, with `--exclude=a,b` for `sysup --exclude`
+  (both dnf generations accept the comma list; the preamble lists the names
+  marked `(--exclude)`), forwarding extra arguments. dnf never prompts
   about config files; it writes `.rpmnew`/`.rpmsave` instead, which the checks
   report. Fedora's default `best=False` lets dnf skip a package whose
   dependencies cannot be met and still exit 0; RHEL's `best=True` fails
@@ -483,16 +611,22 @@ which is reported as unknown rather than as a reboot.
 ## Testing
 
 - `common-test` drives the shared driver with a fake backend: argument
-  rejection, the sudo keeper's lifecycle, lock waits, and root config scans.
+  rejection, `--exclude` parsing and the default rejection, notices, the sudo
+  keeper's lifecycle, lock waits, root config scans, and `--cron` (root
+  check, scheduled shutdown, the busy lock against a background holder, the
+  shutdown inhibitor, stdin, every print condition, and the state files).
 - `archup-test` covers the extracted shared hooks, AUR decisions and the root
   build-user policy, orphan removal, batched library scanning, the reboot
-  check, package diffs, service restarts, and partial failures.
+  check, package diffs, service restarts, partial failures, `--ignore` and
+  rebuild filtering for `--exclude`, excluded-pending updates, failed install
+  hooks, build-user agent cleanup, and `sbctl verify` parsing from fixtures.
 - `debup-test` mocks `apt-get`, `dpkg`, `dpkg-query`, and `systemctl` to cover
-  the upgrade verb, default autoremove and its opt-out, each check, and
-  `needrestart` preference.
+  the upgrade verb, default autoremove and its opt-out, each check,
+  `needrestart` preference, kept-back packages, and the `--exclude`
+  rejection.
 - `dnfup-test` mocks `dnf`, `rpm`, and `systemctl` to cover the upgrade and
-  autoremove policy, versionlocked and excluded packages, the rpm lock wait,
-  multilib, installonly, and signing-key snapshots, each
+  autoremove policy, versionlocked and excluded packages, `--exclude`, the
+  rpm lock wait, multilib, installonly, and signing-key snapshots, each
   check, and the image-based, yum-only, and family guards.
 - `test/e2e/distro-run` boots a stock image of each supported family with
   systemd as PID 1 and runs the real `sysup` (check-only, upgrade as root,
@@ -500,8 +634,9 @@ which is reported as unknown rather than as a reboot.
   It is the only test that does not mock them, and CI runs it per family.
 - `zypup-test` mocks `zypper`, `rpm`, `sudo`, and `systemctl` to cover the
   per-release verb, refresh ordering, lock timeout, informational exit codes,
-  the unneeded listing that never removes, package locks, each check, and the
-  transactional and family guards.
+  the unneeded listing that never removes, package locks, each check, the
+  transactional and family guards, and the `--exclude` rejection.
 - `sysup-test` covers family detection from fixture `os-release` files,
   symlink-aware dispatch to the private backend, exact argument forwarding,
-  portability constraints, and the installation layout.
+  portability constraints, the installation layout, and the load-time
+  library sourcing invariant.

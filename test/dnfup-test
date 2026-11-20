@@ -749,4 +749,39 @@ _assert_contains "dnfup main: names the host it refused" \
 _assert_eq "dnfup main: runs no dnf command on the wrong family" \
   "" "$(cat "$DNFUP_DNF_LOG")"
 
+echo ""
+echo "=== dnfup: --exclude and notices ==="
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_dnfup_main --exclude=kernel-core,'gpu-*' --exclude=lib-b
+dnf_log=$(cat "$DNFUP_DNF_LOG")
+_assert_eq "dnfup exclude: succeeds (output: $DNFUP_RESULT)" "0" "$DNFUP_STATUS"
+_assert_contains "dnfup exclude: maps to one comma-joined dnf --exclude" \
+  "upgrade --refresh -y --exclude=kernel-core,gpu-*,lib-b" "$dnf_log"
+_assert_contains "dnfup exclude: automatic cleanup still runs" \
+  "autoremove -y" "$dnf_log"
+_assert_contains "dnfup exclude: the preamble lists this run's exclusions" \
+  $'versionlocked and excluded packages (3)\n  kernel-core (--exclude)\n  gpu-* (--exclude)\n  lib-b (--exclude)' \
+  "$DNFUP_RESULT"
+
+_dnfup_reset
+DNFUP_MOCK_INSTALLED="base.x86_64 0:1.0-1"
+_dnfup_main
+_assert_not_contains "dnfup exclude: no exclusion passes no --exclude" \
+  "--exclude" "$(cat "$DNFUP_DNF_LOG")"
+
+_dnfup_reset
+dnfup_notices=$(_tmpfile)
+_SYSUP_NOTICE_FILE="$dnfup_notices"
+DNFUP_MOCK_REBOOT_STATUS=1
+: >"$DNFUP_FIXTURE_ETC/app.conf.rpmnew"
+result=$(report_pending_state 2>&1)
+_SYSUP_NOTICE_FILE=""
+_assert_contains "dnfup notices: the reboot report text is unchanged" \
+  "reboot required to complete this upgrade" "$result"
+_assert_eq "dnfup notices: reboot and rpmnew are recorded by kind" \
+  $'reboot-required\treboot required to complete this upgrade\nconfig-merge\t'"$DNFUP_FIXTURE_ETC/app.conf.rpmnew" \
+  "$(cat "$dnfup_notices")"
+
 _test_summary

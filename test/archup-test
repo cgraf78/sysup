@@ -70,6 +70,25 @@ _archup_mock_reset() {
   ARCHUP_YAY_AUR_QUERY_ERROR=""
   ARCHUP_HAS_YAY=1
   ARCHUP_HAS_PACDIFF=1
+  ARCHUP_HAS_SBCTL=0
+  ARCHUP_HAS_GPGCONF=1
+  ARCHUP_SBCTL_OUTPUT=""
+  ARCHUP_SBCTL_STATUS=0
+  ARCHUP_SBCTL_LOG="$ARCHUP_MOCK_ROOT/sbctl-commands.log"
+  ARCHUP_GPGCONF_LOG="$ARCHUP_MOCK_ROOT/gpgconf-commands.log"
+  : >"$ARCHUP_SBCTL_LOG"
+  : >"$ARCHUP_GPGCONF_LOG"
+  ARCHUP_PM_STDERR=""
+  ARCHUP_PENDING_UPDATES=""
+  ARCHUP_PENDING_STATUS=0
+  # shellcheck disable=SC2034 # Read by the sourced backend.
+  ARCHUP_EXCLUDES=()
+  # shellcheck disable=SC2034 # Read by the sourced backend.
+  ARCHUP_BUILD_USER=""
+  # shellcheck disable=SC2034 # Read by the sourced backend.
+  _SYSUP_CRON=0
+  _SYSUP_NOTICE_FILE="$ARCHUP_MOCK_ROOT/notices"
+  : >"$_SYSUP_NOTICE_FILE"
   ARCHUP_PACDIFF_OUTPUT=""
   ARCHUP_PACDIFF_STATUS=0
   ARCHUP_IS_ROOT=0
@@ -212,6 +231,16 @@ pacman() {
       ;;
     -Syu)
       printf '%s\n' "$*" >>"$ARCHUP_PACMAN_COMMAND_LOG"
+      [[ -z "$ARCHUP_PM_STDERR" ]] || printf '%s\n' "$ARCHUP_PM_STDERR" >&2
+      ;;
+    -Qu)
+      # Like real pacman, nothing to upgrade is a silent exit 1.
+      if ((ARCHUP_PENDING_STATUS != 0)); then
+        printf 'error: mock pending-update query failed\n' >&2
+        return "$ARCHUP_PENDING_STATUS"
+      fi
+      [[ -n "$ARCHUP_PENDING_UPDATES" ]] || return 1
+      printf '%s\n' "$ARCHUP_PENDING_UPDATES"
       ;;
     -Dk)
       printf '%s\n' "$*" >>"$ARCHUP_PACMAN_COMMAND_LOG"
@@ -269,8 +298,31 @@ command() {
     printf 'pacdiff\n'
     return 0
   fi
+  # Never the host's sbctl or gpgconf: the functions below stand in.
+  if [[ "${1:-}" == "-v" && "${2:-}" == sbctl ]]; then
+    ((ARCHUP_HAS_SBCTL != 0)) || return 1
+    printf 'sbctl\n'
+    return 0
+  fi
+  if [[ "${1:-}" == "-v" && "${2:-}" == gpgconf ]]; then
+    ((ARCHUP_HAS_GPGCONF != 0)) || return 1
+    printf 'gpgconf\n'
+    return 0
+  fi
 
   builtin command "$@"
+}
+
+# shellcheck disable=SC2329 # Exercised indirectly by the boot-signature check.
+sbctl() {
+  printf '%s\n' "$*" >>"$ARCHUP_SBCTL_LOG"
+  [[ -z "$ARCHUP_SBCTL_OUTPUT" ]] || printf '%s\n' "$ARCHUP_SBCTL_OUTPUT"
+  return "$ARCHUP_SBCTL_STATUS"
+}
+
+# shellcheck disable=SC2329 # Exercised indirectly by the build-agent cleanup.
+gpgconf() {
+  printf '%s\n' "$*" >>"$ARCHUP_GPGCONF_LOG"
 }
 
 # shellcheck disable=SC2329 # Exercised indirectly by the pending-config report.
@@ -292,6 +344,7 @@ id() {
   user="${1:-}"
   case "$user" in
     chris) printf '1000\n' ;;
+    aurbuild) printf '999\n' ;;
     root) printf '0\n' ;;
     *) return 1 ;;
   esac
@@ -312,6 +365,7 @@ yay() {
   fi
 
   if [[ "$1" == "-Syu" ]]; then
+    [[ -z "$ARCHUP_PM_STDERR" ]] || printf '%s\n' "$ARCHUP_PM_STDERR" >&2
     if ((ARCHUP_YAY_FAIL_UPGRADE != 0)); then
       return "$ARCHUP_YAY_FAIL_UPGRADE"
     fi
@@ -2439,5 +2493,403 @@ _assert_not_contains "archup main: does not claim the package diff failed" \
   "could not determine which packages changed" "$result"
 _assert_not_contains "archup main: does not claim the package list comparison failed" \
   "comparing the package list" "$result"
+
+echo ""
+echo "=== archup: --exclude ==="
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+sysup_backend_exclude kernel-pkg 'gpu-*'
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_contains "archup exclude: yay gets one comma-joined --ignore" \
+  "-Syu --devel --ignore=kernel-pkg,gpu-* --noconfirm" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_HAS_YAY=0
+sysup_backend_exclude kernel-pkg
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_eq "archup exclude: the pacman fallback gets --ignore too" \
+  "-Syu --ignore=kernel-pkg --noconfirm" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+# shellcheck disable=SC2119 # The sysup driver passes upgrade args; this call has none.
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_not_contains "archup exclude: no exclusion passes no --ignore" \
+  "--ignore" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+
+# Excluded packages are left as installed, so they are not rebuilt either.
+_archup_mock_reset
+_archup_mock_add_package gpu-driver 1 broken
+_archup_mock_add_package broken-tool 1 broken
+sysup_backend_exclude 'gpu-*'
+result=$(sysup_backend_upgrade 2>&1)
+yay_commands=$(cat "$ARCHUP_YAY_COMMAND_LOG")
+_assert_contains "archup exclude: other broken AUR packages still rebuild" \
+  "-S --aur --rebuild --redownload --answerclean All --ignore=gpu-* --noconfirm broken-tool" "$yay_commands"
+_assert_not_contains "archup exclude: a matching package is not rebuilt" \
+  "gpu-driver" "$(grep -e '--rebuild' <<<"$yay_commands" || true)"
+_assert_contains "archup exclude: says which broken packages it left alone" \
+  "not rebuilding excluded packages with missing libraries: gpu-driver" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package gpu-driver 1 broken
+sysup_backend_exclude gpu-driver
+result=$(sysup_backend_upgrade 2>&1)
+_assert_not_contains "archup exclude: only excluded broken packages starts no rebuild" \
+  "--rebuild" "$(cat "$ARCHUP_YAY_COMMAND_LOG")"
+_assert_not_contains "archup exclude: does not claim nothing is broken" \
+  "no broken foreign package libraries found" "$result"
+
+# The driver keeps exclusions out of the `--` arguments, so cleanup still runs.
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_ORPHANS=(old-dep)
+set +e
+result=$(sysup_main --exclude=kernel-pkg 2>&1)
+status=$?
+set -e
+_assert_eq "archup exclude: a run with an exclusion succeeds" "0" "$status"
+_assert_contains "archup exclude: orphan removal still runs" \
+  "-Rn --noconfirm -- old-dep" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+_assert_contains "archup exclude: the preamble lists it with the ignored packages" \
+  "  kernel-pkg (--exclude)" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package gpu-headers 0 ok
+ARCHUP_ORPHANS=(gpu-headers old-dep)
+ARCHUP_ORPHANS_NEXT=(gpu-headers)
+set +e
+result=$(sysup_main '--exclude=gpu-*' 2>&1)
+status=$?
+set -e
+_assert_eq "archup exclude: retained orphans do not prevent cleanup" "0" "$status"
+_assert_contains "archup exclude: cleanup removes only eligible orphans" \
+  "-Rn --noconfirm -- old-dep" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+_assert_not_contains "archup exclude: cleanup preserves excluded orphans" \
+  "gpu-headers" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IGNORE_PKG="pinned-lib"
+sysup_backend_exclude kernel-pkg
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "archup exclude: listed after pacman.conf's IgnorePkg" \
+  $'ignored packages (2)\n  pinned-lib\n  kernel-pkg (--exclude)' "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PACMAN_CONF_STATUS=1
+sysup_backend_exclude kernel-pkg
+result=$(sysup_backend_preamble 2>&1)
+_assert_contains "archup exclude: still listed when pacman.conf cannot be read" \
+  "  kernel-pkg (--exclude)" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PENDING_UPDATES=$'kernel-pkg 6.1-1 -> 6.2-1\ngpu-driver 550-1 -> 555-1\nother-lib 1.0-1 -> 1.1-1 [ignored]'
+sysup_backend_exclude kernel-pkg 'gpu-*'
+result=$(sysup_backend_upgrade 2>&1)
+_assert_contains "archup exclude: lists excluded packages that still have updates" \
+  $'excluded packages with pending updates (2)\n  kernel-pkg 6.1-1 -> 6.2-1\n  gpu-driver 550-1 -> 555-1' \
+  "$result"
+_assert_not_contains "archup exclude: other pending packages are not listed" \
+  "other-lib" "$result"
+_assert_eq "archup exclude: records an excluded-pending notice per package" \
+  $'excluded-pending\tkernel-pkg 6.1-1 -> 6.2-1\nexcluded-pending\tgpu-driver 550-1 -> 555-1' \
+  "$(cat "$_SYSUP_NOTICE_FILE")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+sysup_backend_exclude kernel-pkg
+result=$(sysup_backend_upgrade 2>&1)
+_assert_not_contains "archup exclude: no pending update lists nothing" \
+  "excluded packages with pending updates" "$result"
+_assert_eq "archup exclude: no pending update records nothing" \
+  "" "$(cat "$_SYSUP_NOTICE_FILE")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PENDING_STATUS=1
+sysup_backend_exclude kernel-pkg
+set +e
+result=$(sysup_backend_upgrade 2>&1)
+status=$?
+set -e
+_assert_eq "archup exclude: a failed pending query does not fail the upgrade" "0" "$status"
+_assert_contains "archup exclude: a failed pending query is a recorded warning" \
+  $'warning\tcould not list pending updates for excluded packages' "$(cat "$_SYSUP_NOTICE_FILE")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PENDING_UPDATES="kernel-pkg 6.1-1 6.2-1"
+sysup_backend_exclude kernel-pkg
+result=$(sysup_backend_upgrade 2>&1)
+_assert_contains "archup exclude: an unrecognized listing is a warning, not a guess" \
+  "could not list pending updates for excluded packages" "$result"
+
+echo ""
+echo "=== archup: failed install hooks ==="
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PM_STDERR=$'(4/5) Updating linux initcpios...\n\033[1;31merror:\033[0m command failed to execute correctly'
+set +e
+result=$(sysup_backend_upgrade 2>&1)
+status=$?
+set -e
+_assert_eq "archup hooks: a failed hook fails an upgrade pacman called successful" "1" "$status"
+_assert_contains "archup hooks: says the boot chain may be stale" \
+  "an install script or package hook failed during the upgrade" "$result"
+_assert_contains "archup hooks: the package manager's own stderr is still shown" \
+  "Updating linux initcpios" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_HAS_YAY=0
+ARCHUP_PM_STDERR="error: command failed to execute correctly"
+set +e
+sysup_backend_upgrade >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup hooks: the pacman fallback is checked too" "1" "$status"
+
+# A mirror failing over to the next prints `error:` and still succeeds.
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PM_STDERR="error: failed retrieving file 'core.db' from mirror.invalid : timeout"
+set +e
+sysup_backend_upgrade >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup hooks: other error lines are not hook failures" "0" "$status"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_PM_STDERR="error: command failed to execute correctly"
+ARCHUP_ORPHANS=(old-dep)
+set +e
+result=$(sysup_main 2>&1)
+status=$?
+set -e
+_assert_eq "archup hooks: the driver reports the failed upgrade" "1" "$status"
+_assert_not_contains "archup hooks: a failed hook skips orphan removal" \
+  "-Rn" "$(cat "$ARCHUP_PACMAN_COMMAND_LOG")"
+
+echo ""
+echo "=== archup: build user agents ==="
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SYSUP_ARCH_USER=aurbuild
+# shellcheck disable=SC2034 # Read by the sourced backend.
+_SYSUP_CRON=1
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_contains "archup agents: stops the build user's gpg agents after yay" \
+  "-u aurbuild -H -- gpgconf --kill all" "$(cat "$ARCHUP_SUDO_COMMAND_LOG")"
+_assert_eq "archup agents: kills every gpg component once" \
+  "--kill all" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SYSUP_ARCH_USER=aurbuild
+# shellcheck disable=SC2034 # Read by the sourced backend.
+_SYSUP_CRON=1
+ARCHUP_YAY_FAIL_UPGRADE=1
+sysup_backend_upgrade >/dev/null 2>&1 || true
+_assert_eq "archup agents: stopped after a failed yay run too" \
+  "--kill all" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+# shellcheck disable=SC2119 # The sysup driver passes upgrade args; this call has none.
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_eq "archup agents: a non-root user's own agents are left alone" \
+  "" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SUDO_USER=chris
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_eq "archup agents: sudo sysup preserves the invoking user's agents" \
+  "" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SYSUP_ARCH_USER=chris
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_eq "archup agents: a manual run preserves the explicitly selected user's agents" \
+  "" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SUDO_USER=chris
+# shellcheck disable=SC2034 # Read by the sourced backend.
+_SYSUP_CRON=1
+sysup_backend_upgrade >/dev/null 2>&1
+_assert_eq "archup agents: a cron run without a dedicated build user preserves the invoking user's agents" \
+  "" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SYSUP_ARCH_USER=aurbuild
+# shellcheck disable=SC2034 # Read by the sourced backend.
+_SYSUP_CRON=1
+ARCHUP_HAS_GPGCONF=0
+set +e
+sysup_backend_upgrade >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup agents: a missing gpgconf is not a failure" "0" "$status"
+_assert_eq "archup agents: a missing gpgconf is not run" "" "$(cat "$ARCHUP_GPGCONF_LOG")"
+
+echo ""
+echo "=== archup: Secure Boot signatures ==="
+
+_archup_mock_reset
+result=$(check_boot_signatures 2>&1)
+_assert_eq "archup sbctl: skipped without sbctl" "" "$result"
+_assert_eq "archup sbctl: sbctl is not run when absent" "" "$(cat "$ARCHUP_SBCTL_LOG")"
+
+# A UKI host: the UKI and systemd-boot are signed, the plain kernel is not
+# (it is embedded in the UKI) and must not fail the check.
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT="Verifying file database and EFI images in /boot...
+✗ /boot/vmlinuz-linux is not signed
+✓ /boot/EFI/Linux/arch-linux.efi is signed
+✓ /boot/EFI/systemd/systemd-bootx64.efi is signed
+✓ /boot/EFI/BOOT/BOOTX64.EFI is signed"
+set +e
+result=$(check_boot_signatures 2>&1)
+status=$?
+set -e
+_assert_eq "archup sbctl: an unsigned vmlinuz on a UKI host passes" "0" "$status"
+_assert_contains "archup sbctl: reports the boot chain signed" \
+  "ok: sbctl reports the checked boot-chain EFI images signed" "$result"
+_assert_eq "archup sbctl: runs sbctl verify" "verify" "$(cat "$ARCHUP_SBCTL_LOG")"
+
+for unsigned_path in /boot/EFI/Linux/arch-linux.efi /efi/EFI/systemd/systemd-bootx64.efi \
+  /boot/efi/EFI/BOOT/BOOTX64.EFI; do
+  _archup_mock_reset
+  ARCHUP_HAS_SBCTL=1
+  ARCHUP_SBCTL_OUTPUT="Verifying file database and EFI images in /boot...
+✗ /boot/vmlinuz-linux is not signed
+✗ $unsigned_path is not signed"
+  set +e
+  result=$(check_boot_signatures 2>&1)
+  status=$?
+  set -e
+  _assert_eq "archup sbctl: unsigned $unsigned_path fails the check" "1" "$status"
+  _assert_contains "archup sbctl: names unsigned $unsigned_path" \
+    "  $unsigned_path" "$result"
+  _assert_not_contains "archup sbctl: does not blame vmlinuz for $unsigned_path" \
+    "  /boot/vmlinuz-linux" "$(sed -n '/unsigned boot-chain/,$p' <<<"$result")"
+done
+
+# Colored output is parsed the same way.
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT=$'\033[31m✗\033[0m /boot/EFI/Linux/arch-linux.efi is not signed'
+set +e
+check_boot_signatures >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup sbctl: color sequences do not hide an unsigned UKI" "1" "$status"
+
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT='[-] /boot/EFI/Linux/arch-linux.efi is not signed'
+set +e
+check_boot_signatures >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup sbctl: SBCTL_UNICODE=0 does not hide an unsigned UKI" "1" "$status"
+
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT='✗ /boot/vmlinuz-linux is not signed'
+result=$(check_boot_signatures 2>&1)
+_assert_contains "archup sbctl: only a kernel verdict leaves the boot chain unverified" \
+  "warning: could not verify Secure Boot signatures" "$result"
+_assert_not_contains "archup sbctl: a kernel alone does not prove the boot chain is signed" \
+  "ok: sbctl" "$result"
+
+# Unsigned files outside the boot chain do not fail it, even a utility kept
+# beside the fallback loader.
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT=$'✗ /boot/EFI/arch/fwupdx64.efi is not signed\n✗ /boot/EFI/BOOT/KeyTool.efi is not signed\n✓ /boot/EFI/Linux/arch-linux.efi is signed'
+set +e
+check_boot_signatures >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup sbctl: files outside the boot chain are ignored" "0" "$status"
+
+# No verdict at all (sbctl refused to run unprivileged) is unverified, not ok.
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT="sbctl requires root to run"
+ARCHUP_SBCTL_STATUS=1
+set +e
+result=$(check_boot_signatures 2>&1)
+status=$?
+set -e
+_assert_eq "archup sbctl: an unverifiable result is advisory" "0" "$status"
+_assert_contains "archup sbctl: an unverifiable result is a warning" \
+  "warning: could not verify Secure Boot signatures" "$result"
+_assert_not_contains "archup sbctl: an unverifiable result is not reported ok" \
+  "ok: sbctl" "$result"
+_assert_contains "archup sbctl: the unverifiable result is recorded" \
+  $'warning\tcould not verify Secure Boot signatures' "$(cat "$_SYSUP_NOTICE_FILE")"
+
+_archup_mock_reset
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT="✓ /boot/EFI/Linux/arch-linux.efi is signed"
+ARCHUP_SBCTL_STATUS=1
+set +e
+result=$(check_boot_signatures 2>&1)
+status=$?
+set -e
+_assert_eq "archup sbctl: a failing sbctl with signed images is advisory" "0" "$status"
+_assert_contains "archup sbctl: a failing sbctl is only partly verified" \
+  "only partly verified" "$result"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_HAS_SBCTL=1
+ARCHUP_SBCTL_OUTPUT="✗ /boot/EFI/Linux/arch-linux.efi is not signed"
+set +e
+sysup_main --check-only >/dev/null 2>&1
+status=$?
+set -e
+_assert_eq "archup sbctl: an unsigned UKI fails a --check-only run" "1" "$status"
+
+echo ""
+echo "=== archup: notices ==="
+
+_archup_mock_reset
+rm -rf "${ARCHUP_MODULES_ROOT:?}/$ARCHUP_KERNEL_RELEASE"
+ARCHUP_PACDIFF_OUTPUT="/etc/pacman.conf.pacnew"
+result=$(report_reboot_required 2>&1)
+report_pending_pacman_configs >/dev/null 2>&1
+_assert_eq "archup notices: the reboot report text is unchanged" \
+  $'\n==> checking whether a reboot is required\nreboot required to complete this upgrade' "$result"
+_assert_eq "archup notices: reboot and pacnew are recorded by kind" \
+  $'reboot-required\treboot required to complete this upgrade\nconfig-merge\t/etc/pacman.conf.pacnew' \
+  "$(cat "$_SYSUP_NOTICE_FILE")"
+
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+result=$(sysup_backend_checks 2>&1)
+_assert_eq "archup notices: a clean check records nothing" "" "$(cat "$_SYSUP_NOTICE_FILE")"
+_SYSUP_NOTICE_FILE=""
 
 _test_summary

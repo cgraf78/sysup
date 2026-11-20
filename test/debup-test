@@ -49,6 +49,11 @@ export DEBUP_MOCK_DPKG_QUERY_FAIL_ON=0
 export DEBUP_MOCK_DPKG_QUERY_STATUS=8
 export DEBUP_MOCK_NEEDRESTART_OUTPUT=""
 export DEBUP_MOCK_NEEDRESTART_STATUS=0
+export DEBUP_MOCK_NEEDRESTART_SERVICES=""
+export DEBUP_MOCK_NEEDRESTART_SERVICES_STATUS=0
+export DEBUP_MOCK_KEPT_BACK=""
+export DEBUP_MOCK_NEW_INSTALLS=""
+export DEBUP_MOCK_KEPT_BACK_STATUS=0
 DEBUP_UPDATE_COUNT_FILE="$(_tmpdir)/update-count"
 DEBUP_SNAPSHOT_COUNT_FILE="$(_tmpdir)/snapshot-count"
 export DEBUP_UPDATE_COUNT_FILE DEBUP_SNAPSHOT_COUNT_FILE
@@ -100,6 +105,23 @@ case "${args[0]:-}" in
     ;;
   autoclean) exit "$DEBUP_MOCK_AUTOCLEAN_STATUS" ;;
 esac
+
+# The kept-back report: a simulated full-upgrade, answered with pkgSimulate
+# records. Upgrades carry the installed version in brackets; new installs
+# (DEBUP_MOCK_NEW_INSTALLS) do not and are not kept back.
+if [[ " ${args[*]} " == *" --simulate "* && " ${args[*]} " == *" full-upgrade "* ]]; then
+  ((DEBUP_MOCK_KEPT_BACK_STATUS == 0)) || {
+    printf 'E: mock simulation failure\n' >&2
+    exit "$DEBUP_MOCK_KEPT_BACK_STATUS"
+  }
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && printf 'Inst %s [1.0] (2.0 Debian:13/stable [amd64])\n' "$pkg"
+  done <<<"$DEBUP_MOCK_KEPT_BACK"
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && printf 'Inst %s (1.0 Debian:13/stable [amd64])\n' "$pkg"
+  done <<<"$DEBUP_MOCK_NEW_INSTALLS"
+  exit 0
+fi
 
 for arg in "${args[@]}"; do
   case "$arg" in
@@ -263,12 +285,17 @@ _debup_reset() {
   DEBUP_MOCK_DPKG_AUDIT_STATUS=0
   DEBUP_MOCK_DPKG_QUERY_FAIL_ON=0
   DEBUP_MOCK_DPKG_QUERY_STATUS=8
+  DEBUP_MOCK_KEPT_BACK=""
+  DEBUP_MOCK_NEW_INSTALLS=""
+  DEBUP_MOCK_KEPT_BACK_STATUS=0
   # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
   DEBUP_UPDATE_ATTEMPTS=5
   # shellcheck disable=SC2034 # Read by debup_apt_update in the sourced backend.
   DEBUP_UPDATE_RETRY_DELAY=0
   DEBUP_MOCK_NEEDRESTART_OUTPUT=""
   DEBUP_MOCK_NEEDRESTART_STATUS=0
+  DEBUP_MOCK_NEEDRESTART_SERVICES=""
+  DEBUP_MOCK_NEEDRESTART_SERVICES_STATUS=0
   # shellcheck disable=SC2034 # backend state read by the sourced debup under test.
   DEBUP_UPGRADE_VERB=upgrade
   # shellcheck disable=SC2034 # backend state read by the sourced debup under test.
@@ -288,6 +315,10 @@ _debup_install_needrestart() {
   _debup_write_mock needrestart <<'EOF'
 #!/usr/bin/env bash
 printf '%s DEBIAN_FRONTEND=%s\n' "$*" "${DEBIAN_FRONTEND:-unset}" >>"$DEBUP_NEEDRESTART_LOG"
+if [[ "$1 $2" == '-b -l' ]]; then
+  printf '%s' "$DEBUP_MOCK_NEEDRESTART_SERVICES"
+  exit "$DEBUP_MOCK_NEEDRESTART_SERVICES_STATUS"
+fi
 printf '%s' "$DEBUP_MOCK_NEEDRESTART_OUTPUT"
 exit "$DEBUP_MOCK_NEEDRESTART_STATUS"
 EOF
@@ -311,8 +342,9 @@ _assert_contains "debup upgrade: refreshes package lists first" \
   "update" "$apt_log"
 _assert_contains "debup upgrade: default upgrade allows new dependencies" \
   "--with-new-pkgs upgrade -y" "$apt_log"
+# The kept-back report simulates a full-upgrade; only a real one would remove.
 _assert_not_contains "debup upgrade: default upgrade never removes packages" \
-  "full-upgrade" "$apt_log"
+  "full-upgrade -y" "$apt_log"
 _assert_contains "debup upgrade: reclaims the package cache" \
   "autoclean -y" "$apt_log"
 
@@ -690,6 +722,50 @@ _assert_contains "debup restart: needrestart cannot raise an interactive debconf
   "-r a DEBIAN_FRONTEND=noninteractive" "$needrestart_log"
 _assert_not_contains "debup restart: needrestart replaces the built-in restart" \
   "try-restart" "$systemctl_log"
+_assert_not_contains "debup restart: interactive upgrades do not rescan needrestart" \
+  "-b -l" "$needrestart_log"
+
+echo ""
+echo "=== debup: needrestart notices for cron ==="
+
+debup_cron_notices=$(_tmpfile)
+_debup_reset
+_debup_install_needrestart
+DEBUP_MOCK_NEEDRESTART_SERVICES=$'NEEDRESTART-VER: 3.11\nNEEDRESTART-SVC: guarded.service\nNEEDRESTART-SESS: example @ user.service'
+result=$(_SYSUP_CRON=1 _SYSUP_NOTICE_FILE="$debup_cron_notices" sysup_backend_restart_services 2>&1)
+_assert_contains "debup cron: reports services still waiting after the automatic restarts" \
+  "guarded.service" "$result"
+_assert_eq "debup cron: records only structured service records as deferred restarts" \
+  $'deferred-restart\tguarded.service' "$(cat "$debup_cron_notices")"
+_assert_contains "debup cron: runs the structured scan after attempting restarts" \
+  $'-r a DEBIAN_FRONTEND=noninteractive\n-b -l' "$(cat "$DEBUP_NEEDRESTART_LOG")"
+
+_debup_reset
+_debup_install_needrestart
+: >"$debup_cron_notices"
+DEBUP_MOCK_NEEDRESTART_SERVICES='NEEDRESTART-VER: 3.11'
+_SYSUP_CRON=1 _SYSUP_NOTICE_FILE="$debup_cron_notices" sysup_backend_restart_services >/dev/null
+_assert_eq "debup cron: no remaining service records send no reminder" \
+  "" "$(cat "$debup_cron_notices")"
+
+_debup_reset
+_debup_install_needrestart
+: >"$debup_cron_notices"
+DEBUP_MOCK_NEEDRESTART_SERVICES_STATUS=8
+_SYSUP_CRON=1 _SYSUP_NOTICE_FILE="$debup_cron_notices" sysup_backend_restart_services >/dev/null 2>&1
+_assert_contains "debup cron: a failed scan records an advisory warning" \
+  $'warning\t' "$(cat "$debup_cron_notices")"
+
+_debup_reset
+_debup_install_needrestart
+: >"$debup_cron_notices"
+DEBUP_MOCK_NEEDRESTART_OUTPUT='NEEDRESTART-KSTA: 1'
+DEBUP_MOCK_NEEDRESTART_SERVICES='NEEDRESTART-SVC: guarded.service'
+_SYSUP_CRON=1 _SYSUP_NOTICE_FILE="$debup_cron_notices" sysup_backend_checks 1 >/dev/null 2>&1
+_assert_eq "debup cron: check-only reports services needing a restart" \
+  $'deferred-restart\tguarded.service' "$(cat "$debup_cron_notices")"
+_assert_not_contains "debup cron: check-only does not restart services" \
+  "-r a" "$(cat "$DEBUP_NEEDRESTART_LOG")"
 
 echo ""
 echo "=== debup: no running systemd ==="
@@ -1091,5 +1167,87 @@ rm -f "$debup_sbin/$debup_nr_fixture"
 DEBUP_NEEDRESTART_SEARCH_PATH="/usr/local/sbin:/usr/sbin:/sbin"
 # shellcheck disable=SC2034 # read by the sourced debup under test.
 DEBUP_NEEDRESTART="$DEBUP_MOCK_BIN/needrestart"
+
+echo ""
+echo "=== debup: kept-back packages and notices ==="
+
+debup_notices=$(_tmpfile)
+_SYSUP_NOTICE_FILE="$debup_notices"
+
+_debup_reset
+: >"$debup_notices"
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_KEPT_BACK=$'held-lib\nsplit-tool'
+DEBUP_MOCK_NEW_INSTALLS="fresh-dep"
+result=$(sysup_backend_upgrade 2>&1)
+_assert_contains "debup kept back: names packages a full-upgrade would still upgrade" \
+  $'packages kept back (2)\n  held-lib\n  split-tool' "$result"
+_assert_not_contains "debup kept back: a new install is not kept back" \
+  "fresh-dep" "$result"
+_assert_eq "debup kept back: records one kept-back notice" \
+  $'kept-back\theld-lib split-tool' "$(cat "$debup_notices")"
+_assert_contains "debup kept back: asks the resolver by simulation" \
+  "--simulate --quiet=2 full-upgrade" "$(cat "$DEBUP_APT_LOG")"
+
+_debup_reset
+: >"$debup_notices"
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+result=$(sysup_backend_upgrade 2>&1)
+_assert_not_contains "debup kept back: nothing kept back prints nothing" \
+  "kept back" "$result"
+_assert_eq "debup kept back: nothing kept back records nothing" \
+  "" "$(cat "$debup_notices")"
+
+_debup_reset
+: >"$debup_notices"
+DEBUP_MOCK_INSTALLED="ii base 1.0"
+DEBUP_MOCK_KEPT_BACK_STATUS=100
+set +e
+result=$(sysup_backend_upgrade 2>&1)
+status=$?
+set -e
+_assert_eq "debup kept back: a failed query does not fail the upgrade" "0" "$status"
+_assert_contains "debup kept back: a failed query is a warning" \
+  "warning: could not determine which packages apt kept back" "$result"
+_assert_contains "debup kept back: the failed query's warning is recorded" \
+  $'warning\tcould not determine which packages apt kept back' "$(cat "$debup_notices")"
+
+_debup_reset
+: >"$debup_notices"
+DEBUP_MOCK_KEPT_BACK="held-lib"
+sysup_backend_parse_arg --full-upgrade
+sysup_backend_upgrade >/dev/null 2>&1
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_UPGRADE_VERB=upgrade
+_assert_not_contains "debup kept back: --full-upgrade keeps nothing back, so it does not ask" \
+  "--simulate" "$(cat "$DEBUP_APT_LOG")"
+
+_debup_reset
+: >"$debup_notices"
+DEBUP_REBOOT_REQUIRED_FILE="$(_tmpdir)/reboot-required"
+: >"$DEBUP_REBOOT_REQUIRED_FILE"
+DEBUP_CONFFILE_ROOT=$(_tmpdir)
+: >"$DEBUP_CONFFILE_ROOT/app.conf.dpkg-dist"
+# shellcheck disable=SC2034 # read by the sourced debup under test.
+DEBUP_NEEDRESTART=/nonexistent/needrestart
+result=$(report_pending_state 2>&1)
+_assert_contains "debup notices: the reboot report text is unchanged" \
+  "reboot required to complete this upgrade" "$result"
+_assert_contains "debup notices: a pending reboot is recorded" \
+  $'reboot-required\t' "$(cat "$debup_notices")"
+_assert_contains "debup notices: a pending conffile is recorded" \
+  $'config-merge\t'"$DEBUP_CONFFILE_ROOT/app.conf.dpkg-dist" "$(cat "$debup_notices")"
+
+_debup_reset
+set +e
+result=$(sysup_main --exclude=base 2>&1)
+status=$?
+set -e
+_assert_eq "debup exclude: rejected as a usage error" "2" "$status"
+_assert_contains "debup exclude: says the backend cannot exclude" \
+  "debup does not support --exclude" "$result"
+_assert_eq "debup exclude: rejected before anything runs" \
+  "" "$(cat "$DEBUP_APT_LOG")$(cat "$DEBUP_DPKG_QUERY_ARGS_LOG")"
+_SYSUP_NOTICE_FILE=""
 
 _test_summary

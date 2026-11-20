@@ -113,7 +113,12 @@ run "check-only as root" "$tag" /opt/sysup/bin/sysup --check-only
 run "upgrade as root" "$tag" /opt/sysup/bin/sysup
 run "upgrade as non-root through sudo" -u sysupci -w /home/sysupci "$tag" \
   /opt/sysup/bin/sysup
-run "check-only after upgrade" "$tag" /opt/sysup/bin/sysup --check-only
+run "cron check-only after upgrade" "$tag" /opt/sysup/bin/sysup --cron --check-only
+run "cron check-only records success and no package changes" "$tag" /bin/bash -c '
+  grep -qx status=0 /var/lib/sysup/last-cron &&
+    grep -qx changed=no /var/lib/sysup/last-cron &&
+    test -s /var/lib/sysup/last-cron.log
+'
 
 if ((status != 0)); then
   printf '\nerror: sysup end-to-end run failed on %s\n' "$image" >&2

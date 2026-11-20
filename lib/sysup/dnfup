@@ -39,9 +39,13 @@ DNFUP_VERSIONLOCK_TOML="${DNFUP_VERSIONLOCK_TOML:-/etc/dnf/versionlock.toml}"
 DNFUP_RPM_LOCK="${DNFUP_RPM_LOCK:-}"
 DNFUP_LOCK_TIMEOUT="${DNFUP_LOCK_TIMEOUT:-300}"
 
+# Packages this run leaves out of the upgrade (--exclude), as given.
+DNFUP_EXCLUDES=()
+
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: sysup [--no-autoremove] [--check-only]
+Usage: sysup [--no-autoremove] [--check-only] [--cron]
+             [--exclude=PKG[,PKG...]]
              [--no-restart-upgraded-services] [--restart-failed]
              [-- dnf args...]
 
@@ -60,6 +64,11 @@ Default flow:
   8. report failed systemd units when systemd is available
 
 Options:
+  --exclude=PKG[,PKG...]          leave these packages (dnf globs allowed) at
+                                  their installed version for this run, via
+                                  dnf upgrade --exclude; repeatable. Unlike
+                                  arguments after --, it keeps automatic
+                                  cleanup.
 EOF
   sysup_usage_common_options
   cat <<'EOF'
@@ -132,12 +141,13 @@ report_pending_state() {
 
   if dnfup_reboot_required; then
     printf 'reboot required to complete this upgrade\n'
+    sysup_notice reboot-required 'reboot required to complete this upgrade'
   else
     reboot_status=$?
     if ((reboot_status == 1)); then
       printf 'ok: no reboot required by packages updated since boot (repository advisories not consulted)\n'
     else
-      printf 'warning: could not determine whether a reboot is required; install or repair the dnf needs-restarting plugin and check again\n' >&2
+      sysup_warn 'could not determine whether a reboot is required; install or repair the dnf needs-restarting plugin and check again'
     fi
   fi
 
@@ -198,7 +208,7 @@ sysup_backend_autoremove() {
     # A listing is advisory, matching the other backends' reports.
     # stderr stays on the terminal: dnf warnings must not read as packages.
     if ! listing="$(dnfup_dnf_local -q repoquery --unneeded)"; then
-      printf 'warning: could not determine which packages are no longer required\n' >&2
+      sysup_warn 'could not determine which packages are no longer required'
       return 0
     fi
     if [[ -z "$listing" ]]; then
@@ -272,13 +282,18 @@ dnfup_pinned_packages() {
 # and never stops the run.
 sysup_backend_preamble() {
   local -a pinned=()
-  local listing
+  local listing item
 
   if ! listing="$(dnfup_pinned_packages)"; then
-    printf 'warning: could not read the dnf exclude or versionlock configuration\n' >&2
-    return 0
+    sysup_warn 'could not read the dnf exclude or versionlock configuration'
+    ((${#DNFUP_EXCLUDES[@]})) || return 0
+    listing=""
   fi
   [[ -z "$listing" ]] || mapfile -t pinned <<<"$listing"
+  # This run's --exclude names sit beside the configured pins they extend.
+  for item in "${DNFUP_EXCLUDES[@]+"${DNFUP_EXCLUDES[@]}"}"; do
+    pinned+=("$item (--exclude)")
+  done
   sysup_log "versionlocked and excluded packages (${#pinned[@]})"
   if ((${#pinned[@]})); then
     printf '  %s\n' "${pinned[@]}"
@@ -323,10 +338,25 @@ dnfup_rpm_lock_held() {
   ' "$SYSUP_PROC_ROOT/locks"
 }
 
+# Both dnf generations accept a comma-separated --exclude, applied to this
+# transaction only, like excludepkgs in dnf.conf.
+sysup_backend_exclude() {
+  DNFUP_EXCLUDES=("$@")
+}
+
 sysup_backend_upgrade() {
+  local -a exclude_args=()
+
+  if ((${#DNFUP_EXCLUDES[@]})); then
+    exclude_args=("--exclude=$(
+      IFS=,
+      printf '%s' "${DNFUP_EXCLUDES[*]}"
+    )")
+  fi
   sysup_wait_path_free "$(dnfup_rpm_lock_path)" "$DNFUP_LOCK_TIMEOUT" \
     "the rpm transaction lock" dnfup_rpm_lock_held || return 1
-  dnfup_dnf upgrade --refresh -y "$@"
+  dnfup_dnf upgrade --refresh -y \
+    "${exclude_args[@]+"${exclude_args[@]}"}" "$@"
 }
 
 if [[ "${SYSUP_SOURCE_ONLY:-0}" != 1 ]]; then

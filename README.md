@@ -68,6 +68,9 @@ Common options:
 
 - `--check-only` skips package changes and service restarts while running the
   verification checks;
+- `--cron` runs unattended from root's crontab (see below);
+- `--exclude=PKG[,PKG...]` leaves packages at their installed version for this
+  run, on Arch and Fedora; the other backends reject it with exit status 2;
 - `--no-autoremove` lists packages no longer required instead of removing them;
 - `--no-restart-upgraded-services` leaves affected active services running;
 - `--restart-failed` restarts failed enabled systemd units after checks;
@@ -77,6 +80,39 @@ Common options:
 Package-manager arguments must follow `--`. Any other argument before it is
 rejected with exit status 2, so a mistyped option fails before anything runs
 instead of reaching the package manager.
+
+`--exclude` takes its names in the same word, comma-separated, and may be
+repeated; names may be `*`/`?` globs. Unlike package-manager arguments after
+`--`, it keeps automatic cleanup.
+
+### Unattended runs
+
+`sysup --cron` is meant for root's crontab, where cron mails whatever a job
+prints:
+
+```text
+30 1 * * * SYSUP_ARCH_USER=aurbuild sysup --cron --exclude=linux,linux-headers
+```
+
+It exits 2 unless run as root, before anything else happens. It skips the run
+with one line and exit status 0 while a shutdown is scheduled
+(`/run/systemd/shutdown/scheduled`), and with one line and exit status 75 when
+another `--cron` run holds `/run/sysup/cron.lock`. That lock is best effort:
+it only keeps scheduled runs from overlapping, and the package managers' own
+locks still guard against an interactive run. The run reads nothing from
+stdin, and its package transactions run under a systemd shutdown inhibitor
+when systemd and `systemd-inhibit` are available. If the inhibitor cannot be
+acquired, the run fails before changing packages.
+
+Output is buffered and printed at the end only when the run failed, packages
+changed (installed, removed, upgraded, or rebuilt), or the run reported a
+pending reboot, a config file awaiting a merge, a deferred service restart, a
+package apt kept back, or a warning. An excluded package that still has an
+update is listed too, but does not by itself make the run print. A run with
+nothing to report prints nothing. The last log is kept in
+the root-only `/var/lib/sysup/last-cron.log`, and `/var/lib/sysup/last-cron` holds
+`time=<epoch>`, `status=<exit status>`, and `changed=yes|no`. The exit
+status is the run's own, as without `--cron`.
 
 ### Arch
 
@@ -93,6 +129,19 @@ under `/usr/lib/modules` is gone, as it is after a kernel package upgrade;
 both reports are advisory and never change the exit status. Broken AUR
 packages are rebuilt and their active services are restarted even when the
 rebuilt package version is unchanged.
+
+pacman exits 0 even when an install hook fails, so an upgrade whose output
+contains pacman's `error: command failed to execute correctly` (a failed
+mkinitcpio, UKI, or signing hook, say) is treated as a failed upgrade; the
+match uses pacman's English wording. When `sbctl` is installed, the checks also
+run `sbctl verify` and fail when a unified kernel image or boot loader under
+`EFI/Linux`, `EFI/systemd`, or `EFI/BOOT` is unsigned; an unsigned
+`/boot/vmlinuz-*`, expected on hosts that boot a UKI, is ignored.
+
+`--exclude` names reach `yay` or `pacman` as one `--ignore=a,b` argument.
+Explicit rebuild and orphan removal targets also skip those packages. The
+preamble lists them beside `pacman.conf`'s `IgnorePkg`. After the upgrade, excluded packages that the
+sync database still has updates for are listed.
 
 Package operations are noninteractive by default. Pass `--confirm` after `--`
 to restore package-manager prompts. Other custom package-manager arguments
@@ -111,7 +160,9 @@ diagnostics. With `yay` installed, `SYSUP_ARCH_USER` naming root or a missing
 account is an error. When neither variable names a non-root account (a
 `su -` shell or root login, where `SUDO_USER` is unset or root), `sysup` warns
 that AUR packages are skipped and upgrades repository packages with
-`pacman -Syu`.
+`pacman -Syu`. After the `yay` steps of a cron run with an explicit
+`SYSUP_ARCH_USER`, the build account's `gpg-agent` and `keyboxd` are stopped
+with `gpgconf --kill all`.
 
 ### Debian and Ubuntu
 
@@ -123,15 +174,16 @@ packages no longer required. Neither step performs a release upgrade or edits
 APT sources.
 
 It keeps locally modified conffiles, retries transient package-index failures,
-checks dpkg and apt integrity, reports pending conffile merges and reboot state,
-and prefers `needrestart` when it is installed.
+lists packages the default upgrade kept back (those a full-upgrade would still
+upgrade), checks dpkg and apt integrity, reports pending conffile merges and
+reboot state, and prefers `needrestart` when it is installed.
 
 ### Fedora and RHEL
 
 The Fedora backend covers Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, and
 other dnf-based RHEL derivatives. It lists versionlocked and excluded
 packages, waits for another rpm transaction to release its lock, runs
-`dnf upgrade --refresh -y`, then
+`dnf upgrade --refresh -y` (with `--exclude=a,b` for `sysup --exclude`), then
 `dnf autoremove -y` after a successful upgrade. It never runs
 `dnf system-upgrade`, and it refuses rpm-ostree/bootc image-based hosts, which
 upgrade through `rpm-ostree upgrade` or `bootc upgrade` instead. It runs
@@ -182,7 +234,7 @@ graphical session (`user@`, `user-runtime-dir@`, gettys, display managers,
 session-related defaults; it
 reports them as deferred until a reboot or manual restart instead. Deferrals
 are recorded in `/var/lib/sysup/deferred-restarts`, and every later run,
-including `--check-only`, repeats one stable stderr line,
+including `--check-only`, repeats one stderr line,
 `reboot recommended: session-critical units may still run pre-upgrade code: ...`,
 until the host reboots or each unit is restarted or stopped. The reminder is
 advisory and never changes the exit status. Missing
@@ -233,7 +285,10 @@ The openSUSE path uses `zypper`, `rpm`, `find`, and `sort`; reboot state
 needs a zypper with `needs-rebooting`. systemd integration is used when
 `systemctl` is available and systemd is the running init
 (`/run/systemd/system` exists); recording deferred
-restarts also uses `install` and `mktemp`.
+restarts also uses `install` and `mktemp`. `--cron` needs Bash 4.1 or newer,
+`flock`, `date`, and, when present, `systemd-inhibit`. The Arch upgrade uses
+`mkfifo` to capture hook errors and checks boot signatures where `sbctl` is
+installed.
 
 The dispatcher and OS detection remain compatible with Bash 3.2 so an
 unsupported macOS host can still run `sysup --help` and receive a clear

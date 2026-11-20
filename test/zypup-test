@@ -659,4 +659,15 @@ _assert_contains "zypup main: names the host it refused" \
 _assert_eq "zypup main: runs no zypper command on the wrong family" \
   "" "$(cat "$ZYPUP_ZYPPER_LOG")"
 
+echo ""
+echo "=== zypup: --exclude ==="
+
+_zypup_reset
+_zypup_main --exclude=base
+_assert_eq "zypup exclude: rejected as a usage error" "2" "$ZYPUP_STATUS"
+_assert_contains "zypup exclude: says the backend cannot exclude" \
+  "zypup does not support --exclude" "$ZYPUP_RESULT"
+_assert_eq "zypup exclude: rejected before any zypper command" \
+  "" "$(cat "$ZYPUP_ZYPPER_LOG")"
+
 _test_summary

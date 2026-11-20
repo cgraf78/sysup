@@ -13,7 +13,9 @@ implementation details that may change together.
 - `zypup` supplies openSUSE/SLES, zypper, package-lock, and reboot policy.
 - `rpm.sh` holds the rpm snapshot, package-file, and pending-conffile helpers
   that `dnfup` and `zypup` share.
-- `common.sh` parses shared flags and owns the upgrade/check/restart ordering.
+- `common.sh` parses shared flags, owns the upgrade/check/restart ordering,
+  records structured notices (`sysup_notice`, `sysup_warn`), and runs the
+  unattended `--cron` mode around the shared run.
 - `detect.sh` defines the supported-family vocabulary and family guards.
 - `systemd.sh` discovers affected active units and handles failed units.
 
@@ -22,6 +24,11 @@ snapshot afterward. Backends implement small hooks for requirements, package
 enumeration, upgrade, checks, and usage text. Centralizing orchestration is a
 safety property: partial package-manager failures still reach verification and
 best-effort service restart, while the original failure status remains final.
+
+Every file here is sourced at the top level while a backend loads, never
+lazily from a function, and each backend's `sysup_main` call is its last
+statement. A checkout replaced during a long run then cannot mix old and new
+code; `sysup-test` enforces this.
 
 `archup`, `debup`, `dnfup`, and `zypup` are executable because the dispatcher
 replaces itself with the selected backend. They intentionally do not live in `bin/`; publishing them

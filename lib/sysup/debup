@@ -59,7 +59,7 @@ DEBUP_CONFFILE_ROOT="${DEBUP_CONFFILE_ROOT:-/etc}"
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: sysup [--full-upgrade] [--no-autoremove] [--check-only]
+Usage: sysup [--full-upgrade] [--no-autoremove] [--check-only] [--cron]
              [--no-restart-upgraded-services] [--restart-failed]
              [-- apt-get args...]
 
@@ -69,7 +69,8 @@ failure modes most likely to leave services broken after the upgrade.
 Default flow:
   1. report held packages
   2. warm sudo credentials
-  3. update package lists and upgrade packages noninteractively
+  3. update package lists and upgrade packages noninteractively, then report
+     packages apt kept back
   4. autoclean the package cache, then purge packages no longer required
   5. run dpkg/apt, pending-config, and reboot-required checks
   6. restart services affected by upgraded packages, preferring needrestart
@@ -89,6 +90,8 @@ installation is noninteractive by default.
 
 debup never performs a release upgrade; use the distribution's documented
 release-upgrade procedure for that.
+
+--exclude is not supported; hold a package with apt-mark hold instead.
 EOF
 }
 
@@ -272,6 +275,7 @@ report_pending_state() {
 
   if debup_reboot_required; then
     printf 'reboot required to complete this upgrade\n'
+    sysup_notice reboot-required 'reboot required to complete this upgrade'
     if [[ -r "$DEBUP_REBOOT_REQUIRED_FILE.pkgs" ]]; then
       mapfile -t packages < <(sort -u "$DEBUP_REBOOT_REQUIRED_FILE.pkgs" 2>/dev/null || true)
       ((${#packages[@]} == 0)) || printf '  %s\n' "${packages[@]}"
@@ -281,7 +285,7 @@ report_pending_state() {
     if ((reboot_status == 1)); then
       printf 'ok: no reboot required\n'
     else
-      printf 'warning: could not determine whether a reboot is required; install or repair needrestart and check again\n' >&2
+      sysup_warn 'could not determine whether a reboot is required; install or repair needrestart and check again'
     fi
   fi
 
@@ -292,12 +296,50 @@ report_pending_state() {
   if ((${#conffiles[@]})); then
     printf '\nconfig files awaiting a manual merge:\n'
     printf '  %s\n' "${conffiles[@]}"
+    sysup_notice config-merge "${conffiles[*]}"
   fi
   if ((conffile_status != 0)); then
-    printf 'warning: could not completely scan for config files awaiting a manual merge\n' >&2
+    sysup_warn 'could not completely scan for config files awaiting a manual merge'
   elif ((${#conffiles[@]} == 0)); then
     printf 'ok: no config files awaiting a manual merge\n'
   fi
+}
+
+# Print the packages `upgrade --with-new-pkgs` kept back: installed packages
+# a full-upgrade, which may also remove packages, would still upgrade. Held
+# and phased packages stay out, because full-upgrade honors both.
+#
+# Simulated, so it takes no lock and needs no root. `Inst` followed by a
+# bracketed installed version is an untranslated pkgSimulate record of an
+# upgrade (a new install has no bracket), so this parse is locale-independent
+# rather than matching apt's "kept back" prose.
+debup_kept_back_packages() {
+  local simulated
+
+  if ! simulated="$(LC_ALL=C apt-get --simulate --quiet=2 \
+    -o APT::Get::Show-User-Simulation-Note=false full-upgrade 2>&1)"; then
+    printf '%s\n' "$simulated" >&2
+    return 1
+  fi
+  printf '%s\n' "$simulated" | sed -E -n 's/^Inst ([^ ]+) \[[^]]*\].*/\1/p'
+}
+
+# Advisory: a kept-back package is a pending upgrade the default verb will
+# never apply by itself, so name it rather than let it go stale quietly.
+report_kept_back() {
+  local listing
+  local -a kept=()
+
+  if ! listing="$(debup_kept_back_packages)"; then
+    sysup_warn 'could not determine which packages apt kept back'
+    return 0
+  fi
+  [[ -n "$listing" ]] || return 0
+  mapfile -t kept <<<"$listing"
+  sysup_log "packages kept back (${#kept[@]})"
+  printf '  %s\n' "${kept[@]}"
+  printf '\nhint: sysup --full-upgrade lets apt upgrade them, removing packages if it must\n'
+  sysup_notice kept-back "${kept[*]}"
 }
 
 report_autoremovable() {
@@ -306,7 +348,7 @@ report_autoremovable() {
   # --simulate takes no lock and needs no root, so this runs unprivileged.
   if ! simulated="$(apt-get --simulate autoremove 2>&1)"; then
     printf '%s\n' "$simulated" >&2
-    printf 'warning: could not determine which packages are no longer required\n' >&2
+    sysup_warn 'could not determine which packages are no longer required'
     return 0
   fi
 
@@ -394,13 +436,40 @@ sysup_backend_parse_arg() {
   esac
 }
 
+# Batch mode reports services with stale mappings as NEEDRESTART-SVC records.
+# Run this after automatic restarts to report only the services still waiting,
+# or by itself in check-only mode. Batch/list-only disables restarts and user
+# notifications, and advanced mode prevents the user's UI setting hiding records.
+debup_report_pending_restarts() {
+  local listing line
+  local -a services=()
+
+  if ! listing="$(sysup_run_as_root "$1" -b -l -r l -m a)"; then
+    sysup_warn 'could not verify which services still need a restart'
+    return 0
+  fi
+  while IFS= read -r line; do
+    if [[ "$line" == 'NEEDRESTART-SVC: '?* ]]; then
+      services+=("${line#NEEDRESTART-SVC: }")
+    fi
+  done <<<"$listing"
+  ((${#services[@]})) || return 0
+
+  sysup_log 'services still needing a restart'
+  printf '  %s\n' "${services[@]}"
+  sysup_notice deferred-restart "${services[*]}"
+}
+
 sysup_backend_checks() {
-  local status=0
+  local check_only="${1:-0}" status=0 needrestart
 
   check_package_integrity || status=1
   # Advisory: a pending reboot or unmerged config file is expected output from a
   # successful upgrade, not a failure, so it never changes the exit status.
   report_pending_state
+  if ((_SYSUP_CRON && check_only)) && needrestart="$(debup_needrestart_path)"; then
+    debup_report_pending_restarts "$needrestart"
+  fi
   return "$status"
 }
 
@@ -430,7 +499,10 @@ sysup_backend_restart_services() {
 
   if needrestart="$(debup_needrestart_path)"; then
     sysup_log "restarting services reported by needrestart"
-    sysup_run_as_root env DEBIAN_FRONTEND=noninteractive "$needrestart" -r a
+    sysup_run_as_root env DEBIAN_FRONTEND=noninteractive "$needrestart" -r a || return
+    if ((_SYSUP_CRON)); then
+      debup_report_pending_restarts "$needrestart"
+    fi
     return
   fi
 
@@ -444,6 +516,7 @@ sysup_backend_upgrade() {
 
   if [[ "$DEBUP_UPGRADE_VERB" == upgrade ]]; then
     sysup_apt_upgrade debup_apt_get -y "${extra_args[@]+"${extra_args[@]}"}" || return
+    report_kept_back
   else
     debup_apt_get full-upgrade -y "${extra_args[@]+"${extra_args[@]}"}" || return
   fi
@@ -453,7 +526,7 @@ sysup_backend_upgrade() {
   # every post-upgrade check and service restart, which would be badly wrong
   # after the packages themselves installed successfully.
   debup_apt_get autoclean -y ||
-    printf 'warning: apt-get autoclean failed; the package cache was not reclaimed\n' >&2
+    sysup_warn 'apt-get autoclean failed; the package cache was not reclaimed'
   return 0
 }
 

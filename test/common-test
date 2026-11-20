@@ -56,22 +56,57 @@ export SYSUP_STATE_DIR SYSUP_BOOT_ID_FILE
 # shellcheck source=../lib/sysup/common.sh
 . "$REPO_ROOT/lib/sysup/common.sh"
 
-# The fake backend. Its upgrade can be slowed so the keeper has time to run.
+# The fake backend. Its upgrade can be slowed so the keeper has time to run,
+# can change the installed set, and can record notices or report extras.
 COMMON_UPGRADE_SECONDS=0
 COMMON_UPGRADE_STATUS=0
+COMMON_SNAPSHOT="$(_tmpdir)/snapshot"
+COMMON_UPGRADE_SNAPSHOT=""
+COMMON_UPGRADE_NOTICES=()
+COMMON_UPGRADE_EXTRAS=()
+COMMON_PROBE_STDIN=0
+COMMON_AUTOREMOVE_LOG="$(_tmpdir)/autoremove.log"
+COMMON_EXCLUDE_LOG="$(_tmpdir)/exclude.log"
+COMMON_HOOK_STATE="$(_tmpdir)/hook-state"
 # shellcheck disable=SC2329 # hooks are invoked indirectly by sysup_main.
 sysup_backend_require() { return 0; }
 # shellcheck disable=SC2329
 sysup_backend_usage() { printf 'Usage: sysup [-- fake args...]\n'; }
 # shellcheck disable=SC2329
-sysup_backend_snapshot() { printf 'base 1.0\n'; }
+sysup_backend_snapshot() { cat "$COMMON_SNAPSHOT"; }
 # shellcheck disable=SC2329
 sysup_backend_package_files() { return 0; }
 # shellcheck disable=SC2329
 sysup_backend_upgrade() {
+  local entry line
+
   printf '%s\n' "$*" >>"$COMMON_UPGRADE_LOG"
+  # What the package-manager step saw: a shutdown inhibitor and stdin.
+  if [[ -n "$_SYSUP_INHIBIT_PID" ]] && kill -0 "$_SYSUP_INHIBIT_PID" 2>/dev/null; then
+    printf 'inhibitor=%s\n' "$_SYSUP_INHIBIT_PID" >>"$COMMON_HOOK_STATE"
+  fi
+  if [[ -n "${COMMON_INHIBIT_LOG:-}" ]] && [[ -s "$COMMON_INHIBIT_LOG" ]] &&
+    [[ "$(<"$COMMON_INHIBIT_LOG")" == *'lock granted'* ]]; then
+    printf 'lock granted\n' >>"$COMMON_HOOK_STATE"
+  fi
+  if ((COMMON_PROBE_STDIN)) && IFS= read -r -t 1 line; then
+    printf 'stdin=%s\n' "$line" >>"$COMMON_HOOK_STATE"
+  fi
   sleep "$COMMON_UPGRADE_SECONDS"
+  [[ -z "$COMMON_UPGRADE_SNAPSHOT" ]] || printf '%s\n' "$COMMON_UPGRADE_SNAPSHOT" >"$COMMON_SNAPSHOT"
+  for entry in "${COMMON_UPGRADE_NOTICES[@]+"${COMMON_UPGRADE_NOTICES[@]}"}"; do
+    if [[ "$entry" == warning ]]; then
+      sysup_warn "fake upgrade warning"
+    else
+      sysup_notice "$entry" "fake $entry"
+    fi
+  done
+  SYSUP_EXTRA_UPGRADED_PACKAGES+=("${COMMON_UPGRADE_EXTRAS[@]+"${COMMON_UPGRADE_EXTRAS[@]}"}")
   return "$COMMON_UPGRADE_STATUS"
+}
+# shellcheck disable=SC2329
+sysup_backend_autoremove() {
+  printf '%s\n' "$1" >>"$COMMON_AUTOREMOVE_LOG"
 }
 # shellcheck disable=SC2329
 sysup_backend_parse_arg() {
@@ -84,6 +119,14 @@ sysup_report_failed_units() { return 0; }
 _common_reset() {
   : >"$COMMON_SUDO_LOG"
   : >"$COMMON_UPGRADE_LOG"
+  : >"$COMMON_AUTOREMOVE_LOG"
+  : >"$COMMON_EXCLUDE_LOG"
+  : >"$COMMON_HOOK_STATE"
+  printf 'base 1.0\n' >"$COMMON_SNAPSHOT"
+  COMMON_UPGRADE_SNAPSHOT=""
+  COMMON_UPGRADE_NOTICES=()
+  COMMON_UPGRADE_EXTRAS=()
+  COMMON_PROBE_STDIN=0
   COMMON_UPGRADE_SECONDS=0
   COMMON_UPGRADE_STATUS=0
   COMMON_SUDO_REFRESH_STATUS=0
@@ -465,5 +508,336 @@ if ((EUID != 0)); then
   _assert_eq "common scan: runs as the invoking user without sudo" "scanned" "$result"
   _assert_eq "common scan: does not need sudo installed" "" "$(cat "$COMMON_SUDO_LOG")"
 fi
+
+echo ""
+echo "=== common: notices ==="
+
+notice_file=$(_tmpfile)
+_SYSUP_NOTICE_FILE="$notice_file"
+sysup_notice reboot-required 'reboot required'
+sysup_notice config-merge $'/etc/a.pacnew\n/etc/b.pacnew'
+result=$(sysup_warn 'disk almost full' 2>&1)
+_assert_eq "common notices: sysup_warn prints the usual warning line" \
+  "warning: disk almost full" "$result"
+_assert_eq "common notices: each notice is one kind<TAB>message line" \
+  $'reboot-required\treboot required\nconfig-merge\t/etc/a.pacnew /etc/b.pacnew\nwarning\tdisk almost full' \
+  "$(cat "$notice_file")"
+_assert_eq "common notices: kinds are listed in order" \
+  $'reboot-required\nconfig-merge\nwarning' "$(sysup_notice_kinds "$notice_file")"
+set +e
+result=$(sysup_notice rebot-required 'typo' 2>&1)
+status=$?
+set -e
+_assert_eq "common notices: an unknown kind is a programming error" "2" "$status"
+_assert_contains "common notices: names the unknown kind" "rebot-required" "$result"
+_assert_not_contains "common notices: an unknown kind is not recorded" \
+  "typo" "$(cat "$notice_file")"
+_SYSUP_NOTICE_FILE=""
+result=$(sysup_notice reboot-required 'unrecorded' 2>&1)
+_assert_eq "common notices: without a notice file nothing is printed" "" "$result"
+
+echo ""
+echo "=== common: --exclude ==="
+
+_common_reset
+_common_main --exclude=pkg-a
+_assert_eq "common exclude: a backend without the hook rejects it with 2" "2" "$COMMON_STATUS"
+_assert_contains "common exclude: says the backend cannot exclude" \
+  "does not support --exclude" "$COMMON_RESULT"
+_assert_eq "common exclude: rejection runs nothing" \
+  "" "$(cat "$COMMON_UPGRADE_LOG")$(cat "$COMMON_SUDO_LOG")"
+
+# shellcheck disable=SC2329 # invoked indirectly by sysup_main.
+sysup_backend_exclude() {
+  printf '%s\n' "$@" >"$COMMON_EXCLUDE_LOG"
+}
+
+_common_reset
+_common_main --exclude=pkg-a,lib-b --exclude='kernel-*'
+_assert_eq "common exclude: a supporting backend runs (output: $COMMON_RESULT)" \
+  "0" "$COMMON_STATUS"
+_assert_eq "common exclude: every name reaches the hook once, in order" \
+  $'pkg-a\nlib-b\nkernel-*' "$(cat "$COMMON_EXCLUDE_LOG")"
+_assert_eq "common exclude: names never become package-manager arguments" \
+  "" "$(cat "$COMMON_UPGRADE_LOG")"
+_assert_eq "common exclude: automatic cleanup still runs" \
+  "apply" "$(cat "$COMMON_AUTOREMOVE_LOG")"
+_assert_not_contains "common exclude: no custom-argument cleanup note" \
+  "custom package-manager arguments" "$COMMON_RESULT"
+
+for bad_exclude in --exclude= --exclude=pkg-a,,lib-b '--exclude=pkg-a,' \
+  --exclude=,pkg-a --exclude=-rf '--exclude=two words' $'--exclude=pkg-a,\nlib-b' --exclude; do
+  _common_reset
+  _common_main "$bad_exclude"
+  _assert_eq "common exclude: '$bad_exclude' is a usage error" "2" "$COMMON_STATUS"
+  _assert_eq "common exclude: '$bad_exclude' runs nothing" \
+    "" "$(cat "$COMMON_UPGRADE_LOG")$(cat "$COMMON_EXCLUDE_LOG")"
+done
+
+_common_reset
+_common_main -- --exclude=pkg-a
+_assert_eq "common exclude: after -- it is a package-manager argument" \
+  "--exclude=pkg-a" "$(cat "$COMMON_UPGRADE_LOG")"
+_assert_eq "common exclude: after -- the hook is not called" \
+  "" "$(cat "$COMMON_EXCLUDE_LOG")"
+
+echo ""
+echo "=== common: --cron ==="
+
+# Host state lives in temporary paths, and a fake systemd-inhibit stands in
+# for the real one: it logs its options and runs the watcher it was given.
+SYSUP_RUN_DIR="$(_tmpdir)/run"
+SYSUP_SHUTDOWN_SCHEDULED_FILE="$(_tmpdir)/scheduled"
+SYSUP_SYSTEMD_RUN_DIR=$(_tmpdir)
+COMMON_INHIBIT_LOG="$(_tmpdir)/inhibit.log"
+COMMON_SYSTEMCTL_LOG="$(_tmpdir)/systemctl.log"
+export COMMON_INHIBIT_LOG COMMON_SYSTEMCTL_LOG
+export COMMON_INHIBIT_DELAY=0 COMMON_INHIBIT_FAIL=0
+cat >"$COMMON_MOCK_BIN/systemd-inhibit" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$COMMON_INHIBIT_LOG"
+((COMMON_INHIBIT_FAIL == 0)) || exit 1
+sleep "$COMMON_INHIBIT_DELAY"
+printf 'lock granted\n' >>"$COMMON_INHIBIT_LOG"
+while [[ "${1:-}" == --* ]]; do shift; done
+exec "$@"
+EOF
+# Present so sysup_systemd_running sees systemd; nothing here may call it.
+cat >"$COMMON_MOCK_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$COMMON_SYSTEMCTL_LOG"
+exit 1
+EOF
+chmod +x "$COMMON_MOCK_BIN/systemd-inhibit" "$COMMON_MOCK_BIN/systemctl"
+
+# --cron needs util-linux flock, which every supported Linux family ships but
+# the shared matrix's macOS and Termux hosts may lack. There a stand-in that
+# always grants the lock keeps the other cases running; only the busy-lock
+# case needs the real one.
+COMMON_REAL_FLOCK=1
+if ! command -v flock >/dev/null 2>&1; then
+  COMMON_REAL_FLOCK=0
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$COMMON_MOCK_BIN/flock"
+  chmod +x "$COMMON_MOCK_BIN/flock"
+fi
+
+COMMON_IS_ROOT=1
+# shellcheck disable=SC2329 # invoked indirectly by sysup_main.
+sysup_is_root() { ((COMMON_IS_ROOT)); }
+
+_cron_reset() {
+  _common_reset
+  COMMON_IS_ROOT=1
+  COMMON_INHIBIT_DELAY=0
+  COMMON_INHIBIT_FAIL=0
+  : >"$COMMON_INHIBIT_LOG"
+  : >"$COMMON_SYSTEMCTL_LOG"
+  rm -f "$SYSUP_SHUTDOWN_SCHEDULED_FILE"
+  rm -rf "$SYSUP_STATE_DIR"
+}
+
+_cron_status_field() {
+  sed -n "s/^$1=//p" "$SYSUP_STATE_DIR/last-cron"
+}
+
+_cron_reset
+COMMON_IS_ROOT=0
+_common_main --cron
+_assert_eq "common cron: a non-root caller is a usage error" "2" "$COMMON_STATUS"
+_assert_contains "common cron: says root is required" \
+  "--cron must run as root" "$COMMON_RESULT"
+_assert_eq "common cron: a non-root caller runs nothing" \
+  "" "$(cat "$COMMON_UPGRADE_LOG")$(cat "$COMMON_SUDO_LOG")"
+if [[ ! -e "$SYSUP_RUN_DIR" && ! -e "$SYSUP_STATE_DIR" ]]; then
+  _pass "common cron: a non-root caller creates no state"
+else
+  _fail "common cron: a non-root caller creates no state"
+fi
+
+_cron_reset
+_common_main --cron
+_assert_eq "common cron: a no-op run succeeds" "0" "$COMMON_STATUS"
+_assert_eq "common cron: a no-op run prints nothing" "" "$COMMON_RESULT"
+_assert_eq "common cron: the upgrade still ran" "" "$(cat "$COMMON_UPGRADE_LOG")"
+_assert_contains "common cron: keeps the last log" \
+  "upgrading system" "$(cat "$SYSUP_STATE_DIR/last-cron.log")"
+log_mode=$(LC_ALL=C ls -ld "$SYSUP_STATE_DIR/last-cron.log")
+_assert_eq "common cron: the full log is private" "-rw-------" "${log_mode:0:10}"
+_assert_eq "common cron: records the exit status" "0" "$(_cron_status_field status)"
+_assert_eq "common cron: records no change" "no" "$(_cron_status_field changed)"
+if [[ "$(_cron_status_field time)" =~ ^[0-9]+$ ]]; then
+  _pass "common cron: records the time as epoch seconds"
+else
+  _fail "common cron: records the time as epoch seconds"
+fi
+_assert_eq "common cron: leaves no buffer behind" \
+  "cron.lock" "$(ls "$SYSUP_RUN_DIR")"
+_assert_eq "common cron: never calls systemctl itself" "" "$(cat "$COMMON_SYSTEMCTL_LOG")"
+
+_cron_reset
+COMMON_UPGRADE_STATUS=7
+_common_main --cron
+_assert_eq "common cron: the upgrade status stays final" "7" "$COMMON_STATUS"
+_assert_contains "common cron: a failed run prints its log" \
+  "the system upgrade failed (status 7)" "$COMMON_RESULT"
+_assert_eq "common cron: records the failed status" "7" "$(_cron_status_field status)"
+
+_cron_reset
+COMMON_UPGRADE_SNAPSHOT="base 2.0"
+_common_main --cron
+_assert_eq "common cron: an upgrading run succeeds" "0" "$COMMON_STATUS"
+_assert_contains "common cron: a package change prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+_assert_eq "common cron: records the change" "yes" "$(_cron_status_field changed)"
+
+# Installs and removals count, though the version diff ignores them.
+_cron_reset
+COMMON_UPGRADE_SNAPSHOT=$'base 1.0\nnew-dep 1.0'
+_common_main --cron
+_assert_contains "common cron: a new install prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+
+_cron_reset
+COMMON_UPGRADE_EXTRAS=(base)
+_common_main --cron
+_assert_contains "common cron: a same-version rebuild prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+_assert_eq "common cron: a rebuild counts as a change" "yes" "$(_cron_status_field changed)"
+
+for kind in reboot-required config-merge deferred-restart kept-back warning; do
+  _cron_reset
+  COMMON_UPGRADE_NOTICES=("$kind")
+  _common_main --cron
+  _assert_contains "common cron: a $kind notice prints the log" \
+    "upgrading system" "$COMMON_RESULT"
+done
+
+_cron_reset
+COMMON_UPGRADE_NOTICES=(excluded-pending excluded-pending)
+_common_main --cron
+_assert_eq "common cron: excluded-pending notices alone stay silent" "" "$COMMON_RESULT"
+
+_cron_reset
+COMMON_UPGRADE_NOTICES=(excluded-pending reboot-required)
+_common_main --cron
+_assert_contains "common cron: excluded-pending with another notice prints the log" \
+  "upgrading system" "$COMMON_RESULT"
+
+_cron_reset
+COMMON_PROBE_STDIN=1
+set +e
+COMMON_RESULT=$(sysup_main --cron 2>&1 <<<"y")
+set -e
+_assert_not_contains "common cron: the run reads nothing from cron's stdin" \
+  "stdin=" "$(cat "$COMMON_HOOK_STATE")"
+
+_cron_reset
+COMMON_INHIBIT_DELAY=0.2
+_common_main --cron
+_assert_contains "common cron: the upgrade starts after the lock is granted" \
+  "lock granted" "$(cat "$COMMON_HOOK_STATE")"
+inhibit_pid=$(sed -n 's/^inhibitor=//p' "$COMMON_HOOK_STATE")
+if [[ -n "$inhibit_pid" ]]; then
+  _pass "common cron: the upgrade runs under a shutdown inhibitor"
+else
+  _fail "common cron: the upgrade runs under a shutdown inhibitor"
+fi
+_assert_contains "common cron: inhibits shutdown as sysup in block mode" \
+  "--what=shutdown --who=sysup --mode=block" "$(cat "$COMMON_INHIBIT_LOG")"
+if [[ -n "$inhibit_pid" ]] && _common_poll "! kill -0 $inhibit_pid 2>/dev/null" 5; then
+  _pass "common cron: the inhibitor is released when the run ends"
+else
+  _fail "common cron: the inhibitor is released when the run ends"
+fi
+
+_cron_reset
+COMMON_INHIBIT_FAIL=1
+_common_main --cron
+_assert_eq "common cron: inhibitor acquisition failure fails the run" "1" "$COMMON_STATUS"
+_assert_contains "common cron: reports the inhibitor failure" \
+  "could not acquire a shutdown inhibitor" "$COMMON_RESULT"
+_assert_eq "common cron: inhibitor failure runs no package transaction" \
+  "" "$(cat "$COMMON_UPGRADE_LOG")$(cat "$COMMON_AUTOREMOVE_LOG")"
+
+_cron_reset
+_common_main
+_assert_eq "common cron: an ordinary run takes no inhibitor" "" "$(cat "$COMMON_INHIBIT_LOG")"
+
+_cron_reset
+saved_systemd_dir="$SYSUP_SYSTEMD_RUN_DIR"
+SYSUP_SYSTEMD_RUN_DIR="$(_tmpdir)/absent"
+_common_main --cron
+SYSUP_SYSTEMD_RUN_DIR="$saved_systemd_dir"
+_assert_eq "common cron: without systemd the upgrade runs uninhibited" "0" "$COMMON_STATUS"
+_assert_eq "common cron: without systemd no inhibitor starts" "" "$(cat "$COMMON_INHIBIT_LOG")"
+
+_cron_reset
+: >"$SYSUP_SHUTDOWN_SCHEDULED_FILE"
+_common_main --cron
+_assert_eq "common cron: a scheduled shutdown skips the run successfully" "0" "$COMMON_STATUS"
+_assert_contains "common cron: a scheduled shutdown prints one line" \
+  "skipped; a shutdown is scheduled" "$COMMON_RESULT"
+_assert_eq "common cron: a scheduled shutdown runs nothing" "" "$(cat "$COMMON_UPGRADE_LOG")"
+
+# Another --cron run holds the lock: a background holder, polled until it
+# has the lock rather than slept for.
+if ((COMMON_REAL_FLOCK)); then
+  _cron_reset
+  lock_ready="$(_tmpdir)/lock-ready"
+  (
+    exec 9>>"$SYSUP_RUN_DIR/cron.lock"
+    flock -n 9 || exit 1
+    : >"$lock_ready"
+    exec sleep 30
+  ) &
+  lock_holder=$!
+  if _common_poll "[[ -e '$lock_ready' ]]" 5; then
+    _common_main --cron
+    _assert_eq "common cron: a held lock exits 75" "75" "$COMMON_STATUS"
+    _assert_contains "common cron: a held lock prints one line" \
+      "another sysup --cron run holds" "$COMMON_RESULT"
+    _assert_eq "common cron: a held lock runs nothing" "" "$(cat "$COMMON_UPGRADE_LOG")"
+  else
+    _fail "common cron: the background lock holder never took the lock"
+  fi
+  kill "$lock_holder" 2>/dev/null || true
+  wait "$lock_holder" 2>/dev/null || true
+else
+  _pass "common cron: busy-lock case skipped; this host has no flock"
+fi
+
+_cron_reset
+_common_main --cron
+_assert_eq "common cron: the lock is free again once its holder exits" "0" "$COMMON_STATUS"
+
+_cron_reset
+saved_run_dir="$SYSUP_RUN_DIR"
+SYSUP_RUN_DIR="$(_tmpdir)/run-link"
+ln -s "$(_tmpdir)" "$SYSUP_RUN_DIR"
+_common_main --cron
+_assert_eq "common cron: a symlinked run directory is refused" "1" "$COMMON_STATUS"
+_assert_eq "common cron: a symlinked run directory runs nothing" "" "$(cat "$COMMON_UPGRADE_LOG")"
+SYSUP_RUN_DIR="$(_tmpdir)/run-lock-link"
+mkdir -p "$SYSUP_RUN_DIR"
+ln -s "$(_tmpfile)" "$SYSUP_RUN_DIR/cron.lock"
+_common_main --cron
+_assert_eq "common cron: a symlinked lock file is refused" "1" "$COMMON_STATUS"
+SYSUP_RUN_DIR="$saved_run_dir"
+
+_cron_reset
+_common_main --cron --help
+_assert_eq "common cron: --help still succeeds" "0" "$COMMON_STATUS"
+_assert_contains "common cron: --help is printed, not buffered" "Usage: sysup" "$COMMON_RESULT"
+
+_cron_reset
+_common_main --cron --frobnicate
+_assert_eq "common cron: an unknown argument is still a usage error" "2" "$COMMON_STATUS"
+_assert_contains "common cron: a usage error prints the log" \
+  "unknown argument: --frobnicate" "$COMMON_RESULT"
+
+_cron_reset
+_common_main --cron -- --cron
+_assert_eq "common cron: --cron after -- is a package-manager argument" \
+  "--cron" "$(cat "$COMMON_UPGRADE_LOG")"
 
 _test_summary

@@ -26,6 +26,72 @@ sysup_log() {
   printf '\n==> %s\n' "$*"
 }
 
+# ---------------------------------------------------------------------------
+# Structured notices
+#
+# Reports that matter after a successful run (a pending reboot, a config merge,
+# a deferred restart, a warning) are printed for the operator and also
+# recorded here, so policy that depends on them -- whether an unattended
+# --cron run mails its log -- reads a kind instead of matching message text.
+# ---------------------------------------------------------------------------
+
+# Every kind a run can record. This is the one owner of the spelling: the cron
+# report policy and the backends both use these words.
+#   reboot-required   the upgrade needs a reboot to take effect
+#   config-merge      a .pacnew/.rpmnew/.dpkg-dist style file awaits a merge
+#   deferred-restart  a service was left on pre-upgrade code
+#   excluded-pending  a package excluded with --exclude still has an update
+#   kept-back         the package manager held back an available upgrade
+#   warning           anything sysup_warn reported
+SYSUP_NOTICE_KINDS=(reboot-required config-merge deferred-restart
+  excluded-pending kept-back warning)
+
+# Where notices are recorded, one "kind<TAB>message" line each. Empty means
+# nothing records them, and sysup_notice only validates its kind. A file
+# rather than a shell array, because reports also run inside command
+# substitutions, whose variable assignments never reach the run.
+_SYSUP_NOTICE_FILE=""
+
+# Record a notice of `kind`. Prints nothing: each call site keeps printing its
+# own operator-facing text, so recording a notice never changes the output.
+# An unknown kind is a programming error and returns 2.
+#
+# Recording is advisory: a failed write must not fail the report around it.
+sysup_notice() {
+  local kind="$1" message known valid=0
+  shift
+  message="$*"
+
+  for known in "${SYSUP_NOTICE_KINDS[@]}"; do
+    [[ "$kind" != "$known" ]] || valid=1
+  done
+  if ((valid == 0)); then
+    printf 'error: unknown sysup notice kind: %s\n' "$kind" >&2
+    return 2
+  fi
+  [[ -n "$_SYSUP_NOTICE_FILE" ]] || return 0
+  # One line per notice: fold embedded newlines so the record stays parsable.
+  printf '%s\t%s\n' "$kind" "${message//$'\n'/ }" >>"$_SYSUP_NOTICE_FILE" ||
+    true
+}
+
+# Print `warning: <message>` on stderr and record it as a `warning` notice.
+sysup_warn() {
+  printf 'warning: %s\n' "$*" >&2
+  sysup_notice warning "$*"
+}
+
+# Print the kinds recorded in notice file "$1", one per line, in order.
+sysup_notice_kinds() {
+  local kind
+
+  [[ -s "$1" ]] || return 0
+  while IFS=$'\t' read -r kind _; do
+    [[ -n "$kind" ]] && printf '%s\n' "$kind"
+  done <"$1"
+  return 0
+}
+
 sysup_need_cmds() {
   local missing=() cmd
 
@@ -261,9 +327,20 @@ sysup_unique_packages() {
 # ---------------------------------------------------------------------------
 
 # Handle one backend-specific flag. Return 0 when consumed, 1 to reject it
-# (sysup then exits 2). Single-token flags only.
+# (sysup then exits 2). Single-token flags only; a value travels in the same
+# token after `=`.
 sysup_backend_parse_arg() {
   return 1
+}
+
+# Leave the packages named in "$@" (as given to --exclude, possibly globs) out
+# of this run's upgrade. Called once, before anything else runs, with every
+# name. Return 0 to accept; any other status ends the run with it. The default
+# rejects with 2, so a backend that cannot honor exclusions never upgrades a
+# package the operator asked to keep.
+sysup_backend_exclude() {
+  printf 'error: %s does not support --exclude\n' "${SYSUP_BACKEND_NAME:-this backend}" >&2
+  return 2
 }
 
 # Report host state worth seeing before the upgrade runs.
@@ -306,6 +383,10 @@ sysup_backend_restart_services() {
 sysup_usage_common_options() {
   cat <<'EOF'
   --check-only                    skip the upgrade; only run post-upgrade checks
+  --cron                          unattended mode for root's crontab: skip when
+                                  another --cron run or a scheduled shutdown is
+                                  active, and print the buffered log only when
+                                  something changed, failed, or needs attention
   --no-autoremove                 only report packages no longer required,
                                   instead of removing them after the upgrade
   --no-restart-upgraded-services  skip automatic restart of active services
@@ -326,28 +407,346 @@ EOF
 # Calling _sysup_run on the left of || turns errexit off for everything it
 # runs, at any depth. Every step in it must therefore check its own status
 # rather than rely on set -e to stop the run.
+#
+# --cron changes how the whole run executes (privilege, locking, output), so
+# it is taken out here, before the shared parser sees the rest. Words after
+# `--` belong to the package manager and are never inspected. --help with
+# --cron prints help directly: buffering it would make it silent.
 sysup_main() {
-  local status=0
+  local status=0 cron=0 help=0
+  local -a args=()
 
-  _sysup_run "$@" || status=$?
+  while (($#)); do
+    case "$1" in
+      --cron) cron=1 ;;
+      --)
+        args+=("$@")
+        break
+        ;;
+      *)
+        [[ "$1" != -h && "$1" != --help ]] || help=1
+        args+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  if ((cron && ! help)); then
+    _sysup_cron "${args[@]+"${args[@]}"}" || status=$?
+  else
+    _sysup_run "${args[@]+"${args[@]}"}" || status=$?
+  fi
   sysup_stop_sudo_keeper
   return "$status"
 }
 
+# ---------------------------------------------------------------------------
+# Unattended runs (--cron)
+# ---------------------------------------------------------------------------
+
+# Where --cron keeps its lock and its in-progress log. /run is cleared on
+# boot, so a lock or log orphaned by a crash never outlives the boot.
+# Overridable for tests.
+SYSUP_RUN_DIR="${SYSUP_RUN_DIR:-/run/sysup}"
+# systemd-logind writes this while a shutdown or reboot is scheduled (as
+# unattended-upgrades does with `shutdown -r 04:20`). Overridable for tests.
+SYSUP_SHUTDOWN_SCHEDULED_FILE="${SYSUP_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}"
+# EX_TEMPFAIL from sysexits.h: another --cron run holds the lock; try later.
+SYSUP_EXIT_LOCKED=75
+
+# Set for the duration of a --cron run; steps that behave differently
+# unattended (the shutdown inhibitor) read it.
+_SYSUP_CRON=0
+# The open file descriptor holding the --cron lock, and the shutdown
+# inhibitor's process, while each is held.
+_SYSUP_CRON_LOCK_FD=""
+_SYSUP_INHIBIT_PID=""
+# Set by _sysup_run when the package snapshots before and after the upgrade
+# differ: any install, removal, or version change.
+_SYSUP_PACKAGES_CHANGED=0
+
+# A function so tests can run --cron without being root.
+sysup_is_root() {
+  ((EUID == 0))
+}
+
+# Create the run directory and take the nonblocking --cron lock. Returns
+# SYSUP_EXIT_LOCKED, after one line of explanation, when another --cron run
+# holds it.
+#
+# The directory and the lock are refused when they are symlinks: this runs as
+# root, and following a link planted there would create or truncate files
+# elsewhere. A missing /run/sysup is created root-owned 0755.
+#
+# Best effort by design: only --cron runs take this lock, so it keeps two
+# scheduled runs from overlapping, and the package managers' own locks still
+# guard against an interactive run. Children inherit the descriptor, so a
+# daemon a package script starts directly (rather than through systemd) can
+# keep the lock held until it exits.
+_sysup_cron_lock() {
+  local dir="$SYSUP_RUN_DIR" lock
+
+  if [[ -L "$dir" ]]; then
+    printf 'error: %s is a symlink; refusing to use it\n' "$dir" >&2
+    return 1
+  fi
+  # -m applies to the run directory alone; its parent is /run.
+  # shellcheck disable=SC2174
+  mkdir -p -m 0755 -- "$dir" || return
+  if [[ -L "$dir" || ! -d "$dir" ]]; then
+    printf 'error: %s is not a directory\n' "$dir" >&2
+    return 1
+  fi
+  lock="$dir/cron.lock"
+  if [[ -L "$lock" ]]; then
+    printf 'error: %s is a symlink; refusing to use it\n' "$lock" >&2
+    return 1
+  fi
+  exec {_SYSUP_CRON_LOCK_FD}>>"$lock" || return
+  if ! flock -n "$_SYSUP_CRON_LOCK_FD"; then
+    exec {_SYSUP_CRON_LOCK_FD}>&-
+    _SYSUP_CRON_LOCK_FD=""
+    printf 'sysup: skipped; another sysup --cron run holds %s\n' "$lock"
+    return "$SYSUP_EXIT_LOCKED"
+  fi
+}
+
+_sysup_cron_unlock() {
+  [[ -n "$_SYSUP_CRON_LOCK_FD" ]] || return 0
+  flock -u "$_SYSUP_CRON_LOCK_FD"
+  exec {_SYSUP_CRON_LOCK_FD}>&-
+  _SYSUP_CRON_LOCK_FD=""
+}
+
+# Take a systemd shutdown inhibitor for the package-manager step of a --cron
+# run, so a scheduled reboot (unattended-upgrades', say) waits instead of
+# interrupting a transaction halfway. Best effort and --cron only: without
+# systemd or systemd-inhibit the step simply runs uninhibited.
+#
+# systemd-inhibit can only wrap an external command, not this shell's
+# functions, so it holds the lock around a watcher that exits when this shell
+# does. That bounds a lock orphaned by a killed run to a few seconds; the
+# normal release kills systemd-inhibit, whose child gets SIGTERM with it. The
+# watcher reads nothing from this shell, so no descriptor inherited by a
+# package script's long-lived child can keep the inhibitor alive.
+sysup_inhibit_shutdown() {
+  ((_SYSUP_CRON)) || return 0
+  [[ -z "$_SYSUP_INHIBIT_PID" ]] || return 0
+  sysup_systemd_running || return 0
+  command -v systemd-inhibit >/dev/null 2>&1 || return 0
+
+  # The --cron lock descriptor is closed for it: the watcher's last sleep can
+  # outlive the release by a few seconds, and must not hold the lock then.
+  # $BASHPID is read here: inside the background job it names the job.
+  local owner="$BASHPID" ready deadline
+
+  ready=$(mktemp "$SYSUP_RUN_DIR/inhibit-ready.XXXXXX") || return
+  if [[ -n "$_SYSUP_CRON_LOCK_FD" ]]; then
+    _sysup_start_inhibitor "$owner" "$ready" {_SYSUP_CRON_LOCK_FD}>&- &
+  else
+    _sysup_start_inhibitor "$owner" "$ready" &
+  fi
+  _SYSUP_INHIBIT_PID=$!
+
+  # The watcher only starts once logind has granted the lock. Wait for its
+  # signal before letting the package manager mutate anything.
+  deadline=$((SECONDS + 10))
+  while kill -0 "$_SYSUP_INHIBIT_PID" 2>/dev/null; do
+    if [[ -s "$ready" ]]; then
+      rm -f -- "$ready"
+      return 0
+    fi
+    ((SECONDS < deadline)) || break
+    sleep 0.05
+  done
+  sysup_release_shutdown_inhibitor
+  rm -f -- "$ready"
+  printf 'error: could not acquire a shutdown inhibitor\n' >&2
+  return 1
+}
+
+# Signal readiness through "$2", then watch the shell whose pid is "$1".
+# A separate function lets the caller close descriptors for it alone.
+_sysup_start_inhibitor() {
+  # The watcher expands the positional parameters in its own shell.
+  # shellcheck disable=SC2016
+  exec systemd-inhibit --what=shutdown --who=sysup --mode=block \
+    --why="sysup is upgrading packages" \
+    sh -c 'printf "ready\n" >"$2" || exit; while kill -0 "$1" 2>/dev/null; do sleep 5; done' \
+    sh "$1" "$2" \
+    </dev/null >/dev/null
+}
+
+sysup_release_shutdown_inhibitor() {
+  local pid="$_SYSUP_INHIBIT_PID"
+
+  [[ -n "$pid" ]] || return 0
+  _SYSUP_INHIBIT_PID=""
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# Decide whether a finished --cron run prints its log. "$1" is the run's exit
+# status, "$2" yes/no for a package change, "$3" the notice file. Returns 0 to
+# print. A run that changed nothing and recorded nothing worth reading stays
+# silent, so cron mails only what needs attention; an excluded package with an
+# update is expected on every run while the exclusion stands, so it alone does
+# not mail.
+sysup_cron_should_report() {
+  local status="$1" changed="$2" notices="$3" kind
+
+  ((status == 0)) || return 0
+  [[ "$changed" != yes ]] || return 0
+  while IFS= read -r kind; do
+    [[ "$kind" == excluded-pending ]] || return 0
+  done < <(sysup_notice_kinds "$notices")
+  return 1
+}
+
+# Keep the last --cron log and a machine-readable status beside the deferred-
+# restart record, each replaced by a rename so a reader never sees half of it.
+# last-cron holds `time=<epoch>`, `status=<exit status>`, `changed=yes|no`.
+_sysup_cron_save_state() {
+  local log="$1" status="$2" changed="$3" dir="$SYSUP_STATE_DIR" tmp
+
+  install -d -m 0755 -- "$dir" || return
+  tmp="$(mktemp "$dir/.last-cron.log.XXXXXX")" || return
+  # Keep the mktemp mode: root's package hooks can log sensitive details.
+  if ! { cat -- "$log" >"$tmp" &&
+    mv -f -- "$tmp" "$dir/last-cron.log"; }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  tmp="$(mktemp "$dir/.last-cron.XXXXXX")" || return
+  if ! { printf 'time=%s\nstatus=%s\nchanged=%s\n' "$(date +%s)" "$status" "$changed" >"$tmp" &&
+    chmod 0644 -- "$tmp" && mv -f -- "$tmp" "$dir/last-cron"; }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# Run sysup unattended from root's crontab. Cron mails whatever a job prints,
+# so the run's output is buffered and printed only when it failed, changed
+# packages, or recorded a notice; a quiet night sends nothing.
+_sysup_cron() {
+  local status=0 changed=no log="" notices=""
+
+  # Root only, checked before anything else: as another user the run would
+  # stop at sudo prompts nobody answers, and it could not take the lock or
+  # write the state below.
+  if ! sysup_is_root; then
+    printf 'error: --cron must run as root\n' >&2
+    return 2
+  fi
+  if ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] == 0)); then
+    printf 'error: --cron requires Bash 4.1 or newer\n' >&2
+    return 2
+  fi
+  if [[ -e "$SYSUP_SHUTDOWN_SCHEDULED_FILE" ]]; then
+    printf 'sysup: skipped; a shutdown is scheduled (%s)\n' "$SYSUP_SHUTDOWN_SCHEDULED_FILE"
+    return 0
+  fi
+  sysup_need_cmds flock || return
+  _sysup_cron_lock || return
+
+  # The buffer lives beside the lock, under the root-owned run directory,
+  # rather than in a shared /tmp.
+  log="$(mktemp "$SYSUP_RUN_DIR/cron-log.XXXXXX")" || status=$?
+  if ((status == 0)); then
+    notices="$(mktemp "$SYSUP_RUN_DIR/cron-notices.XXXXXX")" || status=$?
+  fi
+  if ((status != 0)); then
+    rm -f -- "$log"
+    _sysup_cron_unlock
+    return "$status"
+  fi
+
+  _SYSUP_PACKAGES_CHANGED=0
+  SYSUP_EXTRA_UPGRADED_PACKAGES=()
+  _SYSUP_CRON=1
+  _SYSUP_NOTICE_FILE="$notices"
+  # stdin from /dev/null: nothing can prompt under cron, and a package
+  # manager that tried would otherwise read cron's stdin.
+  _sysup_run "$@" >"$log" 2>&1 </dev/null || status=$?
+  _SYSUP_NOTICE_FILE=""
+  _SYSUP_CRON=0
+
+  if ((_SYSUP_PACKAGES_CHANGED || ${#SYSUP_EXTRA_UPGRADED_PACKAGES[@]})); then
+    changed=yes
+  fi
+  if sysup_cron_should_report "$status" "$changed" "$notices"; then
+    cat -- "$log"
+  fi
+  # Outside the buffer, so a failure to keep the record reaches cron mail.
+  _sysup_cron_save_state "$log" "$status" "$changed" ||
+    printf 'warning: could not record the last --cron run in %s\n' "$SYSUP_STATE_DIR" >&2
+  rm -f -- "$log" "$notices"
+  _sysup_cron_unlock
+  return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# The shared run
+# ---------------------------------------------------------------------------
+
+# Package names and the `*`/`?` globs pacman and dnf accept. The first
+# character may not be `-`, which a package manager would read as an option.
+_SYSUP_EXCLUDE_NAME_RE='^[A-Za-z0-9@_+.*?][A-Za-z0-9@_+.*?:-]*$'
+
+# Print the names in one --exclude value, one per line. An empty value, an
+# empty element (a stray comma), or anything else that is not a package name
+# is a usage error.
+_sysup_parse_excludes() {
+  local value="$1" name
+  local -a names=()
+
+  if [[ -z "$value" ]]; then
+    printf 'error: --exclude needs package names, as in --exclude=PKG[,PKG...]\n' >&2
+    return 2
+  fi
+  if [[ "$value" == *$'\n'* ]]; then
+    printf 'error: --exclude package names must be on one line\n' >&2
+    return 2
+  fi
+  IFS=, read -ra names <<<"$value"
+  # read drops one trailing empty field, which still means a stray comma.
+  [[ "$value" != *, ]] || names+=("")
+  for name in "${names[@]}"; do
+    if [[ ! "$name" =~ $_SYSUP_EXCLUDE_NAME_RE ]]; then
+      printf 'error: invalid package name in --exclude: %s\n' "${name:-(empty)}" >&2
+      return 2
+    fi
+    printf '%s\n' "$name"
+  done
+}
+
 _sysup_run() {
   local check_only=0 restart_failed=0 restart_upgraded=1 autoremove=1
-  local -a upgrade_args=()
+  local -a upgrade_args=() excludes=()
   local -a upgraded_packages=()
   local before_packages="" after_packages="" stage=""
   local changed_listing="" unique_listing="" extra_listing=""
   local -a extra_packages=()
   local upgrade_status=0 status=0
   local followup_status=0 upgrade_attempted=0 package_diff_known=0
+  local exclude_listing
 
   while (($#)); do
     case "$1" in
       --check-only)
         check_only=1
+        ;;
+      # A value rides in the same token so the parser contract stays one
+      # token per flag. Exclusions never join the `--` arguments: those
+      # disable automatic cleanup, and keeping a package back is no reason
+      # to skip it.
+      --exclude=*)
+        exclude_listing="$(_sysup_parse_excludes "${1#--exclude=}")" || return
+        mapfile -t -O "${#excludes[@]}" excludes <<<"$exclude_listing"
+        ;;
+      --exclude)
+        printf 'error: --exclude takes its packages in the same word, as in --exclude=PKG[,PKG...]\n' >&2
+        return 2
         ;;
       # --autoremove predates removal becoming the default; it stays accepted
       # so existing invocations keep working, and the last flag wins.
@@ -388,6 +787,12 @@ _sysup_run() {
     shift
   done
 
+  # Before anything else runs, so a backend that cannot exclude packages
+  # rejects the request instead of upgrading them.
+  if ((${#excludes[@]})); then
+    sysup_backend_exclude "${excludes[@]}" || return
+  fi
+
   sysup_backend_require || return
   sysup_backend_preamble || return
 
@@ -411,6 +816,13 @@ _sysup_run() {
       stage="acquiring sudo credentials"
       sysup_warm_sudo || upgrade_status=$?
       ((upgrade_status != 0)) || sysup_start_sudo_keeper
+    fi
+
+    if ((upgrade_status == 0)); then
+      # Held across the upgrade and the removal below: both run package
+      # transactions a reboot must not cut short.
+      stage="acquiring the shutdown inhibitor"
+      sysup_inhibit_shutdown || upgrade_status=$?
     fi
 
     if ((upgrade_status == 0)); then
@@ -442,6 +854,7 @@ _sysup_run() {
         sysup_backend_autoremove report || status=1
       fi
     fi
+    sysup_release_shutdown_inhibitor
 
     # Package managers can install some packages and still return non-zero.
     # Once the upgrade command has started, always take the second snapshot so
@@ -449,6 +862,13 @@ _sysup_run() {
     if ((upgrade_attempted)); then
       followup_status=0
       sysup_backend_snapshot >"$after_packages" || followup_status=$?
+      # Any difference counts, installs and removals included, which the
+      # version diff below deliberately ignores; --cron reports on it.
+      # Compared in the shell because cmp (diffutils) is not in every base
+      # install; a package list is small.
+      if ((followup_status == 0)) && [[ "$(<"$before_packages")" != "$(<"$after_packages")" ]]; then
+        _SYSUP_PACKAGES_CHANGED=1
+      fi
       if ((followup_status == 0)); then
         changed_listing="$(sysup_changed_packages "$before_packages" "$after_packages")" ||
           followup_status=$?
@@ -504,7 +924,7 @@ _sysup_run() {
 
   # Every remaining step contributes to the exit status instead of
   # short-circuiting, so one run surfaces every problem it can see.
-  sysup_backend_checks || status=1
+  sysup_backend_checks "$check_only" || status=1
 
   # Nothing was upgraded under --check-only, so there is nothing to restart.
   # This is a guarantee of the driver rather than of each backend: a backend

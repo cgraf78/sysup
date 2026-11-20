@@ -48,7 +48,7 @@ ZYPUP_UPGRADE_REBOOT_NEEDED=0
 
 sysup_backend_usage() {
   cat <<'EOF'
-Usage: sysup [--no-autoremove] [--check-only]
+Usage: sysup [--no-autoremove] [--check-only] [--cron]
              [--no-restart-upgraded-services] [--restart-failed] [--]
              [-- zypper args...]
 
@@ -77,6 +77,8 @@ automatically: a package that needs license confirmation stops the upgrade.
 
 zypup never performs a release upgrade between Leap or SLES versions; use the
 distribution's documented release-upgrade procedure for that.
+
+--exclude is not supported; lock a package with zypper addlock instead.
 EOF
 }
 
@@ -281,12 +283,13 @@ report_pending_state() {
 
   if zypup_reboot_required; then
     printf 'reboot required to complete this upgrade\n'
+    sysup_notice reboot-required 'reboot required to complete this upgrade'
   else
     reboot_status=$?
     if ((reboot_status == 1)); then
       printf 'ok: no reboot required\n'
     else
-      printf 'warning: could not determine whether a reboot is required; zypper needs-rebooting is unavailable or failed\n' >&2
+      sysup_warn 'could not determine whether a reboot is required; zypper needs-rebooting is unavailable or failed'
     fi
   fi
 
@@ -321,7 +324,7 @@ sysup_backend_preamble() {
 
   if ! listing="$(zypup_locked_packages)"; then
     sysup_log "package locks (unknown)"
-    printf 'warning: could not read %s; package locks are unknown\n' "$ZYPUP_LOCKS_FILE" >&2
+    sysup_warn "could not read $ZYPUP_LOCKS_FILE; package locks are unknown"
     return 0
   fi
   if [[ -n "$listing" ]]; then
@@ -369,7 +372,7 @@ sysup_backend_autoremove() {
   local listing line
 
   if ! listing="$(zypup_zypper_local --quiet packages --unneeded)"; then
-    printf 'warning: could not determine which packages are no longer required\n' >&2
+    sysup_warn 'could not determine which packages are no longer required'
     return 0
   fi
   if [[ -z "$listing" ]]; then
