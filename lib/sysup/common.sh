@@ -619,7 +619,7 @@ _sysup_cron_save_state() {
   fi
   tmp="$(mktemp "$dir/.last-cron.XXXXXX")" || return
   if ! { printf 'time=%s\nstatus=%s\nchanged=%s\n' "$(date +%s)" "$status" "$changed" >"$tmp" &&
-    chmod 0644 -- "$tmp" && mv -f -- "$tmp" "$dir/last-cron"; }; then
+    chmod -- 0644 "$tmp" && mv -f -- "$tmp" "$dir/last-cron"; }; then
     rm -f -- "$tmp"
     return 1
   fi
