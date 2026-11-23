@@ -69,6 +69,22 @@ _sysup_test_cleanup() {
 }
 trap _sysup_test_cleanup EXIT
 
+case "$_SYSUP_TEST_TMP_ROOT" in
+  *:*)
+    printf '%s\n' 'sysup test: TMPDIR must not contain a colon (:) for mock PATH entries' >&2
+    exit 2
+    ;;
+esac
+
+# Fixture Git commands inherit configuration ahead of their working dir and
+# local repo config. Clear caller selectors before creating any fixtures.
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_DIR GIT_GRAFT_FILE
+unset GIT_INDEX_FILE GIT_NAMESPACE GIT_NO_REPLACE_OBJECTS GIT_OBJECT_DIRECTORY
+unset GIT_PREFIX GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_SHALLOW_FILE
+unset GIT_TEMPLATE_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$_SYSUP_TEST_TMP_ROOT/gitconfig"
+
 _tmpdir() {
   local path
   path=$(mktemp -d "$_SYSUP_TEST_TMP_ROOT/dir.XXXXXXXX") || {
