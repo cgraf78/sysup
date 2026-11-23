@@ -2789,6 +2789,48 @@ _assert_contains "archup exclude: an unrecognized listing is a warning, not a gu
 echo ""
 echo "=== archup: failed install hooks ==="
 
+# Exercise the silent cron path with named FIFO creation disabled, using
+# the real upgrade driver and its in-process package manager fixtures.
+_archup_mock_reset
+_archup_mock_add_package steady-pkg 1 ok 1.0
+ARCHUP_IS_ROOT=1
+SUDO_USER=chris
+# shellcheck disable=SC2034 # Read by the sourced backend.
+_SYSUP_CRON=1
+no_fifo_status=0
+no_fifo_result=$(
+  # shellcheck disable=SC2329 # The old backend calls this during setup.
+  mkfifo() {
+    return 73
+  }
+  sysup_backend_upgrade 2>&1
+) || no_fifo_status=$?
+_assert_eq "archup capture: a silent upgrade completes without a named FIFO" "0" "$no_fifo_status"
+_assert_not_contains "archup capture: a silent upgrade has no copier warning" \
+  "could not capture package-manager errors" "$no_fifo_result"
+
+capture_probe=$(_tmpdir)
+ARCHUP_PM_ERRORS="$capture_probe/stderr.log"
+capture_marker=
+# shellcheck disable=SC2329 # Called indirectly by archup_run_captured.
+_archup_capture_fixture() {
+  local input
+  IFS= read -r input || return
+  capture_marker=$input
+  printf '%s' "$input"
+  printf '%s' 'last stderr bytes' >&2
+  return 17
+}
+capture_status=0
+archup_run_captured _archup_capture_fixture <<<fixture \
+  >"$capture_probe/stdout" 2>"$capture_probe/stderr" || capture_status=$?
+_assert_eq "archup capture: the command runs in the caller's shell" fixture "$capture_marker"
+_assert_eq "archup capture: preserves the command's exit status" 17 "$capture_status"
+_assert_eq "archup capture: the command retains stdin and stdout" fixture "$(cat "$capture_probe/stdout")"
+_assert_eq "archup capture: shows the original stderr" 'last stderr bytes' "$(cat "$capture_probe/stderr")"
+_assert_eq "archup capture: waits for the final stderr bytes" 'last stderr bytes' "$(cat "$ARCHUP_PM_ERRORS")"
+ARCHUP_PM_ERRORS=
+
 _archup_mock_reset
 _archup_mock_add_package steady-pkg 1 ok 1.0
 ARCHUP_PM_STDERR=$'(4/5) Updating linux initcpios...\n\033[1;31merror:\033[0m command failed to execute correctly'
