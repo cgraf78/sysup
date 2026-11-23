@@ -5,6 +5,45 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=lib/test.sh
 source "$ROOT/test/lib/test.sh"
 
+# A hook can export selectors that override git -C and fixture-local config.
+# Both repositories and the caller-config sentinel are owned by this test.
+fixture=$(_tmpdir) || exit 1
+mkdir "$fixture/caller" "$fixture/target" || exit 1
+git -C "$fixture/caller" init --quiet --initial-branch=caller --template='' || exit 1
+printf '[fixture]\n\towner = caller\n' >"$fixture/gitconfig"
+status=0
+# The child shell expands its own positional parameters.
+# shellcheck disable=SC2016
+output=$(env -u BASH_ENV -u ENV \
+  GIT_DIR="$fixture/caller/.git" GIT_WORK_TREE="$fixture/caller" \
+  GIT_CONFIG_GLOBAL="$fixture/gitconfig" GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=fixture.injected GIT_CONFIG_VALUE_0=caller \
+  "$BASH" -euo pipefail -c '
+    . "$1"
+    git -C "$2" init --quiet --initial-branch=target --template=""
+    git -C "$2" config --global fixture.owner child
+    status=0
+    git -C "$2" config --get fixture.injected || status=$?
+    [[ "$status" == 1 ]]
+  ' bash "$ROOT/test/lib/test.sh" "$fixture/target" 2>&1) || status=$?
+_assert_eq "fixture: inherited Git config does not affect setup" 0 "$status"
+if [[ $status -ne 0 ]]; then
+  printf '%s\n' "$output" >&2
+fi
+_assert_eq "fixture: Git initialized the owned target" target \
+  "$(git -C "$fixture/target" symbolic-ref --short HEAD 2>/dev/null)"
+_assert_eq "fixture: caller config is unchanged" $'[fixture]\n\towner = caller' \
+  "$(cat "$fixture/gitconfig")"
+
+mkdir "$fixture/path:separator" || exit 1
+status=0
+# shellcheck disable=SC2016 # The child shell expands its own source path.
+output=$(env -u BASH_ENV -u ENV TMPDIR="$fixture/path:separator" \
+  "$BASH" -c '. "$1"; printf "setup continued\\n"' bash "$ROOT/test/lib/test.sh" 2>&1) || status=$?
+_assert_eq "fixture: rejects a TMPDIR that would split mock PATH" 2 "$status"
+_assert_contains "fixture: explains how to select a usable TMPDIR" \
+  'TMPDIR must not contain a colon' "$output"
+
 LOG=$(_tmpfile)
 UPDATES=""
 LEAVES=""
