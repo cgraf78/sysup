@@ -121,21 +121,45 @@ archup_stop_build_agents() {
 
 # Run a package-manager command with its stderr also copied to
 # ARCHUP_PM_ERRORS, keeping the command in this shell and its output live.
-# Wait for the copier so the hook check sees complete output. Use an explicit
-# background job because Bash before 4.4 cannot wait on process substitution.
+# The coprocess owns an anonymous pipe before the command can write any bytes.
+# Bash 4.0 can wait for it explicitly, including when the command is silent.
 archup_run_captured() {
-  local status=0 copier pipe
+  local status=0 copier writer
+  local -a stderr_copy
+  local stderr_copy_PID
 
   if [[ -z "$ARCHUP_PM_ERRORS" ]]; then
     "$@"
     return
   fi
-  pipe="${ARCHUP_PM_ERRORS%/*}/stderr.fifo"
-  tee -a -- "$ARCHUP_PM_ERRORS" <"$pipe" >&2 &
-  copier=$!
-  "$@" 2>"$pipe" || status=$?
-  wait "$copier" || sysup_warn 'could not capture package-manager errors'
-  return "$status"
+  {
+    coproc stderr_copy { tee -a -- "$ARCHUP_PM_ERRORS" >&2; } || {
+      sysup_warn 'could not start package-manager error capture'
+      return 1
+    }
+    copier=${stderr_copy_PID:-$!}
+    writer=${stderr_copy[1]:-}
+    if [[ ! "$writer" =~ ^[0-9]+$ ]]; then
+      wait "$copier" || true
+      sysup_warn 'package-manager error copier exited before capture'
+      return 1
+    fi
+
+    # Move the writer to a scoped fd using Bash 4.0 syntax. The package
+    # manager gets stderr only. Close the final shell writer before wait.
+    if ! exec 9>&"$writer"-; then
+      # Bash 4.0 needs a literal descriptor on the close redirection. Only
+      # the numeric descriptor allocated by Bash's coprocess reaches eval.
+      eval "exec $writer>&-"
+      wait "$copier" || true
+      sysup_warn 'could not open package-manager error capture'
+      return 1
+    fi
+    "$@" 2>&9 9>&- || status=$?
+    exec 9>&-
+    wait "$copier" || sysup_warn 'could not capture package-manager errors'
+    return "$status"
+  } 9>&-
 }
 
 # Return 0 when the captured package-manager stderr holds a hook or scriptlet
@@ -989,23 +1013,20 @@ report_excluded_pending() {
 # not sign) fails the upgrade even though pacman exited 0: the boot chain may
 # be broken, and like any failed upgrade it skips automatic cleanup.
 sysup_backend_upgrade() {
-  local status=0 capture
+  local status=0 ARCHUP_PM_ERRORS
 
-  capture=$(mktemp -d) || return
-  if ! mkfifo -m 0600 -- "$capture/stderr.fifo"; then
-    rmdir -- "$capture"
-    return 1
+  if [[ -n ${TMPDIR:-} ]]; then
+    ARCHUP_PM_ERRORS=$(mktemp -- "${TMPDIR%/}/sysup-stderr.XXXXXX") || return
+  else
+    ARCHUP_PM_ERRORS=$(mktemp) || return
   fi
-  ARCHUP_PM_ERRORS="$capture/stderr.log"
   archup_upgrade "$@" || status=$?
   archup_stop_build_agents
   if archup_hook_failed; then
     printf '\nerror: an install script or package hook failed during the upgrade (pacman: "command failed to execute correctly"); the initramfs, unified kernel image, or Secure Boot signatures may be stale\n' >&2
     ((status != 0)) || status=1
   fi
-  rm -f -- "$ARCHUP_PM_ERRORS" "$capture/stderr.fifo"
-  rmdir -- "$capture"
-  ARCHUP_PM_ERRORS=""
+  rm -f -- "$ARCHUP_PM_ERRORS"
   report_excluded_pending
   return "$status"
 }
