@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exercise container provisioning with package-manager functions only.
 set -euo pipefail
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=lib/test.sh
 source "$ROOT/test/lib/test.sh"
 

@@ -7,7 +7,7 @@
 set -euo pipefail
 export NO_COLOR=1
 
-TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TEST_DIR=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$TEST_DIR/.." && pwd)
 # shellcheck source=lib/test.sh
 . "$TEST_DIR/lib/test.sh"

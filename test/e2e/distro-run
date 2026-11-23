@@ -19,7 +19,7 @@ set -euo pipefail
 
 image="${1:?usage: distro-run IMAGE}"
 engine="${SYSUP_E2E_ENGINE:-docker}"
-repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+repo=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # Per-invocation names, so concurrent runs on one Docker host cannot remove
 # each other's containers.
 tag="sysup-e2e-$$-$RANDOM"

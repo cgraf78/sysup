@@ -10,7 +10,7 @@ if [[ ${SYSUP_E2E_CONTAINER:-} != 1 || ! -x /sysup-init || $EUID != 0 ]]; then
   exit 1
 fi
 
-repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+repo=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 fixture=$(mktemp -d /tmp/sysup-sudo-test.XXXXXXXX)
 policy=/etc/sudoers.d/sysup-sudo-test
 account=sysupsudo
