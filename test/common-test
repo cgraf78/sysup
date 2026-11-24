@@ -23,6 +23,7 @@ export COMMON_SUDO_REFRESH_STATUS=0
 export COMMON_SUDO_WARM_STATUS=0
 export COMMON_SUDO_VALIDATE_STATUS=0
 export COMMON_SUDO_CACHED_STATUS=0
+unset COMMON_SUDO_STALL_FILE
 COMMON_SUDO_ALERT_LOG="$(_tmpdir)/sudo-alert.log"
 export COMMON_SUDO_ALERT_LOG
 
@@ -34,7 +35,16 @@ printf '%s\n' "$*" >>"$COMMON_SUDO_LOG"
 case "$*" in
   -v) exit "$COMMON_SUDO_VALIDATE_STATUS" ;;
   true) exit "$COMMON_SUDO_WARM_STATUS" ;;
-  "-n -v") exit "$COMMON_SUDO_REFRESH_STATUS" ;;
+  "-n -v")
+    if [[ -n "${COMMON_SUDO_STALL_FILE:-}" ]]; then
+      # A stuck refresh is allowed to ignore graceful shutdown. Replace the
+      # fixture shell so its published PID is the blocked command itself.
+      trap '' TERM
+      printf '%s\n' "$$" >"$COMMON_SUDO_STALL_FILE"
+      exec sleep 30
+    fi
+    exit "$COMMON_SUDO_REFRESH_STATUS"
+    ;;
   "-n true") exit "$COMMON_SUDO_CACHED_STATUS" ;;
   "-n -k true")
     # A refused command probe is an alert even with stderr redirected.
@@ -279,6 +289,72 @@ else
   status=$?
   set -e
   _assert_eq "common keeper: a second stop is a no-op" "0" "$status"
+
+  _common_reset
+  SYSUP_SUDO_REFRESH=0.1
+  COMMON_SUDO_STALL_FILE="$(_tmpdir)/refresh.pid"
+  export COMMON_SUDO_STALL_FILE
+  sysup_start_sudo_keeper
+  keeper="$_SYSUP_SUDO_KEEPER_PID"
+  stalled_sudo=""
+  # shellcheck disable=SC2016 # _common_poll evaluates the condition.
+  if _common_poll '[[ -s "$COMMON_SUDO_STALL_FILE" ]]' 5; then
+    read -r stalled_sudo <"$COMMON_SUDO_STALL_FILE"
+  fi
+  sysup_stop_sudo_keeper
+  if [[ "$stalled_sudo" =~ ^[1-9][0-9]*$ ]] && ! _common_alive "$stalled_sudo"; then
+    _pass "common keeper: stop reaps a TERM-resistant sudo refresh"
+  else
+    _fail "common keeper: stop reaps a TERM-resistant sudo refresh (pid: $stalled_sudo)"
+    if [[ "$stalled_sudo" =~ ^[1-9][0-9]*$ ]]; then
+      kill -KILL "$stalled_sudo" 2>/dev/null || true
+    fi
+  fi
+  if _common_alive "$keeper"; then
+    _fail "common keeper: stop also reaps the waiting keeper"
+  else
+    _pass "common keeper: stop also reaps the waiting keeper"
+  fi
+  unset COMMON_SUDO_STALL_FILE
+
+  _common_reset
+  SYSUP_SUDO_REFRESH=0.1
+  COMMON_SUDO_STALL_FILE="$(_tmpdir)/refresh.pid"
+  export COMMON_SUDO_STALL_FILE
+  # A privileged sudo phase can deny the keeper's process-group signals.
+  # Model permission failure without changing credentials or using real sudo.
+  # shellcheck disable=SC2329 # Called by the sourced keeper code.
+  kill() {
+    if [[ -n "${keeper_child:-}" ]]; then
+      [[ "${!#}" != "$keeper_child" && "${!#}" != "-$keeper_child" ]] || return 1
+    fi
+    builtin kill "$@"
+  }
+  sysup_start_sudo_keeper
+  keeper="$_SYSUP_SUDO_KEEPER_PID"
+  stalled_sudo=""
+  # shellcheck disable=SC2016 # _common_poll evaluates the condition.
+  if _common_poll '[[ -s "$COMMON_SUDO_STALL_FILE" ]]' 5; then
+    read -r stalled_sudo <"$COMMON_SUDO_STALL_FILE"
+  fi
+  stop_diagnostics="$(_tmpdir)/stop.log"
+  stop_status=0
+  sysup_stop_sudo_keeper 2>"$stop_diagnostics" || stop_status=$?
+  unset -f kill
+  if [[ "$stalled_sudo" =~ ^[1-9][0-9]*$ ]]; then
+    builtin kill -KILL "$stalled_sudo" 2>/dev/null || true
+  else
+    _fail "common keeper: the signal-denial fixture reached the sudo refresh"
+  fi
+  _assert_eq "common keeper: signal-denial cleanup preserves success" "0" "$stop_status"
+  _assert_contains "common keeper: reports a refresh that could not be stopped" \
+    "could not fully stop the sudo credential keeper" "$(cat "$stop_diagnostics")"
+  if _common_alive "$keeper"; then
+    _fail "common keeper: signaling failure still reaps the keeper"
+  else
+    _pass "common keeper: signaling failure still reaps the keeper"
+  fi
+  unset COMMON_SUDO_STALL_FILE
 
   # Only one keeper per run.
   _common_reset
