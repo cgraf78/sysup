@@ -158,17 +158,17 @@ _SYSUP_SUDO_KEEPER_PID=""
 # Start a background loop that refreshes the cached sudo credential until
 # sysup_stop_sudo_keeper runs or this shell exits.
 #
-# The keeper owns exactly one child, its current sleep, and kills it when it
-# is told to stop, so stopping leaves no process behind. It also exits on its
-# own once the parent shell is gone (checked every interval) or sudo refuses a
-# noninteractive refresh, so a run killed without cleanup cannot leave it
-# looping. No trap is installed in the caller: backends are sourceable, and
+# The keeper owns one child at a time, either its interval sleep or its sudo
+# refresh. It stops and reaps that child on shutdown when permissions permit.
+# It checks for a vanished parent before each refresh, and exits if sudo
+# refuses the noninteractive refresh.
+# No trap is installed in the caller: backends are sourceable, and
 # clobbering a caller's trap is worse than that bounded lag. Always start the
 # keeper after warming: successful commands cannot distinguish NOPASSWD from
 # cached credentials. Under mixed passwordless policies, validation may refuse;
 # `sudo -n -v` then exits without a refused-command alert or a prompt.
 sysup_start_sudo_keeper() {
-  local parent="$BASHPID"
+  local parent="$BASHPID" keeper_child="" launching=0 stop_requested=0
 
   ((EUID != 0)) || return 0
   [[ "$SYSUP_SUDO_REFRESH" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
@@ -176,35 +176,81 @@ sysup_start_sudo_keeper() {
   [[ -z "$_SYSUP_SUDO_KEEPER_PID" ]] || return 0
 
   (
-    sleeper=""
-    trap 'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit 0' TERM
+    trap _sysup_stop_keeper_child TERM
+    # Give each child its own group for cleanup, without modifying job
+    # control or traps in the caller. The keeper never reads from the tty.
+    set +m
+    set -m
     while :; do
-      sleep "$SYSUP_SUDO_REFRESH" &
-      sleeper=$!
-      wait "$sleeper" || true
+      _sysup_wait_keeper_child sleep "$SYSUP_SUDO_REFRESH" || true
       kill -0 "$parent" 2>/dev/null || exit 0
-      sudo -n -v 2>/dev/null || exit 0
+      _sysup_wait_keeper_child sudo -n -v || exit 0
     done
   ) </dev/null >/dev/null 2>&1 &
   _SYSUP_SUDO_KEEPER_PID=$!
 }
 
+# Run each command asynchronously so the keeper can handle TERM while waiting.
+_sysup_wait_keeper_child() {
+  local status=0
+
+  launching=1
+  "$@" &
+  keeper_child=$!
+  launching=0
+  ((stop_requested == 0)) || _sysup_stop_keeper_child
+  wait "$keeper_child" || status=$?
+  keeper_child=""
+  return "$status"
+}
+
+# Defer a signal during launch until the actual child PID is known.
+_sysup_stop_keeper_child() {
+  local tries active
+
+  stop_requested=1
+  ((launching == 0)) || return 0
+  trap '' TERM
+  if [[ -n "$keeper_child" ]]; then
+    kill -TERM -- "-$keeper_child" 2>/dev/null ||
+      kill -TERM "$keeper_child" 2>/dev/null || true
+    for ((tries = 0; tries < 10; tries++)); do
+      kill -0 -- "-$keeper_child" 2>/dev/null || break
+      sleep 0.1
+    done
+    if ! kill -KILL -- "-$keeper_child" 2>/dev/null &&
+      ! kill -KILL "$keeper_child" 2>/dev/null; then
+      # sudo may temporarily run with root real and saved UIDs. If the
+      # group signal was denied, use our job table to distinguish a live
+      # child from one that already exited. EX_TEMPFAIL tells the caller
+      # about an active refresh without blocking in wait.
+      for active in $(jobs -pr) $(jobs -ps); do
+        [[ "$active" != "$keeper_child" ]] || exit 75
+      done
+    fi
+    wait "$keeper_child" 2>/dev/null || true
+  fi
+  exit 0
+}
+
 # Stop the keeper and reap it. Idempotent, and safe when none was started.
 sysup_stop_sudo_keeper() {
-  local pid="$_SYSUP_SUDO_KEEPER_PID" tries
+  local pid="$_SYSUP_SUDO_KEEPER_PID" tries status=0
 
   [[ -n "$pid" ]] || return 0
   _SYSUP_SUDO_KEEPER_PID=""
   kill -TERM "$pid" 2>/dev/null || true
-  # The keeper runs its TERM trap only between commands, so a refresh stuck
-  # in sudo (a slow PAM or directory lookup) would hold it there. Give it
-  # about five seconds, then kill it, rather than hang the end of the run.
+  # Leave the keeper time to finish its own bounded teardown, with an outer
+  # limit so the end of the upgrade is independent of the keeper's status.
   for ((tries = 0; tries < 50; tries++)); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done
   kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || status=$?
+  if ((status == 75 || status == 137)); then
+    sysup_warn "could not fully stop the sudo credential keeper; a refresh may still be running"
+  fi
 }
 
 # Root of the process table that lock detection reads. Overridable so tests can
