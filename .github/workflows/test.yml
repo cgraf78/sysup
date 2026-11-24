@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
     with:
       # The dispatcher must survive macOS Bash 3.2, while the Linux backends
       # exercise package and service policy under several userlands. Keep the
@@ -140,4 +140,4 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e9922d129ba6d9dc43793247409197b0b07b81c8
